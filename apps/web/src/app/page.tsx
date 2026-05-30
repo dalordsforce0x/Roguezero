@@ -1389,7 +1389,9 @@ export default function Home() {
                       playsInline
                       onEnded={() => setActiveBirdVideo((current) => current === 'primary' ? 'secondary' : 'primary')}
                       className="h-full w-full object-contain bg-transparent"
-                      style={{ objectPosition: 'center 34%' }}
+                      style={{
+                        objectPosition: activeBirdVideo === 'primary' ? 'left bottom' : '32% 56%',
+                      }}
                     >
                       <source
                         src={activeBirdVideo === 'primary' ? ACTIVE_BIRD_PRIMARY_VIDEO_SRC : ACTIVE_BIRD_SECONDARY_VIDEO_SRC}
