@@ -1002,6 +1002,7 @@ export default function Home() {
   const [runtimeControlUpdating, setRuntimeControlUpdating] = useState(false);
   const [nowMs, setNowMs] = useState<number>(() => Date.now());
   const [gateUnlocked, setGateUnlocked] = useState(false);
+  const handleGateUnlock = useCallback(() => setGateUnlocked(true), []);
 
   const loadUsers = useCallback(async () => {
     setLoading(true);
@@ -1197,7 +1198,7 @@ export default function Home() {
   }
 
   if (!gateUnlocked) {
-    return <IntroGate storageKey={ADMIN_GATE_STORAGE_KEY} onUnlock={() => setGateUnlocked(true)} />;
+    return <IntroGate storageKey={ADMIN_GATE_STORAGE_KEY} onUnlock={handleGateUnlock} />;
   }
 
   return (

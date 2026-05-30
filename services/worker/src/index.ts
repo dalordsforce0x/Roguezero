@@ -1147,6 +1147,17 @@ const checkFunding = async (session: RawSession, observedBalance?: number): Prom
 
   lastFundingCheckAt.set(session.id, Date.now());
 
+  const balanceAtomic = String(balance);
+  if (session.funding.currentBalanceAtomic !== balanceAtomic) {
+    try {
+      await mergeFundingPatch(session, {
+        currentBalanceAtomic: balanceAtomic,
+      });
+    } catch (err) {
+      log('warn', session.id, `failed to persist awaiting-funding balance: ${String(err)}`);
+    }
+  }
+
   if (balance >= MIN_TRADEABLE_LAMPORTS) {
     const kp = await getKeypair(session.id);
     if (!kp) {
@@ -1177,8 +1188,8 @@ const checkFunding = async (session: RawSession, observedBalance?: number): Prom
         return capLamports ? Math.min(balance, capLamports) : balance;
       })();
     await mergeFundingPatch(session, {
-      startingBalanceAtomic: String(balance),
-      currentBalanceAtomic: String(balance),
+      startingBalanceAtomic: balanceAtomic,
+      currentBalanceAtomic: balanceAtomic,
     });
     await persistServiceControl(session, {
       positionState: {

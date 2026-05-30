@@ -346,6 +346,12 @@ const formatFundingSol = (atomic: string) => {
   return `${(numeric / 1_000_000_000).toFixed(6)} SOL`;
 };
 
+const formatFundingRequirement = (value: number) => (
+  Number.isFinite(value) && value > 0
+    ? `${value.toFixed(6)} SOL`
+    : 'loading live threshold'
+);
+
 const formatUsd = (value: number) => `${value > 0 ? '+' : value < 0 ? '-' : ''}$${Math.abs(value).toFixed(4)}`;
 const formatMetricUsd = (value: number) => `${value > 0 ? '+' : value < 0 ? '-' : ''}$${Math.abs(value).toFixed(2)}`;
 
@@ -428,25 +434,29 @@ const getPhaseKeyword = (session: Session | null, activity: PerformanceActivityI
   if (!session || session.status === 'stopped') return 'idle';
   const latestActivity = getLatestActivityItem(activity);
   switch (session.status) {
-    case 'awaiting_funding': return 'funding bot';
-    case 'ready': return 'funding bot';
-    case 'starting': return 'scanning';
+    case 'awaiting_funding': return 'waiting for deposit';
+    case 'ready': return 'ready to start';
+    case 'starting': return 'launching trader';
     case 'active':
       if (latestActivity?.kind === 'swap_submitted' || latestActivity?.kind === 'swap_prepared') return 'executing trade';
       if (session.serviceControl?.positionState?.status === 'long_sol') return 'working';
       return 'scanning';
     case 'paused': return 'idle';
     case 'stopping':
-    case 'settling': return 'withdrawing funds';
+    case 'settling': return 'recovering funds';
     case 'error': return 'idle';
     default: return 'idle';
   }
 };
 
-const buildSessionMarkers = (session: Session | null): SessionMarker[] => {
+const buildSessionMarkers = (session: Session | null, minimumFundingSol: number): SessionMarker[] => {
   if (!session) {
     return [];
   }
+
+  const liveBalanceSol = Number(session.funding.currentBalanceAtomic) / 1_000_000_000;
+  const hasLiveBalance = Number.isFinite(liveBalanceSol) && liveBalanceSol > 0;
+  const minimumFundingLabel = formatFundingRequirement(minimumFundingSol);
 
   const markers: SessionMarker[] = [
     { title: 'Session requested', detail: formatDateTime(session.requestedAt), tone: 'neutral' },
@@ -457,11 +467,22 @@ const buildSessionMarkers = (session: Session | null): SessionMarker[] => {
   }
 
   if (session.status === 'awaiting_funding') {
-    markers.push({ title: 'Awaiting funding', detail: 'Waiting for wallet deposit before execution can begin.', tone: 'warn' });
+    markers.push({
+      title: hasLiveBalance ? 'Deposit detected' : 'Awaiting funding',
+      detail: hasLiveBalance
+        ? `Detected ${liveBalanceSol.toFixed(6)} SOL on-chain. Need ${minimumFundingLabel} before start unlocks.`
+        : `No deposit detected on-chain yet. Send at least ${minimumFundingLabel} to the session wallet.`,
+      tone: 'warn',
+    });
+    markers.push({
+      title: 'Recovery',
+      detail: 'You can stop this pending session at any time if you want a fresh wallet.',
+      tone: 'neutral',
+    });
   }
 
   if (session.status === 'ready') {
-    markers.push({ title: 'Ready to launch', detail: 'Funding detected. Session is staged for manual start.', tone: 'good' });
+    markers.push({ title: 'Ready to launch', detail: 'Funding detected on-chain. Press start to begin trading.', tone: 'good' });
   }
 
   if (session.status === 'starting' || session.status === 'active') {
@@ -1059,7 +1080,31 @@ export default function Home() {
     return () => window.clearTimeout(toggle);
   }, [showLogicVideo, idleBirdMode]);
 
-  const sessionMarkers = buildSessionMarkers(primarySession);
+  const minimumFundingLabel = formatFundingRequirement(minimumFundingSol);
+  const liveFundingBalance = primarySession ? formatFundingSol(primarySession.funding.currentBalanceAtomic) : '—';
+  const nextStepLabel = (() => {
+    if (!primarySession) return 'create a session';
+    switch (primarySession.status) {
+      case 'awaiting_funding':
+        return `fund ${minimumFundingLabel}, then wait for ready`;
+      case 'ready':
+        return 'press start to trade';
+      case 'starting':
+        return 'worker is launching';
+      case 'active':
+        return 'monitor live trading';
+      case 'paused':
+        return 'resume or stop';
+      case 'stopping':
+      case 'settling':
+        return 'waiting for fund recovery';
+      case 'error':
+        return 'stop and create a fresh session';
+      default:
+        return 'create a session';
+    }
+  })();
+  const sessionMarkers = buildSessionMarkers(primarySession, minimumFundingSol);
   const controllerStatusLabel = primarySession ? primarySession.status.replace(/_/g, ' ') : '';
   const solscanLink = primarySession ? `https://solscan.io/account/${primarySession.sessionWallet}` : null;
   const controllerInfoRows: InfoRow[] = auth.status === 'authorized'
@@ -1069,11 +1114,13 @@ export default function Home() {
       { label: 'owner wallet', value: auth.user.walletAddress },
       { label: 'started', value: formatDateTime(primarySession?.startedAt ?? null) },
       { label: 'network', value: 'Solana' },
-      { label: 'funded amount', value: primarySession ? formatFundingSol(primarySession.funding.startingBalanceAtomic) : `${minimumFundingSol > 0 ? minimumFundingSol.toFixed(6) : '0.000000'} SOL` },
-      { label: 'balance', value: primarySession ? formatFundingSol(primarySession.funding.currentBalanceAtomic) : '—' },
+      { label: 'minimum required', value: minimumFundingLabel },
+      { label: 'detected balance', value: liveFundingBalance },
+      { label: 'funded amount', value: primarySession ? formatFundingSol(primarySession.funding.startingBalanceAtomic) : '—' },
       { label: 'realized pnl', value: primarySession ? formatUsd(primarySession.funding.realizedPnlUsd) : '—' },
       { label: 'fees captured', value: primarySession ? `$${primarySession.funding.capturedFeesUsd.toFixed(4)}` : '—' },
-      { label: 'ephemeral', value: primarySession?.sessionWallet ?? 'awaiting session' },
+      { label: 'next step', value: nextStepLabel },
+      { label: 'session wallet', value: primarySession?.sessionWallet ?? 'awaiting session' },
       { label: 'solscan', value: solscanLink ?? 'unavailable' },
     ]
     : [];
@@ -1121,7 +1168,7 @@ export default function Home() {
     }
 
     if (primarySession.status === 'awaiting_funding') {
-      return { label: 'Awaiting Funding', disabled: true, onClick: () => undefined };
+      return { label: 'Waiting for Deposit', disabled: true, onClick: () => undefined };
     }
 
     if (primarySession.status === 'ready') {
@@ -1155,7 +1202,7 @@ export default function Home() {
     };
   })();
 
-  const canStop = primarySession !== null && ['ready', 'active', 'paused', 'starting'].includes(primarySession.status);
+  const canStop = primarySession !== null && ['awaiting_funding', 'ready', 'active', 'paused', 'starting'].includes(primarySession.status);
 
   if (accessGateState === 'checking') {
     return (
@@ -1380,7 +1427,9 @@ export default function Home() {
                           {primarySession?.status === 'awaiting_funding' && (
                             <div className="mt-3 text-yellow-200">
                               &gt; fund wallet {primarySession.sessionWallet}
-                              <div className="text-yellow-300/80">minimum funding {minimumFundingSol > 0 ? minimumFundingSol.toFixed(6) : '0.006806'} SOL</div>
+                              <div className="text-yellow-300/80">minimum funding {minimumFundingLabel}</div>
+                              <div className="text-yellow-300/80">detected on-chain balance {formatFundingSol(primarySession.funding.currentBalanceAtomic)}</div>
+                              <div className="text-yellow-300/70">stop is available if this wallet gets abandoned and you want to recreate the session.</div>
                             </div>
                           )}
 
