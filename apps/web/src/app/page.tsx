@@ -291,6 +291,7 @@ type GateProps = {
 const GATE_PASSWORD = '1121';
 const GATE_VIDEO_SRC = '/media/rz-gated-access-intro.mp4';
 const WEB_GATE_STORAGE_KEY = 'rz-web-gate-unlocked';
+const IDLE_BIRD_ALT_VIDEO_SRC = '/media/birds2-alpha.webm';
 
 const SESSION_PRIORITY: SessionStatus[] = [
   'active',
@@ -637,6 +638,7 @@ export default function Home() {
   const [showOpenTrades, setShowOpenTrades] = useState(false);
   const [selectedHistoricalSessionId, setSelectedHistoricalSessionId] = useState<string | null>(null);
   const [gateUnlocked, setGateUnlocked] = useState(false);
+  const [idleBirdMode, setIdleBirdMode] = useState<'still' | 'alt-video'>('still');
 
   const handleUnauthorized = useCallback((payload?: UnauthorizedApiResponse) => {
     setSessions([]);
@@ -868,6 +870,20 @@ export default function Home() {
   const showLogicVideo = primarySession
     ? ['starting', 'active', 'stopping', 'settling'].includes(primarySession.status)
     : false;
+
+  useEffect(() => {
+    if (showLogicVideo) {
+      setIdleBirdMode('still');
+      return;
+    }
+
+    const toggle = window.setInterval(() => {
+      setIdleBirdMode((current) => current === 'still' ? 'alt-video' : 'still');
+    }, 12000);
+
+    return () => window.clearInterval(toggle);
+  }, [showLogicVideo]);
+
   const sessionMarkers = buildSessionMarkers(primarySession);
   const controllerStatusLabel = primarySession ? primarySession.status.replace(/_/g, ' ') : '';
   const solscanLink = primarySession ? `https://solscan.io/account/${primarySession.sessionWallet}` : null;
@@ -1020,7 +1036,7 @@ export default function Home() {
           <section className="relative w-full">
             <div className="relative mx-auto w-full overflow-hidden rounded-[28px] border border-cyan-100/35 bg-slate-950/38 shadow-[0_18px_60px_rgba(0,0,0,0.52)] backdrop-blur-[7px]">
               <div className="grid h-[560px] max-h-[80vh] grid-cols-[34%_minmax(0,1fr)] items-stretch gap-[3.6%] px-[3.4%] py-[3.2%]">
-              <div className="relative h-full w-full overflow-hidden rounded-[18px] border border-white/15 bg-black/20">
+              <div className="relative h-full w-full overflow-hidden rounded-[18px] border border-white/15 bg-transparent">
                 <div className="absolute inset-0">
                   {showLogicVideo ? (
                     <video
@@ -1033,6 +1049,19 @@ export default function Home() {
                     >
                       <source src="/media/rz-trading-logic.mp4" type="video/mp4" />
                     </video>
+                  ) : idleBirdMode === 'alt-video' ? (
+                    <div className="flex h-full w-full items-center justify-center">
+                      <video
+                        key="idle-bird-alt"
+                        autoPlay
+                        muted
+                        loop
+                        playsInline
+                        className="h-[84%] w-[84%] object-contain object-center bg-transparent"
+                      >
+                        <source src={IDLE_BIRD_ALT_VIDEO_SRC} type="video/webm" />
+                      </video>
+                    </div>
                   ) : (
                     // eslint-disable-next-line @next/next/no-img-element
                     <img
