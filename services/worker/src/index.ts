@@ -1712,6 +1712,20 @@ const refreshPositionMark = async (
     positionState: nextPositionState,
   });
 
+  // Compute and persist unrealized P&L
+  if (
+    positionState.status === 'long_sol'
+    && positionState.entryPriceUsd !== null
+    && positionState.quantityAtomic !== null
+    && markedPriceUsd > 0
+  ) {
+    const qty = Number(positionState.quantityAtomic) / 1_000_000_000;
+    const unrealizedPnlUsd = Number(((markedPriceUsd - positionState.entryPriceUsd) * qty).toFixed(6));
+    if (unrealizedPnlUsd !== session.funding.unrealizedPnlUsd) {
+      await mergeFundingPatch(session, { unrealizedPnlUsd });
+    }
+  }
+
   return nextPositionState;
 };
 
