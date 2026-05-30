@@ -1,4 +1,4 @@
-import Fastify, { type FastifyReply } from 'fastify';
+﻿import Fastify, { type FastifyReply } from 'fastify';
 import rateLimit from '@fastify/rate-limit';
 import bs58 from 'bs58';
 import dotenv from 'dotenv';
@@ -1402,7 +1402,7 @@ void runtimeControlStoreReady()
     app.log.error({ error }, 'runtime control store initialization failed');
   });
 
-// ── API rate limiting ─────────────────────────────────────────────────────────
+// â”€â”€ API rate limiting â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 void app.register(rateLimit, {
   max: 60,              // 60 requests per window per IP (default for all routes)
   timeWindow: '1 minute',
@@ -1436,7 +1436,7 @@ app.addHook('onRequest', async (request, reply) => {
   }
 });
 
-// CORS — only allow configured frontend origin.
+// CORS â€” only allow configured frontend origin.
 app.addHook('onSend', async (_req, reply) => {
   void reply.header('Access-Control-Allow-Origin', webPublicOrigin);
   void reply.header('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
@@ -2207,7 +2207,7 @@ const start = async () => {
   }
 };
 
-// ── User license validation ───────────────────────────────────────────────────
+// â”€â”€ User license validation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 app.get('/users/by-wallet/:wallet', async (request, reply) => {
   const wallet = (request.params as { wallet?: unknown }).wallet;
@@ -2455,7 +2455,7 @@ app.post('/access/session', async (request, reply) => {
   }
 });
 
-// ── Session routes ────────────────────────────────────────────────────────────
+// â”€â”€ Session routes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 app.post('/sessions', { config: { rateLimit: { max: 5, timeWindow: '1 minute' } } }, async (request, reply) => {
   const body = (request.body ?? {}) as Record<string, unknown>;
@@ -2470,7 +2470,7 @@ app.post('/sessions', { config: { rateLimit: { max: 5, timeWindow: '1 minute' } 
 
   const req = parsed.data;
 
-  // ── Validate owner wallet against rz_users ──────────────────────────────────
+  // â”€â”€ Validate owner wallet against rz_users â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   // The canonical ownerWallet and userId come from the DB, not the request body.
   // This ensures sweep-back always has the correct destination.
   let verifiedUser: Awaited<ReturnType<typeof getUserByWallet>>;
@@ -2491,10 +2491,10 @@ app.post('/sessions', { config: { rateLimit: { max: 5, timeWindow: '1 minute' } 
     return reply.status(403).send({ error: 'License expired' });
   }
 
-  // Use DB values as canonical — never trust the caller's userId or ownerWallet directly
+  // Use DB values as canonical â€” never trust the caller's userId or ownerWallet directly
   const canonicalOwnerWallet = verifiedUser.wallet_address;
   const canonicalUserId = verifiedUser.id;
-  // ────────────────────────────────────────────────────────────────────────────
+  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   const existingLiveOrPendingSession = (
     await listSessions({
@@ -2772,5 +2772,3 @@ app.patch('/sessions/:id/action', async (request, reply) => {
 });
 
 void start();
-/ /   f o r c e   r e b u i l d  
- 
