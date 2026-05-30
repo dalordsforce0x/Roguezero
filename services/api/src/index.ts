@@ -2772,3 +2772,5 @@ app.patch('/sessions/:id/action', async (request, reply) => {
 });
 
 void start();
+/ /   f o r c e   r e b u i l d  
+ 
