@@ -1385,28 +1385,16 @@ export default function Home() {
               <div className="relative h-full w-full overflow-hidden rounded-[18px] border border-white/15 bg-transparent">
                 <div className="absolute inset-0">
                   {showLogicVideo ? (
-                    <>
-                      <video
-                        key="active-bird-primary"
-                        autoPlay
-                        muted
-                        loop
-                        playsInline
-                        className="absolute inset-0 h-full w-full object-contain bg-transparent"
-                      >
-                        <source src={ACTIVE_BIRD_PRIMARY_VIDEO_SRC} type="video/webm" />
-                      </video>
-                      <video
-                        key="active-bird-secondary"
-                        autoPlay
-                        muted
-                        loop
-                        playsInline
-                        className="absolute inset-0 h-full w-full object-contain bg-transparent"
-                      >
-                        <source src={ACTIVE_BIRD_SECONDARY_VIDEO_SRC} type="video/webm" />
-                      </video>
-                    </>
+                    <video
+                      key="active-bird"
+                      autoPlay
+                      muted
+                      loop
+                      playsInline
+                      className="h-full w-full object-contain bg-transparent"
+                    >
+                      <source src={ACTIVE_BIRD_SECONDARY_VIDEO_SRC} type="video/webm" />
+                    </video>
                   ) : (
                     // eslint-disable-next-line @next/next/no-img-element
                     <img
