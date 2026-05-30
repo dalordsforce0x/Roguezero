@@ -317,6 +317,8 @@ type GateProps = {
 
 const GATE_VIDEO_SRC = '/media/rz-gated-access-intro.mp4';
 const IDLE_BIRD_ALT_VIDEO_SRC = '/media/birds2-alpha.webm';
+const ACTIVE_BIRD_PRIMARY_VIDEO_SRC = '/media/rz-trading-bird-alpha.webm';
+const ACTIVE_BIRD_SECONDARY_VIDEO_SRC = '/media/birds2-alpha.webm';
 const IDLE_BIRD_STILL_DELAY_MS = 12000;
 const LICENSE_REVEAL_STORAGE_KEY = 'rz-pending-license-reveal';
 const FUNDING_FEE_CUSHION_LAMPORTS = 50_000;
@@ -698,6 +700,7 @@ export default function Home() {
   const [enrollingAccess, setEnrollingAccess] = useState(false);
   const [licenseReveal, setLicenseReveal] = useState<{ userId: string; licenseKey: string } | null>(null);
   const [idleBirdMode, setIdleBirdMode] = useState<'still' | 'alt-video'>('still');
+  const [activeBirdVideo, setActiveBirdVideo] = useState<'primary' | 'secondary'>('primary');
 
   useEffect(() => {
     if (typeof window === 'undefined') {
@@ -1158,6 +1161,12 @@ export default function Home() {
     return () => window.clearTimeout(toggle);
   }, [showLogicVideo, idleBirdMode]);
 
+  useEffect(() => {
+    if (!showLogicVideo) {
+      setActiveBirdVideo('primary');
+    }
+  }, [showLogicVideo]);
+
   const minimumFundingLabel = formatFundingRequirement(minimumFundingSol);
   const liveFundingBalance = primarySession ? formatFundingSol(primarySession.funding.currentBalanceAtomic) : '—';
   const nextStepLabel = (() => {
@@ -1356,14 +1365,18 @@ export default function Home() {
                 <div className="absolute inset-0">
                   {showLogicVideo ? (
                     <video
-                      key="logic-active"
+                      key={`active-bird-${activeBirdVideo}`}
                       autoPlay
                       muted
-                      loop
                       playsInline
-                      className="h-full w-full object-contain object-bottom-left"
+                      onEnded={() => setActiveBirdVideo((current) => current === 'primary' ? 'secondary' : 'primary')}
+                      className="h-full w-full object-contain bg-transparent"
+                      style={{ objectPosition: 'center 34%' }}
                     >
-                      <source src="/media/rz-trading-logic.mp4" type="video/mp4" />
+                      <source
+                        src={activeBirdVideo === 'primary' ? ACTIVE_BIRD_PRIMARY_VIDEO_SRC : ACTIVE_BIRD_SECONDARY_VIDEO_SRC}
+                        type="video/webm"
+                      />
                     </video>
                   ) : idleBirdMode === 'alt-video' ? (
                     <video
@@ -1372,7 +1385,8 @@ export default function Home() {
                       muted
                       playsInline
                       onEnded={() => setIdleBirdMode('still')}
-                      className="h-full w-full scale-[1.16] object-contain object-bottom-left bg-transparent"
+                      className="h-full w-full scale-[1.16] object-contain bg-transparent"
+                      style={{ objectPosition: 'center 34%' }}
                     >
                       <source src={IDLE_BIRD_ALT_VIDEO_SRC} type="video/webm" />
                     </video>
@@ -1382,7 +1396,8 @@ export default function Home() {
                       key="idle-bird-0"
                       src="/media/roguebird-alpha.webp"
                       alt="Idle bird"
-                      className="h-full w-full object-contain object-bottom-left"
+                      className="h-full w-full object-contain"
+                      style={{ objectPosition: 'center 34%' }}
                     />
                   )}
                 </div>
