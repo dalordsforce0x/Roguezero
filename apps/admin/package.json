@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "next dev --webpack -p 3001",
     "build": "node ./scripts/ensure-linux-natives.mjs && next build",
-    "start": "next start -p 3001",
+    "start": "next start -p ${PORT:-3001}",
     "lint": "eslint"
   },
   "dependencies": {
