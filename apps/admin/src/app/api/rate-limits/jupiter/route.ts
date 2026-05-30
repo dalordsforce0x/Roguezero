@@ -16,7 +16,7 @@ export async function GET() {
   const apiKey = process.env.JUPITER_API_KEY;
   if (!apiKey) {
     return NextResponse.json(
-      { connected: false, error: 'JUPITER_API_KEY not set in .env.local' },
+      { connected: false, error: 'JUPITER_API_KEY must be set on the admin service' },
       { status: 500 },
     );
   }

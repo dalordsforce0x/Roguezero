@@ -4,17 +4,17 @@
 import { NextResponse } from 'next/server';
 
 export async function GET() {
-  const apiKey = process.env.HELIUS_API_KEY;
-  if (!apiKey) {
+  const rpcUrl = process.env.HELIUS_RPC_URL;
+  if (!rpcUrl) {
     return NextResponse.json(
-      { connected: false, error: 'HELIUS_API_KEY not set in .env.local' },
+      { connected: false, error: 'HELIUS_RPC_URL must be set on the admin service' },
       { status: 500 },
     );
   }
 
   const start = Date.now();
   try {
-    const res = await fetch(`https://mainnet.helius-rpc.com/?api-key=${apiKey}`, {
+    const res = await fetch(rpcUrl, {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getBlockHeight' }),

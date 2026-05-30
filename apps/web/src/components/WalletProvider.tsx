@@ -12,9 +12,12 @@ import {
 import { WalletError } from '@solana/wallet-adapter-base';
 import '@solana/wallet-adapter-react-ui/styles.css';
 
-const HELIUS_RPC = 'https://mainnet.helius-rpc.com/?api-key=8bc59e1c-2213-4bc6-955b-5b5407f5b0da';
+const HELIUS_RPC = process.env.NEXT_PUBLIC_HELIUS_RPC_URL;
 
 export function RZWalletProvider({ children }: { children: React.ReactNode }) {
+  if (!HELIUS_RPC) {
+    throw new Error('NEXT_PUBLIC_HELIUS_RPC_URL must be set on the web service');
+  }
   const wallets = useMemo(
     () => [
       new PhantomWalletAdapter(),
