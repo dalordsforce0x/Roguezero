@@ -73,6 +73,7 @@ if (!process.env.API_URL) {
   throw new Error('API_URL must be set on the worker service');
 }
 const API_BASE = process.env.API_URL;
+const WORKER_INTERNAL_SECRET = process.env.RZ_INTERNAL_SECRET?.trim() ?? '';
 const POLL_MS  = Number(process.env.WORKER_POLL_INTERVAL_MS ?? 5000);
 const MIN_LOOP_MS = Number(process.env.WORKER_MIN_LOOP_INTERVAL_MS ?? 250);
 const READY_STARTING_POLL_MS = Number(process.env.WORKER_READY_STARTING_POLL_MS ?? 3000);
@@ -1009,7 +1010,10 @@ const apiPost = async <T>(
 
       const res = await fetch(`${API_BASE}${path}`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(WORKER_INTERNAL_SECRET ? { 'x-rz-internal-secret': WORKER_INTERNAL_SECRET } : {}),
+        },
         body: JSON.stringify(body),
       });
 
@@ -1053,6 +1057,25 @@ const fundingSubscriptionIds = new Map<string, number>();
 const lastFundingCheckAt = new Map<string, number>();
 const fundingChecksInFlight = new Set<string>();
 
+const failFundingSession = async (
+  session: RawSession,
+  balance: number,
+  reason: string,
+) => {
+  await mergeFundingPatch(session, {
+    startingBalanceAtomic: String(balance),
+    currentBalanceAtomic: String(balance),
+  });
+  await setSessionStatus(
+    session.id,
+    'error',
+    { stop_reason: 'runtime_error' },
+    { expectedStatuses: ['awaiting_funding'] },
+  );
+  unsubscribeFundingSession(session.id);
+  log('error', session.id, `${reason} -> error`);
+};
+
 const checkFunding = async (session: RawSession, observedBalance?: number): Promise<void> => {
   let balance = observedBalance;
   if (balance === undefined) {
@@ -1069,11 +1092,19 @@ const checkFunding = async (session: RawSession, observedBalance?: number): Prom
   if (balance >= MIN_TRADEABLE_LAMPORTS) {
     const kp = await getKeypair(session.id);
     if (!kp) {
-      log('error', session.id, `funded session is missing its persisted keypair; refusing ready transition for wallet ${session.session_wallet}`);
+      await failFundingSession(
+        session,
+        balance,
+        `funded session is missing its persisted keypair for wallet ${session.session_wallet}`,
+      );
       return;
     }
     if (kp.publicKey.toBase58() !== session.session_wallet) {
-      log('error', session.id, `persisted keypair mismatch during funding check: stored=${kp.publicKey.toBase58()} session=${session.session_wallet}`);
+      await failFundingSession(
+        session,
+        balance,
+        `persisted keypair mismatch during funding check: stored=${kp.publicKey.toBase58()} session=${session.session_wallet}`,
+      );
       return;
     }
     const markedAt = new Date().toISOString();
@@ -3085,6 +3116,7 @@ const tick = async (): Promise<number> => {
           }
           break;
         case 'ready':
+          break;
         case 'starting':
           await activateSession(session);
           break;

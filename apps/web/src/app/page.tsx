@@ -17,9 +17,10 @@ type AuthUser = {
   id: string;
   username: string;
   walletAddress: string;
-  licenseKey: string | null;
   expiryDate: string | null;
   duration: string | null;
+  gatedAccessEnrolledAt?: string | null;
+  licenseKeyRevealedAt?: string | null;
 };
 
 const isUnauthorizedReason = (
@@ -35,10 +36,33 @@ type UnauthorizedApiResponse = {
     id?: string;
     username?: string;
     walletAddress?: string;
-    licenseKey?: string | null;
     expiryDate?: string | null;
     duration?: string | null;
+    gatedAccessEnrolledAt?: string | null;
+    licenseKeyRevealedAt?: string | null;
   };
+};
+
+type AccessGateState = 'checking' | 'temporary_required' | 'temporary_unlocked' | 'license_required' | 'access_granted';
+
+type AccessBootPayload = {
+  state?: AccessGateState;
+  source?: 'trusted_device' | 'license_key' | 'live_session_bypass' | null;
+  trustedUntil?: string | null;
+  liveSessionCount?: number;
+  userId?: string | null;
+  error?: string;
+};
+
+type AccessEnrollPayload = {
+  ok?: boolean;
+  user?: AuthUser;
+  firstReveal?: boolean;
+  licenseKey?: string | null;
+  liveSessionCount?: number;
+  trustedUntil?: string;
+  error?: string;
+  details?: string;
 };
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -284,14 +308,14 @@ type InfoRow = {
 };
 
 type GateProps = {
-  storageKey: string;
-  onUnlock: () => void;
+  mode: 'temporary' | 'license';
+  onUnlock: (password: string) => Promise<void>;
 };
 
-const GATE_PASSWORD = '1121';
 const GATE_VIDEO_SRC = '/media/rz-gated-access-intro.mp4';
-const WEB_GATE_STORAGE_KEY = 'rz-web-gate-unlocked';
 const IDLE_BIRD_ALT_VIDEO_SRC = '/media/birds2-alpha.webm';
+const IDLE_BIRD_STILL_DELAY_MS = 12000;
+const LICENSE_REVEAL_STORAGE_KEY = 'rz-pending-license-reveal';
 
 const SESSION_PRIORITY: SessionStatus[] = [
   'active',
@@ -534,30 +558,26 @@ const buildSessionMarkers = (session: Session | null): SessionMarker[] => {
   return markers;
 };
 
-function IntroGate({ storageKey, onUnlock }: GateProps) {
+function IntroGate({ mode, onUnlock }: GateProps) {
   const [phase, setPhase] = useState<'checking' | 'video' | 'password'>('checking');
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
 
   useEffect(() => {
-    const unlocked = typeof window !== 'undefined' && window.sessionStorage.getItem(storageKey) === 'true';
-    if (unlocked) {
-      onUnlock();
-      return;
-    }
-
     setPhase('video');
-  }, [onUnlock, storageKey]);
+  }, []);
 
-  const submitPassword = useCallback(() => {
-    if (password !== GATE_PASSWORD) {
-      setError('wrong password');
-      return;
+  const submitPassword = useCallback(async () => {
+    try {
+      setSubmitting(true);
+      await onUnlock(password);
+    } catch (submitError) {
+      setError(submitError instanceof Error ? submitError.message : 'wrong password');
+    } finally {
+      setSubmitting(false);
     }
-
-    window.sessionStorage.setItem(storageKey, 'true');
-    onUnlock();
-  }, [onUnlock, password, storageKey]);
+  }, [onUnlock, password]);
 
   return (
     <div className="relative min-h-screen bg-black text-white overflow-hidden">
@@ -583,7 +603,12 @@ function IntroGate({ storageKey, onUnlock }: GateProps) {
           <div className="absolute inset-0 flex items-center justify-center bg-black/62 backdrop-blur-sm p-6">
             <div className="w-full max-w-sm rounded-2xl border border-cyan-200/20 bg-slate-950/88 p-5 shadow-[0_0_35px_rgba(34,211,238,0.08)]">
               <div className="text-[10px] uppercase tracking-[0.28em] text-cyan-300">access gate</div>
-              <div className="mt-2 text-lg text-white">enter password</div>
+              <div className="mt-2 text-lg text-white">{mode === 'temporary' ? 'enter temporary password' : 'enter license key'}</div>
+              <div className="mt-1 text-xs text-cyan-100/70">
+                {mode === 'temporary'
+                  ? 'first-time access on this device'
+                  : 'trusted device access expired — use your own key'}
+              </div>
               <input
                 type="password"
                 value={password}
@@ -592,21 +617,22 @@ function IntroGate({ storageKey, onUnlock }: GateProps) {
                   setError(null);
                 }}
                 onKeyDown={(event) => {
-                  if (event.key === 'Enter') {
-                    submitPassword();
+                  if (event.key === 'Enter' && !submitting) {
+                    void submitPassword();
                   }
                 }}
                 className="mt-4 w-full rounded-lg border border-white/10 bg-black/40 px-3 py-2 text-sm text-white outline-none transition focus:border-cyan-300/40"
-                placeholder="temporary password"
+                placeholder={mode === 'temporary' ? 'temporary password' : 'license key'}
                 autoFocus
               />
               {error && <div className="mt-2 text-xs text-red-300">{error}</div>}
               <button
                 type="button"
-                onClick={submitPassword}
+                onClick={() => void submitPassword()}
+                disabled={submitting}
                 className="mt-4 w-full rounded-lg border border-cyan-300/25 bg-cyan-500/10 px-3 py-2 text-sm text-cyan-100 transition hover:bg-cyan-500/18"
               >
-                unlock controller
+                {submitting ? 'verifying…' : mode === 'temporary' ? 'unlock controller' : 'unlock with license'}
               </button>
             </div>
           </div>
@@ -637,8 +663,79 @@ export default function Home() {
   const [performanceLoading, setPerformanceLoading] = useState(false);
   const [showOpenTrades, setShowOpenTrades] = useState(false);
   const [selectedHistoricalSessionId, setSelectedHistoricalSessionId] = useState<string | null>(null);
-  const [gateUnlocked, setGateUnlocked] = useState(false);
+  const [accessGateState, setAccessGateState] = useState<AccessGateState>('checking');
+  const [accessTrustedUntil, setAccessTrustedUntil] = useState<string | null>(null);
+  const [enrollingAccess, setEnrollingAccess] = useState(false);
+  const [licenseReveal, setLicenseReveal] = useState<{ userId: string; licenseKey: string } | null>(null);
   const [idleBirdMode, setIdleBirdMode] = useState<'still' | 'alt-video'>('still');
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+
+    const stored = window.sessionStorage.getItem(LICENSE_REVEAL_STORAGE_KEY);
+    if (!stored) {
+      return;
+    }
+
+    try {
+      const parsed = JSON.parse(stored) as { userId?: unknown; licenseKey?: unknown };
+      if (typeof parsed.userId === 'string' && typeof parsed.licenseKey === 'string') {
+        setLicenseReveal({ userId: parsed.userId, licenseKey: parsed.licenseKey });
+      }
+    } catch {
+      window.sessionStorage.removeItem(LICENSE_REVEAL_STORAGE_KEY);
+    }
+  }, []);
+
+  const refreshAccessGate = useCallback(async () => {
+    setAccessGateState('checking');
+    try {
+      const response = await fetch('/api/access/boot', { cache: 'no-store' });
+      const payload = await response.json() as AccessBootPayload;
+      setAccessGateState(payload.state ?? 'temporary_required');
+      setAccessTrustedUntil(payload.trustedUntil ?? null);
+    } catch {
+      setAccessGateState('temporary_required');
+      setAccessTrustedUntil(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshAccessGate();
+  }, [refreshAccessGate]);
+
+  const unlockTemporaryGate = useCallback(async (password: string) => {
+    const response = await fetch('/api/access/unlock-temporary', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password }),
+    });
+
+    const payload = await response.json().catch(() => ({ error: 'wrong password' })) as { error?: string };
+    if (!response.ok) {
+      throw new Error(payload.error ?? 'wrong password');
+    }
+
+    setAccessGateState('temporary_unlocked');
+  }, []);
+
+  const unlockLicenseGate = useCallback(async (password: string) => {
+    const response = await fetch('/api/access/unlock-license', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password }),
+    });
+
+    const payload = await response.json().catch(() => ({ error: 'license key rejected' })) as AccessEnrollPayload;
+    if (!response.ok) {
+      throw new Error(payload.details ?? payload.error ?? 'license key rejected');
+    }
+
+    setAccessGateState('access_granted');
+    setAccessTrustedUntil(payload.trustedUntil ?? null);
+  }, []);
 
   const handleUnauthorized = useCallback((payload?: UnauthorizedApiResponse) => {
     setSessions([]);
@@ -661,7 +758,15 @@ export default function Home() {
       const data = await res.json() as {
         authorized?: boolean;
         reason?: string;
-        user?: { id: string; username: string; walletAddress: string; licenseKey: string | null; expiryDate: string | null; duration: string | null };
+        user?: {
+          id: string;
+          username: string;
+          walletAddress: string;
+          expiryDate: string | null;
+          duration: string | null;
+          gatedAccessEnrolledAt?: string | null;
+          licenseKeyRevealedAt?: string | null;
+        };
       };
       if (res.ok && data.authorized && data.user) {
         setAuth({ status: 'authorized', user: data.user as AuthUser });
@@ -696,6 +801,75 @@ export default function Home() {
       return () => clearTimeout(reset);
     }
   }, [publicKey, checkLicense]);
+
+  useEffect(() => {
+    if (accessGateState !== 'temporary_unlocked') {
+      return;
+    }
+
+    if (auth.status !== 'authorized') {
+      return;
+    }
+
+    let cancelled = false;
+
+    const enrollTrustedDevice = async () => {
+      setEnrollingAccess(true);
+      try {
+        const response = await fetch('/api/access/enroll', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ wallet: auth.user.walletAddress }),
+        });
+
+        const payload = await response.json() as AccessEnrollPayload;
+        if (!response.ok) {
+          throw new Error(payload.details ?? payload.error ?? 'Failed to enroll trusted device');
+        }
+
+        if (cancelled) {
+          return;
+        }
+
+        setAccessGateState('access_granted');
+        setAccessTrustedUntil(payload.trustedUntil ?? null);
+        setAuth((current) => current.status === 'authorized' && payload.user
+          ? {
+              status: 'authorized',
+              user: {
+                ...current.user,
+                ...payload.user,
+              },
+            }
+          : current);
+
+        if (payload.firstReveal && payload.licenseKey && payload.user) {
+          if (typeof window !== 'undefined') {
+            window.sessionStorage.setItem(
+              LICENSE_REVEAL_STORAGE_KEY,
+              JSON.stringify({ userId: payload.user.id, licenseKey: payload.licenseKey }),
+            );
+          }
+          setLicenseReveal({ userId: payload.user.id, licenseKey: payload.licenseKey });
+        }
+      } catch {
+        if (!cancelled) {
+          setAccessGateState('temporary_required');
+          setAccessTrustedUntil(null);
+        }
+      } finally {
+        if (!cancelled) {
+          setEnrollingAccess(false);
+        }
+      }
+    };
+
+    void enrollTrustedDevice();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [accessGateState, auth]);
 
   useEffect(() => {
     if (!connecting) return;
@@ -739,9 +913,6 @@ export default function Home() {
       const params = new URLSearchParams({ userId: user.id });
       if (user.walletAddress) {
         params.set('ownerWallet', user.walletAddress);
-      }
-      if (user.licenseKey) {
-        params.set('licenseId', user.licenseKey);
       }
       const res = await fetch(`${API}/sessions/performance?${params.toString()}`);
       if (res.status === 403) {
@@ -804,7 +975,7 @@ export default function Home() {
         body: JSON.stringify({
           userId:        user.id,
           keyAuthUserId: user.id,
-          licenseId:     user.licenseKey ?? user.id,
+          licenseId:     user.id,
           ownerWallet:   user.walletAddress,
           fundingMint:        'So11111111111111111111111111111111111111112',
           fundingTokenSymbol: 'SOL',
@@ -877,12 +1048,16 @@ export default function Home() {
       return;
     }
 
-    const toggle = window.setInterval(() => {
-      setIdleBirdMode((current) => current === 'still' ? 'alt-video' : 'still');
-    }, 12000);
+    if (idleBirdMode !== 'still') {
+      return;
+    }
 
-    return () => window.clearInterval(toggle);
-  }, [showLogicVideo]);
+    const toggle = window.setTimeout(() => {
+      setIdleBirdMode('alt-video');
+    }, IDLE_BIRD_STILL_DELAY_MS);
+
+    return () => window.clearTimeout(toggle);
+  }, [showLogicVideo, idleBirdMode]);
 
   const sessionMarkers = buildSessionMarkers(primarySession);
   const controllerStatusLabel = primarySession ? primarySession.status.replace(/_/g, ' ') : '';
@@ -890,7 +1065,7 @@ export default function Home() {
   const controllerInfoRows: InfoRow[] = auth.status === 'authorized'
     ? [
       { label: 'user', value: auth.user.username },
-      { label: 'license key', value: auth.user.licenseKey ?? 'no key assigned' },
+      { label: 'access', value: accessTrustedUntil ? `trusted until ${formatDateTime(accessTrustedUntil)}` : 'trusted device enrolled' },
       { label: 'owner wallet', value: auth.user.walletAddress },
       { label: 'started', value: formatDateTime(primarySession?.startedAt ?? null) },
       { label: 'network', value: 'Solana' },
@@ -905,7 +1080,7 @@ export default function Home() {
 
   const dashboardSummaryRows: InfoRow[] = auth.status === 'authorized'
     ? [
-      { label: 'license', value: performance?.linkedBy.licenseId ?? auth.user.licenseKey ?? 'unassigned' },
+      { label: 'gate', value: accessTrustedUntil ? `expires ${formatDateTime(accessTrustedUntil)}` : 'trusted device active' },
       { label: 'fees captured', value: `$${(performance?.summary.totalCapturedFeesUsd ?? 0).toFixed(4)}` },
       { label: 'sessions', value: `${(performance?.summary.totalSessions ?? sessions.length)} total / ${(performance?.summary.activeSessions ?? sessions.filter((session) => session.status === 'active').length)} active` },
       { label: 'executions', value: `${(performance?.summary.confirmedExecutions ?? 0)} confirmed` },
@@ -982,8 +1157,20 @@ export default function Home() {
 
   const canStop = primarySession !== null && ['ready', 'active', 'paused', 'starting'].includes(primarySession.status);
 
-  if (!gateUnlocked) {
-    return <IntroGate storageKey={WEB_GATE_STORAGE_KEY} onUnlock={() => setGateUnlocked(true)} />;
+  if (accessGateState === 'checking') {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-black text-sm uppercase tracking-[0.25em] text-cyan-200">
+        loading access
+      </div>
+    );
+  }
+
+  if (accessGateState === 'temporary_required') {
+    return <IntroGate mode="temporary" onUnlock={unlockTemporaryGate} />;
+  }
+
+  if (accessGateState === 'license_required') {
+    return <IntroGate mode="license" onUnlock={unlockLicenseGate} />;
   }
 
   // ── UI ──────────────────────────────────────────────────────────────────────
@@ -1050,18 +1237,16 @@ export default function Home() {
                       <source src="/media/rz-trading-logic.mp4" type="video/mp4" />
                     </video>
                   ) : idleBirdMode === 'alt-video' ? (
-                    <div className="flex h-full w-full items-center justify-center">
-                      <video
-                        key="idle-bird-alt"
-                        autoPlay
-                        muted
-                        loop
-                        playsInline
-                        className="h-[84%] w-[84%] object-contain object-center bg-transparent"
-                      >
-                        <source src={IDLE_BIRD_ALT_VIDEO_SRC} type="video/webm" />
-                      </video>
-                    </div>
+                    <video
+                      key="idle-bird-alt"
+                      autoPlay
+                      muted
+                      playsInline
+                      onEnded={() => setIdleBirdMode('still')}
+                      className="h-full w-full scale-[1.16] object-contain object-bottom-left bg-transparent"
+                    >
+                      <source src={IDLE_BIRD_ALT_VIDEO_SRC} type="video/webm" />
+                    </video>
                   ) : (
                     // eslint-disable-next-line @next/next/no-img-element
                     <img
@@ -1118,6 +1303,11 @@ export default function Home() {
                 {auth.status === 'authorized' ? (
                   <>
                     <div className="flex-none text-gray-200">
+                      {enrollingAccess && (
+                        <div className="mb-3 rounded border border-cyan-300/18 bg-cyan-500/[0.05] px-3 py-2 text-[10px] uppercase tracking-[0.18em] text-cyan-100/80">
+                          finalizing trusted device enrollment...
+                        </div>
+                      )}
                       {panelView === 'activity' ? (
                         <div className="space-y-1.5">
                           {controllerInfoRows.map((row) => (
@@ -1461,6 +1651,54 @@ export default function Home() {
           </section>
         </div>
       </main>
+
+      {licenseReveal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/72 p-6 backdrop-blur-sm">
+          <div className="w-full max-w-lg rounded-3xl border border-cyan-300/20 bg-slate-950/96 p-6 shadow-[0_0_40px_rgba(34,211,238,0.12)]">
+            <div className="text-[10px] uppercase tracking-[0.28em] text-cyan-300">license key unlocked</div>
+            <h2 className="mt-2 text-2xl font-semibold text-white">save this now</h2>
+            <p className="mt-3 text-sm text-cyan-50/82">
+              This device is now enrolled. Your license key replaces the shared temporary password on future access after the 6-hour trusted window expires.
+            </p>
+            <div className="mt-4 rounded-2xl border border-cyan-300/20 bg-black/35 p-4 font-mono text-lg text-cyan-100 break-all">
+              {licenseReveal.licenseKey}
+            </div>
+            <div className="mt-4 space-y-2 text-xs text-amber-100/85">
+              <div>• Store it somewhere secure. This popup is the intentional reveal.</div>
+              <div>• Refreshing won’t slide the 6-hour window forward.</div>
+              <div>• A live session can still bypass the lock so you are not blind mid-run.</div>
+            </div>
+            <div className="mt-5 flex justify-end">
+              <button
+                type="button"
+                onClick={async () => {
+                  await fetch('/api/access/license-revealed', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ userId: licenseReveal.userId }),
+                  });
+                  if (typeof window !== 'undefined') {
+                    window.sessionStorage.removeItem(LICENSE_REVEAL_STORAGE_KEY);
+                  }
+                  setAuth((current) => current.status === 'authorized'
+                    ? {
+                        status: 'authorized',
+                        user: {
+                          ...current.user,
+                          licenseKeyRevealedAt: new Date().toISOString(),
+                        },
+                      }
+                    : current);
+                  setLicenseReveal(null);
+                }}
+                className="rounded-xl border border-cyan-300/25 bg-cyan-500/10 px-4 py-2 text-sm text-cyan-100 transition hover:bg-cyan-500/18"
+              >
+                i saved it
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

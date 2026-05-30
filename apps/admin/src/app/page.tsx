@@ -12,6 +12,8 @@ interface User {
   expiry_date: string | null;
   access_enabled: boolean;
   duration: string | null;
+  gated_access_enrolled_at: string | null;
+  license_key_revealed_at: string | null;
   created_at: string;
 }
 
@@ -750,6 +752,7 @@ function UserCard({ user: u, isLive, onToggle, onAssign, onDelete, assigning, to
   const [copiedWallet, setCopiedWallet] = useState(false);
 
   const isActive = u.access_enabled && !isExpired(u.expiry_date);
+  const isGated = Boolean(u.gated_access_enrolled_at);
 
   const [kc1, kc2, kc3] = getUserKeyColors(u.id);
   const licenseKeyStyle: React.CSSProperties = {
@@ -833,8 +836,17 @@ function UserCard({ user: u, isLive, onToggle, onAssign, onDelete, assigning, to
 
         {/* Row 3: Wallet + expiry */}
         <div className="flex items-center justify-between gap-2">
-          <div className="flex items-center gap-1">
+              <div className="flex items-center gap-2">
             <span className="font-mono text-[9px] text-gray-600">{shortWallet(u.wallet_address)}</span>
+                {isGated && (
+                  <span
+                    title={u.gated_access_enrolled_at ? `Trusted-device enrolled ${formatDateTime(u.gated_access_enrolled_at)}` : 'Trusted-device enrolled'}
+                    className="inline-flex items-center gap-1 rounded-full border border-cyan-400/30 bg-cyan-500/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.22em] text-cyan-200"
+                  >
+                    <span className="text-cyan-300">✓</span>
+                    gated
+                  </span>
+                )}
             <button onClick={copyWallet} className="text-[9px] text-gray-700 hover:text-gray-400 transition-colors">
               {copiedWallet ? '✓' : '·copy'}
             </button>

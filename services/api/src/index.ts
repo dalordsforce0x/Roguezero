@@ -47,6 +47,17 @@ import {
   updateSessionStatus,
 } from './sessionStore.js';
 import {
+  accessTablesReady,
+  acknowledgeLicenseKeyReveal,
+  createWebAccessSession,
+  enrollTrustedDeviceForWallet,
+  getAccessUserByWallet,
+  getLiveSessionCountForUser,
+  getTrustedDeviceEnrollment,
+  verifyTrustedDeviceLicense,
+  verifyWebAccessSession,
+} from './accessStore.js';
+import {
   schemaVersion,
   sessionActionValues,
   sessionStatusValues,
@@ -1371,6 +1382,13 @@ void sessionStoreReady()
   .catch((error) => {
     app.log.error({ error }, 'session store initialization failed');
   });
+void accessTablesReady()
+  .then(() => {
+    app.log.info('access store ready');
+  })
+  .catch((error) => {
+    app.log.error({ error }, 'access store initialization failed');
+  });
 
 // ── API rate limiting ─────────────────────────────────────────────────────────
 void app.register(rateLimit, {
@@ -2186,13 +2204,13 @@ app.get('/users/by-wallet/:wallet', async (request, reply) => {
   }
 
   try {
-    const user = await getUserByWallet(wallet);
+    const user = await getAccessUserByWallet(wallet);
 
     if (!user) {
       return reply.status(404).send({ authorized: false, reason: 'not_registered' });
     }
 
-    if (!user.access_enabled) {
+    if (!user.accessEnabled) {
       return reply.status(403).send({
         authorized: false,
         reason: 'access_disabled',
@@ -2200,11 +2218,11 @@ app.get('/users/by-wallet/:wallet', async (request, reply) => {
       });
     }
 
-    if (isLicenseExpired(user.expiry_date)) {
+    if (isLicenseExpired(user.expiryDate)) {
       return reply.status(403).send({
         authorized: false,
         reason: 'license_expired',
-        user: { id: user.id, username: user.username, expiryDate: user.expiry_date },
+        user: { id: user.id, username: user.username, expiryDate: user.expiryDate },
       });
     }
 
@@ -2213,15 +2231,215 @@ app.get('/users/by-wallet/:wallet', async (request, reply) => {
       user: {
         id: user.id,
         username: user.username,
-        walletAddress: user.wallet_address,
-        licenseKey: user.license_key,
-        expiryDate: user.expiry_date,
+        walletAddress: user.walletAddress,
+        expiryDate: user.expiryDate,
         duration: user.duration,
+        gatedAccessEnrolledAt: user.gatedAccessEnrolledAt,
+        licenseKeyRevealedAt: user.licenseKeyRevealedAt,
       },
     };
   } catch (err) {
     app.log.error({ err, wallet }, 'getUserByWallet failed');
     return reply.status(500).send({ error: 'Failed to validate wallet' });
+  }
+});
+
+app.post('/access/boot', async (request, reply) => {
+  const body = (request.body ?? {}) as Record<string, unknown>;
+  const tokenHash = asOptionalString(body.tokenHash);
+  const deviceIdHash = asOptionalString(body.deviceIdHash);
+
+  if (deviceIdHash && !/^[a-f0-9]{64}$/i.test(deviceIdHash)) {
+    return reply.status(400).send({ error: 'deviceIdHash must be a sha256 hex string' });
+  }
+
+  if (tokenHash && !/^[a-f0-9]{64}$/i.test(tokenHash)) {
+    return reply.status(400).send({ error: 'tokenHash must be a sha256 hex string' });
+  }
+
+  try {
+    if (tokenHash && deviceIdHash) {
+      const session = await verifyWebAccessSession(tokenHash, deviceIdHash);
+      if (session) {
+        return {
+          state: 'access_granted',
+          source: session.accessMode,
+          userId: session.userId,
+          trustedUntil: session.trustedUntil,
+        };
+      }
+    }
+
+    if (!deviceIdHash) {
+      return { state: 'temporary_required' };
+    }
+
+    const device = await getTrustedDeviceEnrollment(deviceIdHash);
+    if (!device) {
+      return { state: 'temporary_required' };
+    }
+
+    const liveSessionCount = await getLiveSessionCountForUser(device.userId);
+    if (liveSessionCount > 0) {
+      return {
+        state: 'access_granted',
+        source: 'live_session_bypass',
+        userId: device.userId,
+        liveSessionCount,
+      };
+    }
+
+    return {
+      state: 'license_required',
+      userId: device.userId,
+    };
+  } catch (error) {
+    app.log.error({ error }, 'failed to resolve access boot state');
+    return reply.status(500).send({ error: 'Failed to resolve access state' });
+  }
+});
+
+app.post('/access/enroll', async (request, reply) => {
+  const body = (request.body ?? {}) as Record<string, unknown>;
+  const wallet = asOptionalString(body.wallet);
+  const deviceIdHash = asOptionalString(body.deviceIdHash);
+
+  if (!wallet || !publicKeyPattern.test(wallet)) {
+    return reply.status(400).send({ error: 'wallet must be a Solana public key' });
+  }
+
+  if (!deviceIdHash || !/^[a-f0-9]{64}$/i.test(deviceIdHash)) {
+    return reply.status(400).send({ error: 'deviceIdHash must be a sha256 hex string' });
+  }
+
+  try {
+    const enrollment = await enrollTrustedDeviceForWallet(wallet, deviceIdHash);
+    const liveSessionCount = await getLiveSessionCountForUser(enrollment.user.id);
+
+    return {
+      ok: true,
+      user: enrollment.user,
+      firstReveal: enrollment.firstReveal,
+      licenseKey: enrollment.licenseKey,
+      liveSessionCount,
+    };
+  } catch (error) {
+    app.log.error({ error, wallet }, 'failed to enroll trusted device');
+    const details = error instanceof Error ? error.message : String(error);
+    const status = details === 'User not found'
+      ? 404
+      : details === 'Access disabled' || details === 'License expired' || details === 'License key not assigned'
+        ? 403
+        : 500;
+
+    return reply.status(status).send({ error: 'Failed to enroll trusted device', details });
+  }
+});
+
+app.post('/access/license-auth', async (request, reply) => {
+  const body = (request.body ?? {}) as Record<string, unknown>;
+  const licenseKey = asOptionalString(body.licenseKey);
+  const deviceIdHash = asOptionalString(body.deviceIdHash);
+
+  if (!licenseKey) {
+    return reply.status(400).send({ error: 'licenseKey is required' });
+  }
+
+  if (!deviceIdHash || !/^[a-f0-9]{64}$/i.test(deviceIdHash)) {
+    return reply.status(400).send({ error: 'deviceIdHash must be a sha256 hex string' });
+  }
+
+  try {
+    const user = await verifyTrustedDeviceLicense(licenseKey, deviceIdHash);
+    const liveSessionCount = await getLiveSessionCountForUser(user.id);
+
+    return {
+      ok: true,
+      user,
+      liveSessionCount,
+    };
+  } catch (error) {
+    app.log.error({ error }, 'failed to validate trusted-device license key');
+    const details = error instanceof Error ? error.message : String(error);
+    const status = details === 'Trusted device enrollment not found'
+      ? 404
+      : details === 'License key does not match the enrolled device' || details === 'Access disabled' || details === 'License expired' || details === 'License key not assigned'
+        ? 403
+        : details === 'User not found'
+          ? 404
+          : 500;
+
+    return reply.status(status).send({ error: 'Failed to validate license key', details });
+  }
+});
+
+app.post('/access/license-revealed', async (request, reply) => {
+  const body = (request.body ?? {}) as Record<string, unknown>;
+  const userId = asOptionalString(body.userId);
+
+  if (!userId) {
+    return reply.status(400).send({ error: 'userId is required' });
+  }
+
+  try {
+    const user = await acknowledgeLicenseKeyReveal(userId);
+    if (!user) {
+      return reply.status(404).send({ error: 'User not found' });
+    }
+
+    return { ok: true, user };
+  } catch (error) {
+    app.log.error({ error, userId }, 'failed to mark license key reveal');
+    return reply.status(500).send({ error: 'Failed to mark license reveal' });
+  }
+});
+
+app.post('/access/session', async (request, reply) => {
+  const body = (request.body ?? {}) as Record<string, unknown>;
+  const tokenHash = asOptionalString(body.tokenHash);
+  const userId = asOptionalString(body.userId);
+  const deviceIdHash = asOptionalString(body.deviceIdHash);
+  const accessMode = asOptionalString(body.accessMode);
+  const trustedUntil = asOptionalString(body.trustedUntil);
+
+  if (!tokenHash || !/^[a-f0-9]{64}$/i.test(tokenHash)) {
+    return reply.status(400).send({ error: 'tokenHash must be a sha256 hex string' });
+  }
+
+  if (!userId) {
+    return reply.status(400).send({ error: 'userId is required' });
+  }
+
+  if (!deviceIdHash || !/^[a-f0-9]{64}$/i.test(deviceIdHash)) {
+    return reply.status(400).send({ error: 'deviceIdHash must be a sha256 hex string' });
+  }
+
+  if (!accessMode || !['trusted_device', 'license_key', 'live_session_bypass'].includes(accessMode)) {
+    return reply.status(400).send({ error: 'accessMode must be trusted_device, license_key, or live_session_bypass' });
+  }
+
+  if (!trustedUntil || Number.isNaN(Date.parse(trustedUntil))) {
+    return reply.status(400).send({ error: 'trustedUntil must be a valid ISO timestamp' });
+  }
+
+  try {
+    const device = await getTrustedDeviceEnrollment(deviceIdHash);
+    if (!device || device.userId !== userId) {
+      return reply.status(403).send({ error: 'Trusted device does not belong to this user' });
+    }
+
+    const session = await createWebAccessSession({
+      tokenHash,
+      userId,
+      deviceIdHash,
+      accessMode: accessMode as 'trusted_device' | 'license_key' | 'live_session_bypass',
+      trustedUntil,
+    });
+
+    return { ok: true, session };
+  } catch (error) {
+    app.log.error({ error, userId }, 'failed to create web access session');
+    return reply.status(500).send({ error: 'Failed to create web access session' });
   }
 });
 

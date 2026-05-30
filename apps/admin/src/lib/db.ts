@@ -42,6 +42,8 @@ export interface RzUser {
   expiry_date: string | null;
   access_enabled: boolean;
   duration: string | null;
+  gated_access_enrolled_at: string | null;
+  license_key_revealed_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -56,9 +58,14 @@ export async function usersTableReady(): Promise<void> {
       expiry_date TIMESTAMPTZ,
       access_enabled BOOLEAN NOT NULL DEFAULT false,
       duration TEXT,
+      gated_access_enrolled_at TIMESTAMPTZ,
+      license_key_revealed_at TIMESTAMPTZ,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+    ALTER TABLE rz_users
+      ADD COLUMN IF NOT EXISTS gated_access_enrolled_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS license_key_revealed_at TIMESTAMPTZ;
     CREATE INDEX IF NOT EXISTS rz_users_wallet_idx ON rz_users(wallet_address);
   `);
 }

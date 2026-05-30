@@ -14,8 +14,16 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "RogueZero Trading",
-  description: "Autonomous Solana trading bot",
+  title: "Rogue Zero",
+  description: "0ttonomous Solution",
+  openGraph: {
+    title: "Rogue Zero",
+    description: "0ttonomous Solution",
+  },
+  twitter: {
+    title: "Rogue Zero",
+    description: "0ttonomous Solution",
+  },
 };
 
 export default function RootLayout({
