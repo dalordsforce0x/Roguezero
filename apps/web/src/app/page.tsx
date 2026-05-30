@@ -1040,33 +1040,43 @@ export default function Home() {
   const fundSession = useCallback(async (session: Session) => {
     if (auth.status !== 'authorized' || !publicKey) return;
 
-    const currentBalanceLamports = Number(session.funding.currentBalanceAtomic ?? '0');
-    const requiredLamports = Math.max(
-      0,
-      minimumFundingLamports - (Number.isFinite(currentBalanceLamports) ? currentBalanceLamports : 0),
-    );
-
-    if (requiredLamports <= 0) {
-      setFundingError(null);
-      void fetchSessions(auth.user.id);
-      return;
-    }
-
     setFundingSessionId(session.id);
     setFundingError(null);
     setFundingSignature(null);
     setCreateError(null);
 
     try {
+      const latestBlockhash = await connection.getLatestBlockhash('confirmed');
+      const feeProbeTransaction = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: publicKey,
+          toPubkey: new PublicKey(session.sessionWallet),
+          lamports: 1,
+        }),
+      );
+
+      feeProbeTransaction.feePayer = publicKey;
+      feeProbeTransaction.recentBlockhash = latestBlockhash.blockhash;
+
+      const estimatedFeeLamports = (await connection.getFeeForMessage(
+        feeProbeTransaction.compileMessage(),
+        'confirmed',
+      )).value ?? 5_000;
+      const walletBalanceLamports = await connection.getBalance(publicKey, 'confirmed');
+      const transferLamports = Math.max(0, walletBalanceLamports - estimatedFeeLamports);
+
+      if (transferLamports <= 0) {
+        throw new Error('Wallet balance is too low to fund the session after network fees');
+      }
+
       const transaction = new Transaction().add(
         SystemProgram.transfer({
           fromPubkey: publicKey,
           toPubkey: new PublicKey(session.sessionWallet),
-          lamports: requiredLamports,
+          lamports: transferLamports,
         }),
       );
 
-      const latestBlockhash = await connection.getLatestBlockhash('confirmed');
       transaction.feePayer = publicKey;
       transaction.recentBlockhash = latestBlockhash.blockhash;
 

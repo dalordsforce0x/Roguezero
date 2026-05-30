@@ -201,12 +201,26 @@ const defaultSessionSchedulingState: NonNullable<SessionServiceControl['scheduli
   lastTradeSubmittedAt: null,
 };
 
+const defaultSessionRotationState: NonNullable<SessionServiceControl['rotationState']> = {
+  activeStrategy: 'momentum',
+  queuedStrategy: 'momentum',
+  rotationIntervalMinutes: 60,
+  lastRotatedAt: null,
+  lockedUntil: null,
+};
+
 export const mergeSessionServiceControl = (
   base: SessionServiceControl,
   patch: SessionServiceControlPatch,
 ): SessionServiceControl => ({
   ...base,
   ...patch,
+  rotationState: patch.rotationState === undefined
+    ? base.rotationState
+    : {
+        ...(base.rotationState ?? defaultSessionRotationState),
+        ...patch.rotationState,
+      },
   positionState: patch.positionState === undefined
     ? base.positionState
     : {

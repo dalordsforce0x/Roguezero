@@ -1883,6 +1883,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
           rotationState: {
             activeStrategy: recommendation.recommended,
             queuedStrategy: recommendation.recommended,
+            rotationIntervalMinutes: rotationState?.rotationIntervalMinutes ?? 60,
             lastRotatedAt: new Date().toISOString(),
             lockedUntil: new Date(Date.now() + 60_000).toISOString(), // lock for 1 min to prevent thrashing
           },
