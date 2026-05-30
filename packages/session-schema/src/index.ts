@@ -71,7 +71,7 @@ export const managedStrategySchema = z.object({
 export const sessionRotationStateSchema = z.object({
   activeStrategy: strategyKeySchema,
   queuedStrategy: strategyKeySchema,
-  rotationIntervalMinutes: z.number().int().positive(),
+  rotationIntervalMinutes: z.number().int().positive().default(60),
   lastRotatedAt: isoDatetimeSchema.nullable(),
   lockedUntil: isoDatetimeSchema.nullable(),
 });
