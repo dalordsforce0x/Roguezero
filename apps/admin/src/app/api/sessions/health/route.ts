@@ -12,6 +12,12 @@ type SessionHealthRow = {
   stop_reason: string | null;
   last_trade_attempted_at: string | null;
   last_trade_submitted_at: string | null;
+  last_decision_at: string | null;
+  last_decision_outcome: 'attempted' | 'blocked' | 'submitted' | 'stopped' | 'error' | null;
+  last_decision_reason: string | null;
+  last_blocked_at: string | null;
+  last_blocked_reason: string | null;
+  blocked_reason_counts: Record<string, number> | null;
   last_sizing_at: string | null;
   last_sizing_decision: 'traded' | 'skipped' | null;
   last_sizing_reason: string | null;
@@ -58,6 +64,7 @@ type SessionHealthIssue = {
   reason: string;
   stopReason: string | null;
   lastTradeSubmittedAt: string | null;
+  lastBlockedReason: string | null;
 };
 
 type SessionSizingSnapshot = {
@@ -90,11 +97,23 @@ type SessionSizingSnapshot = {
   tradeContext: SessionHealthRow['last_sizing_trade_context'];
 };
 
+type LiveNoTradeSession = {
+  sessionId: string;
+  username: string;
+  status: string;
+  blocker: string;
+  lastDecisionOutcome: SessionHealthRow['last_decision_outcome'];
+  lastDecisionReason: string | null;
+  lastDecisionAgeMinutes: number | null;
+  lastSubmitAgeMinutes: number | null;
+};
+
 const ACTIVE_STALE_MINUTES = 5;
 const STOPPING_STALE_MINUTES = 3;
 const AWAITING_FUNDING_WARN_MINUTES = 15;
 const ISSUE_LIMIT = 8;
 const SIZING_LIMIT = 10;
+const LIVE_NO_TRADE_LIMIT = 25;
 
 const parseTimestamp = (value: Date | string | null | undefined) => {
   if (!value) return null;
@@ -123,6 +142,34 @@ const getMostRecentTimestamp = (...values: Array<Date | string | null | undefine
 const sortIssues = (issues: SessionHealthIssue[]) =>
   [...issues].sort((a, b) => b.ageMinutes - a.ageMinutes).slice(0, ISSUE_LIMIT);
 
+const classifyLiveNoTradeBlocker = (row: SessionHealthRow): string | null => {
+  if (row.status !== 'active' && row.status !== 'starting') {
+    return null;
+  }
+
+  if (row.last_decision_outcome === 'submitted') {
+    return null;
+  }
+
+  if (row.last_decision_outcome === 'blocked') {
+    return row.last_decision_reason ?? row.last_blocked_reason ?? 'blocked_unknown';
+  }
+
+  if (row.last_decision_outcome === 'error') {
+    return row.last_decision_reason ?? 'worker_error';
+  }
+
+  if (row.last_decision_outcome === 'stopped') {
+    return row.last_decision_reason ?? row.stop_reason ?? 'stopped';
+  }
+
+  if (row.last_decision_outcome === 'attempted') {
+    return 'attempting_no_submit';
+  }
+
+  return row.last_trade_submitted_at ? 'no_recent_submit' : 'no_submit_yet';
+};
+
 export async function GET() {
   try {
     const pool = getPool();
@@ -138,6 +185,12 @@ export async function GET() {
          s.stop_reason,
          s.service_control -> 'schedulingState' ->> 'lastTradeAttemptedAt' AS last_trade_attempted_at,
          s.service_control -> 'schedulingState' ->> 'lastTradeSubmittedAt' AS last_trade_submitted_at,
+         s.service_control -> 'schedulingState' ->> 'lastDecisionAt' AS last_decision_at,
+         s.service_control -> 'schedulingState' ->> 'lastDecisionOutcome' AS last_decision_outcome,
+         s.service_control -> 'schedulingState' ->> 'lastDecisionReason' AS last_decision_reason,
+         s.service_control -> 'schedulingState' ->> 'lastBlockedAt' AS last_blocked_at,
+         s.service_control -> 'schedulingState' ->> 'lastBlockedReason' AS last_blocked_reason,
+         s.service_control -> 'schedulingState' -> 'blockedReasonCounts' AS blocked_reason_counts,
          s.service_control -> 'lastSizing' ->> 'at' AS last_sizing_at,
          s.service_control -> 'lastSizing' ->> 'decision' AS last_sizing_decision,
          s.service_control -> 'lastSizing' ->> 'reason' AS last_sizing_reason,
@@ -184,7 +237,18 @@ export async function GET() {
     const awaitingFunding: SessionHealthIssue[] = [];
     const errors: SessionHealthIssue[] = [];
     const recentSizing: SessionSizingSnapshot[] = [];
+    const liveNoTradeSessions: LiveNoTradeSession[] = [];
     const liveUserIds = new Set<string>();
+    const decisionOutcomes: Record<string, number> = {
+      attempted: 0,
+      blocked: 0,
+      submitted: 0,
+      stopped: 0,
+      error: 0,
+      unknown: 0,
+    };
+    const blockedReasonTotals = new Map<string, number>();
+    const liveNoTradeBlockerCounts = new Map<string, number>();
 
     for (const row of result.rows) {
       countsByStatus[row.status] = (countsByStatus[row.status] ?? 0) + 1;
@@ -211,7 +275,37 @@ export async function GET() {
             reason: 'No worker activity recorded recently',
             stopReason: row.stop_reason,
             lastTradeSubmittedAt: row.last_trade_submitted_at,
+            lastBlockedReason: row.last_blocked_reason,
           });
+        }
+      }
+
+      if (row.status === 'active' || row.status === 'starting') {
+        const outcome = row.last_decision_outcome ?? 'unknown';
+        decisionOutcomes[outcome] = (decisionOutcomes[outcome] ?? 0) + 1;
+
+        if (row.blocked_reason_counts && typeof row.blocked_reason_counts === 'object') {
+          for (const [reason, count] of Object.entries(row.blocked_reason_counts)) {
+            if (!reason) continue;
+            const numericCount = Number(count);
+            if (!Number.isFinite(numericCount) || numericCount <= 0) continue;
+            blockedReasonTotals.set(reason, (blockedReasonTotals.get(reason) ?? 0) + numericCount);
+          }
+        }
+
+        const blocker = classifyLiveNoTradeBlocker(row);
+        if (blocker) {
+          liveNoTradeSessions.push({
+            sessionId: row.id,
+            username: row.username,
+            status: row.status,
+            blocker,
+            lastDecisionOutcome: row.last_decision_outcome,
+            lastDecisionReason: row.last_decision_reason,
+            lastDecisionAgeMinutes: minutesSince(row.last_decision_at),
+            lastSubmitAgeMinutes: minutesSince(row.last_trade_submitted_at),
+          });
+          liveNoTradeBlockerCounts.set(blocker, (liveNoTradeBlockerCounts.get(blocker) ?? 0) + 1);
         }
       }
 
@@ -232,6 +326,7 @@ export async function GET() {
             reason: 'Stop/return flow has been pending too long',
             stopReason: row.stop_reason,
             lastTradeSubmittedAt: row.last_trade_submitted_at,
+            lastBlockedReason: row.last_blocked_reason,
           });
         }
       }
@@ -247,6 +342,7 @@ export async function GET() {
             reason: 'Session has been waiting on user funding for a while',
             stopReason: row.stop_reason,
             lastTradeSubmittedAt: row.last_trade_submitted_at,
+            lastBlockedReason: row.last_blocked_reason,
           });
         }
       }
@@ -261,6 +357,7 @@ export async function GET() {
           reason: 'Session is in error state',
           stopReason: row.stop_reason,
           lastTradeSubmittedAt: row.last_trade_submitted_at,
+          lastBlockedReason: row.last_blocked_reason,
         });
       }
 
@@ -314,6 +411,21 @@ export async function GET() {
     const recentSizingSnapshots = [...recentSizing]
       .sort((a, b) => Date.parse(b.at) - Date.parse(a.at))
       .slice(0, SIZING_LIMIT);
+    const topBlockedReasons = [...blockedReasonTotals.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 10)
+      .map(([reason, count]) => ({ reason, count }));
+    const topLiveNoTradeBlockers = [...liveNoTradeBlockerCounts.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 10)
+      .map(([reason, count]) => ({ reason, count }));
+    const liveNoTradeSnapshot = [...liveNoTradeSessions]
+      .sort((a, b) => {
+        const aAge = a.lastDecisionAgeMinutes ?? Number.MAX_SAFE_INTEGER;
+        const bAge = b.lastDecisionAgeMinutes ?? Number.MAX_SAFE_INTEGER;
+        return bAge - aAge;
+      })
+      .slice(0, LIVE_NO_TRADE_LIMIT);
 
     return NextResponse.json({
       generatedAt: new Date().toISOString(),
@@ -329,6 +441,14 @@ export async function GET() {
         readyOrStartingSessions: (countsByStatus.ready ?? 0) + (countsByStatus.starting ?? 0),
         stoppingSessions: countsByStatus.stopping,
         attentionCount: staleActive.length + staleStopping.length + errors.length,
+      },
+      tradeDecisions: {
+        outcomes: decisionOutcomes,
+        topBlockedReasons,
+      },
+      liveNoTrade: {
+        sessions: liveNoTradeSnapshot,
+        topBlockers: topLiveNoTradeBlockers,
       },
       countsByStatus,
       issues: {
@@ -354,6 +474,21 @@ export async function GET() {
         readyOrStartingSessions: 0,
         stoppingSessions: 0,
         attentionCount: 0,
+      },
+      tradeDecisions: {
+        outcomes: {
+          attempted: 0,
+          blocked: 0,
+          submitted: 0,
+          stopped: 0,
+          error: 0,
+          unknown: 0,
+        },
+        topBlockedReasons: [],
+      },
+      liveNoTrade: {
+        sessions: [],
+        topBlockers: [],
       },
       countsByStatus: {
         awaiting_funding: 0,

@@ -1,6 +1,6 @@
 import { z } from 'zod';
 
-export const schemaVersion = '2026-05-29.2';
+export const schemaVersion = '2026-05-30.1';
 
 export const sessionNetworkValues = ['mainnet-beta', 'devnet'] as const;
 export const sessionStatusValues = [
@@ -79,6 +79,12 @@ export const sessionRotationStateSchema = z.object({
 export const sessionSchedulingStateSchema = z.object({
   lastTradeAttemptedAt: isoDatetimeSchema.nullable(),
   lastTradeSubmittedAt: isoDatetimeSchema.nullable(),
+  lastDecisionAt: isoDatetimeSchema.nullable().default(null),
+  lastDecisionOutcome: z.enum(['attempted', 'blocked', 'submitted', 'stopped', 'error']).nullable().default(null),
+  lastDecisionReason: z.string().nullable().default(null),
+  lastBlockedAt: isoDatetimeSchema.nullable().default(null),
+  lastBlockedReason: z.string().nullable().default(null),
+  blockedReasonCounts: z.record(z.string(), z.number().int().nonnegative()).default({}),
 });
 
 // Stage 3 adaptive sizing — last decision snapshot for admin visibility.
@@ -199,6 +205,12 @@ const defaultSessionPositionState: NonNullable<SessionServiceControl['positionSt
 const defaultSessionSchedulingState: NonNullable<SessionServiceControl['schedulingState']> = {
   lastTradeAttemptedAt: null,
   lastTradeSubmittedAt: null,
+  lastDecisionAt: null,
+  lastDecisionOutcome: null,
+  lastDecisionReason: null,
+  lastBlockedAt: null,
+  lastBlockedReason: null,
+  blockedReasonCounts: {},
 };
 
 const defaultSessionRotationState: NonNullable<SessionServiceControl['rotationState']> = {

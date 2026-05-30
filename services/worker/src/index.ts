@@ -1802,12 +1802,14 @@ const executeTrade = async (session: RawSession): Promise<void> => {
   );
   const inflightCount = Number(inflightCheck.rows[0]?.cnt ?? 0);
   if (inflightCount > 0) {
+    await persistTradeDecision(session, 'blocked', 'in_flight_execution');
     log('info', session.id, `skipping trade â€” ${inflightCount} in-flight execution(s) pending reconciliation`);
     return;
   }
 
   const keypair = await getKeypair(session.id);
   if (!keypair) {
+    await persistTradeDecision(session, 'blocked', 'missing_session_keypair');
     log('warn', session.id, 'no keypair found â€” skipping trade');
     return;
   }
@@ -1868,6 +1870,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
   } else {
     // Default: momentum (existing behavior)
     if (!lastSignalSnapshot) {
+      await persistTradeDecision(session, 'blocked', 'signal_not_ready');
       await persistLastTradeGate(session, {
         at: new Date().toISOString(),
         decision: 'blocked',
@@ -1908,6 +1911,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
   }
 
   if (!effectiveSignal) {
+    await persistTradeDecision(session, 'blocked', 'signal_not_ready');
     await persistLastTradeGate(session, {
       at: new Date().toISOString(),
       decision: 'blocked',
@@ -1923,6 +1927,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
   await persistLastSignal(session, effectiveSignal);
 
   if (effectiveSignal.status !== 'ready') {
+    await persistTradeDecision(session, 'blocked', `signal_${effectiveSignal.status}`);
     await persistLastTradeGate(session, {
       at: new Date().toISOString(),
       decision: 'blocked',
@@ -1938,6 +1943,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
   const lastTradeSubmittedMs = getLastTradeSubmittedMs(session);
   const msSinceLastSubmit = lastTradeSubmittedMs > 0 ? (Date.now() - lastTradeSubmittedMs) : Number.POSITIVE_INFINITY;
   if (msSinceLastSubmit < POST_SUBMIT_RECONCILE_GRACE_MS) {
+    await persistTradeDecision(session, 'blocked', 'post_submit_reconcile_grace');
     log(
       'info',
       session.id,
@@ -1948,6 +1954,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
 
   // Verify keypair matches session wallet
   if (keypair.publicKey.toBase58() !== session.session_wallet) {
+    await persistTradeDecision(session, 'error', 'session_keypair_mismatch');
     log('warn', session.id, `keypair mismatch: stored=${keypair.publicKey.toBase58()} session=${session.session_wallet}`);
     return;
   }
@@ -1957,6 +1964,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
   try {
     balance = await rlGetBalance(keypair.publicKey);
   } catch {
+    await persistTradeDecision(session, 'error', 'balance_check_failed');
     log('warn', session.id, 'balance check failed before trade');
     return;
   }
@@ -1974,6 +1982,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
     : MIN_TRADEABLE_LAMPORTS;
 
   if (balance < minimumRequiredLamports) {
+    await persistTradeDecision(session, 'stopped', 'insufficient_balance');
     log('warn', session.id, `insufficient balance for trade: ${balance}/${minimumRequiredLamports} lamports`);
     await setSessionStatus(session.id, 'stopping', { stop_reason: 'depleted' }, { expectedStatuses: ['active'] });
     log('info', session.id, 'balance depleted â†’ stopping (sweep will run)');
@@ -1984,6 +1993,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
   const { realizedPnlUsd, capturedFeesUsd } = session.funding;
   const sessionLoss = Math.abs(Math.min(0, realizedPnlUsd));
   if (sessionLoss >= session.risk_limits.maxSessionLossUsd) {
+    await persistTradeDecision(session, 'stopped', 'risk_limit_hit');
     await setSessionStatus(session.id, 'stopping', { stop_reason: 'risk_limit_hit' }, { expectedStatuses: ['active'] });
     log('info', session.id, `risk limit hit (loss $${sessionLoss.toFixed(2)}) â†’ stopping (sweep will run)`);
     return;
@@ -1995,6 +2005,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
     const exitTrigger = evaluateExitTrigger(positionState, effectiveSignal);
 
     if (!exitTrigger.shouldExit) {
+      await persistTradeDecision(session, 'blocked', 'no_exit_trigger');
       if (positionState.pendingExitReason !== null) {
         await persistServiceControl(session, {
           positionState: {
@@ -2100,6 +2111,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
     };
   } else {
     if (effectiveSignal.regime !== 'bullish') {
+      await persistTradeDecision(session, 'blocked', 'no_bullish_entry_signal');
       await persistLastTradeGate(session, {
         at: new Date().toISOString(),
         decision: 'blocked',
@@ -2113,6 +2125,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
     }
 
     if (balance < MIN_SOL_OPERATING_RESERVE_LAMPORTS) {
+      await persistTradeDecision(session, 'blocked', 'insufficient_sol_fee_reserve');
       await persistLastTradeGate(session, {
         at: new Date().toISOString(),
         decision: 'blocked',
@@ -2147,6 +2160,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
     };
 
     if (usdcSizing.skip) {
+      await persistTradeDecision(session, 'blocked', usdcSizing.reason ?? 'entry_inventory_blocked');
       await persistLastTradeGate(session, {
         at: new Date().toISOString(),
         decision: 'blocked',
@@ -2318,6 +2332,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
   }
 
   if (!forceExitExecution && economics && (!economics.economicallyViable || !economics.withinRiskBudget)) {
+    await persistTradeDecision(session, 'blocked', sizingReason ?? 'economics_blocked');
     await persistLastTradeGate(session, {
       at: new Date().toISOString(),
       decision: 'blocked',
@@ -2375,6 +2390,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
   }
 
   if (tradeGate && !tradeGate.allowed) {
+    await persistTradeDecision(session, 'blocked', tradeGate.reason);
     await persistLastTradeGate(session, {
       at: new Date().toISOString(),
       decision: 'blocked',
@@ -2433,6 +2449,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
   }
 
   if (!prepare.ok || !prepare.data.preparedTransactionBase64 || !prepare.data.executionId) {
+    await persistTradeDecision(session, 'blocked', 'prepare_failed');
     log('warn', session.id, `prepare failed (${prepare.status}): ${prepare.data.error ?? JSON.stringify(prepare.data)}`);
     if (prepare.data.shortfall) {
       await setSessionStatus(session.id, 'stopping', { stop_reason: 'depleted' }, { expectedStatuses: ['active'] });
@@ -2459,6 +2476,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
   }
 
   if (prepare.data.simulation?.err) {
+    await persistTradeDecision(session, 'blocked', 'simulation_error');
     log('warn', session.id, `simulation error: ${JSON.stringify(prepare.data.simulation.err)}`);
     if (prepare.data.shortfall) {
       await setSessionStatus(session.id, 'stopping', { stop_reason: 'depleted' }, { expectedStatuses: ['active'] });
@@ -2559,6 +2577,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
   });
 
   if (!submit.ok) {
+    await persistTradeDecision(session, 'blocked', 'submit_failed');
     log('warn', session.id, `submit failed (${submit.status}): ${submit.data.error ?? JSON.stringify(submit.data)}`);
     const submitErrorText = submit.data.error ?? '';
     const submitBlockhashExpired = submit.status === 409 && /blockhash|expired/i.test(submitErrorText);
@@ -2581,6 +2600,8 @@ const executeTrade = async (session: RawSession): Promise<void> => {
 
   log('info', session.id, `trade submitted â€” sig: ${submit.data.signature ?? 'pending'} status: ${submit.data.status}`);
   consecutiveSimFailures.delete(session.id);
+
+  await persistTradeDecision(session, 'submitted', submit.data.status ?? 'submitted');
 
   try {
     await persistSchedulingState(session, {
@@ -2649,6 +2670,49 @@ const persistSchedulingState = async (
   };
 
   await mergeServiceControlPatch(session, { schedulingState });
+};
+
+const BLOCKED_REASON_COUNTER_LIMIT = 20;
+
+const trimBlockedReasonCounts = (counts: Record<string, number>) => {
+  const nextEntries = Object.entries(counts)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, BLOCKED_REASON_COUNTER_LIMIT);
+
+  return Object.fromEntries(nextEntries);
+};
+
+const persistTradeDecision = async (
+  session: RawSession,
+  outcome: NonNullable<NonNullable<Session['serviceControl']['schedulingState']>['lastDecisionOutcome']>,
+  reason: string | null,
+) => {
+  const nowIso = new Date().toISOString();
+
+  if (outcome === 'blocked' && reason) {
+    const latestSession = await getSessionById(session.id);
+    const currentCounts = latestSession?.service_control?.schedulingState?.blockedReasonCounts ?? {};
+    const nextCounts = trimBlockedReasonCounts({
+      ...currentCounts,
+      [reason]: (currentCounts[reason] ?? 0) + 1,
+    });
+
+    await persistSchedulingState(session, {
+      lastDecisionAt: nowIso,
+      lastDecisionOutcome: outcome,
+      lastDecisionReason: reason,
+      lastBlockedAt: nowIso,
+      lastBlockedReason: reason,
+      blockedReasonCounts: nextCounts,
+    });
+    return;
+  }
+
+  await persistSchedulingState(session, {
+    lastDecisionAt: nowIso,
+    lastDecisionOutcome: outcome,
+    lastDecisionReason: reason,
+  });
 };
 
 const releaseTradeWindowReservation = async (session: RawSession) => {
@@ -2766,7 +2830,13 @@ const reserveTradeWindow = async (session: RawSession): Promise<boolean> => {
   lastTradedAt.set(session.id, now);
 
   try {
-    await persistSchedulingState(session, { lastTradeAttemptedAt: new Date(now).toISOString() });
+    const nowIso = new Date(now).toISOString();
+    await persistSchedulingState(session, {
+      lastTradeAttemptedAt: nowIso,
+      lastDecisionAt: nowIso,
+      lastDecisionOutcome: 'attempted',
+      lastDecisionReason: null,
+    });
   } catch (err) {
     log('warn', session.id, `failed to persist scheduling state: ${String(err)}`);
   }
