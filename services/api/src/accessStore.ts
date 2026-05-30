@@ -116,6 +116,8 @@ export const accessTablesReady = async () => {
     const dbPool = getPool();
     readyPromise = dbPool.query(`
       ALTER TABLE rz_users
+        ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         ADD COLUMN IF NOT EXISTS gated_access_enrolled_at TIMESTAMPTZ,
         ADD COLUMN IF NOT EXISTS license_key_revealed_at TIMESTAMPTZ;
     `)

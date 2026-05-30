@@ -55,6 +55,90 @@ const requiredLiveKeys = [
 export type RuntimeEnv = z.infer<typeof envSchema>;
 export type RequiredLiveKey = (typeof requiredLiveKeys)[number];
 export type JupiterFeeToken = (typeof jupiterFeeTokenValues)[number];
+export const runtimeSpeedProfileValues = ['glide', 'pulse', 'surge'] as const;
+export type RuntimeSpeedProfileName = (typeof runtimeSpeedProfileValues)[number];
+
+export type RuntimeSpeedProfile = {
+  name: RuntimeSpeedProfileName;
+  label: string;
+  maxSolEntryUsd: number;
+  concurrentCapacity: number;
+  cadenceMs: {
+    readyStarting: number;
+    activeInPosition: number;
+    activeFlat: number;
+    activeGuarded: number;
+    stopping: number;
+    postSubmitFast: number;
+  };
+};
+
+const runtimeSpeedProfileDefinitions = {
+  glide: {
+    label: 'Glide',
+    maxSolEntryUsd: 1_500,
+    capacityDivisor: 1,
+    cadenceMs: {
+      readyStarting: 6_000,
+      activeInPosition: 9_000,
+      activeFlat: 45_000,
+      activeGuarded: 60_000,
+      stopping: 6_000,
+      postSubmitFast: 2_500,
+    },
+  },
+  pulse: {
+    label: 'Pulse',
+    maxSolEntryUsd: 4_500,
+    capacityDivisor: 2,
+    cadenceMs: {
+      readyStarting: 3_500,
+      activeInPosition: 5_500,
+      activeFlat: 30_000,
+      activeGuarded: 45_000,
+      stopping: 5_000,
+      postSubmitFast: 1_500,
+    },
+  },
+  surge: {
+    label: 'Surge',
+    maxSolEntryUsd: 10_000,
+    capacityDivisor: 3,
+    cadenceMs: {
+      readyStarting: 2_000,
+      activeInPosition: 3_000,
+      activeFlat: 15_000,
+      activeGuarded: 25_000,
+      stopping: 4_000,
+      postSubmitFast: 1_000,
+    },
+  },
+} as const;
+
+export const normalizeRuntimeSpeedProfileName = (value: string | null | undefined): RuntimeSpeedProfileName => {
+  if (value === 'glide' || value === 'pulse' || value === 'surge') {
+    return value;
+  }
+
+  return 'pulse';
+};
+
+export const getRuntimeSpeedProfile = (
+  value: string | null | undefined,
+  env: NodeJS.ProcessEnv,
+): RuntimeSpeedProfile => {
+  const name = normalizeRuntimeSpeedProfileName(value);
+  const definition = runtimeSpeedProfileDefinitions[name];
+  const baseConcurrentCapacity = Number(env.WORKER_BASE_CONCURRENT_CAPACITY ?? 120);
+
+  return {
+    name,
+    label: definition.label,
+    maxSolEntryUsd: definition.maxSolEntryUsd,
+    concurrentCapacity: Math.max(1, Math.floor(baseConcurrentCapacity / definition.capacityDivisor)),
+    cadenceMs: definition.cadenceMs,
+  };
+};
 
 export type WorkerFundingThresholds = {
   tradeAmountLamports: number;
@@ -313,6 +397,20 @@ export const computeTradeAmountLamports = (params: {
     tradableLamports,
     targetLamports,
   };
+};
+
+export const computeSolEntryCapLamports = (params: {
+  profileName: string | null | undefined;
+  solUsdPrice: number | null | undefined;
+  env: NodeJS.ProcessEnv;
+}) => {
+  const solUsdPrice = params.solUsdPrice ?? 0;
+  if (!Number.isFinite(solUsdPrice) || solUsdPrice <= 0) {
+    return null;
+  }
+
+  const profile = getRuntimeSpeedProfile(params.profileName, params.env);
+  return Math.max(1, Math.floor((profile.maxSolEntryUsd / solUsdPrice) * 1_000_000_000));
 };
 
 // ── Stage 4 price feeds ──────────────────────────────────────────────────────

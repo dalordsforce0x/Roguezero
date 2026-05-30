@@ -1,8 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  computeSolEntryCapLamports,
   computeTradeAmountLamports,
   getHeliusRpcUrl,
+  getRuntimeSpeedProfile,
   getWorkerFundingThresholds,
   getWorkerSizingPolicy,
 } from './index.js';
@@ -130,4 +132,18 @@ test('computeTradeAmountLamports skips when balance cannot cover reserve', () =>
     assert.equal(decision.targetLamports, 0);
     assert.equal(decision.sizedLamports, 0);
   }
+});
+
+test('getRuntimeSpeedProfile derives entry caps and capacity', () => {
+  const glide = getRuntimeSpeedProfile('glide', baseEnv);
+  const pulse = getRuntimeSpeedProfile('pulse', baseEnv);
+  const surge = getRuntimeSpeedProfile('surge', baseEnv);
+
+  assert.equal(glide.maxSolEntryUsd, 1500);
+  assert.equal(glide.concurrentCapacity, 120);
+  assert.equal(pulse.maxSolEntryUsd, 4500);
+  assert.equal(pulse.concurrentCapacity, 60);
+  assert.equal(surge.maxSolEntryUsd, 10000);
+  assert.equal(surge.concurrentCapacity, 40);
+  assert.equal(computeSolEntryCapLamports({ profileName: 'surge', solUsdPrice: 200, env: baseEnv }), 50_000_000_000);
 });

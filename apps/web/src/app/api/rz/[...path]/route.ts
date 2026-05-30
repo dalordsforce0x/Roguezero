@@ -1,9 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
 
 const getApiBaseUrl = () => {
-  const fromEnv = process.env.API_INTERNAL_URL ?? process.env.API_URL;
+  const fromEnv = process.env.API_INTERNAL_URL ?? process.env.API_URL ?? process.env.NEXT_PUBLIC_API_URL;
   if (!fromEnv) {
-    throw new Error('API_INTERNAL_URL (or API_URL) must be set on the web service');
+    throw new Error('API_INTERNAL_URL (or API_URL / NEXT_PUBLIC_API_URL) must be set on the web service');
   }
   return fromEnv.endsWith('/') ? fromEnv.slice(0, -1) : fromEnv;
 };

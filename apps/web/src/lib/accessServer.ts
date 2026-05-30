@@ -9,9 +9,9 @@ export const TEMP_GATE_TTL_SECONDS = 30 * 60;
 export const ACCESS_TTL_SECONDS = ACCESS_TRUST_HOURS * 60 * 60;
 
 const getApiBaseUrl = () => {
-  const fromEnv = process.env.API_INTERNAL_URL ?? process.env.API_URL;
+  const fromEnv = process.env.API_INTERNAL_URL ?? process.env.API_URL ?? process.env.NEXT_PUBLIC_API_URL;
   if (!fromEnv) {
-    throw new Error('API_INTERNAL_URL (or API_URL) must be set on the web service');
+    throw new Error('API_INTERNAL_URL (or API_URL / NEXT_PUBLIC_API_URL) must be set on the web service');
   }
   return fromEnv.endsWith('/') ? fromEnv.slice(0, -1) : fromEnv;
 };
@@ -64,7 +64,14 @@ export const callInternalApi = async <T>(path: string, init?: {
   });
 
   const text = await response.text();
-  const json = text.length > 0 ? JSON.parse(text) as T : null;
+  let json: T | null = null;
+  if (text.length > 0) {
+    try {
+      json = JSON.parse(text) as T;
+    } catch {
+      json = ({ error: text } as unknown) as T;
+    }
+  }
   return { response, json };
 };
 

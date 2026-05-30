@@ -27,17 +27,21 @@ import {
 } from '@solana/spl-token';
 import { createSharedTokenBucket, getExponentialBackoffDelayMs } from '@roguezero/provider-governor';
 import {
+  computeSolEntryCapLamports,
   computeTradeAmountLamports,
   getDatabaseConnectionUrl,
   getHeliusRpcUrl,
   getJupiterPriceConfig,
   getPythPriceConfig,
+  getRuntimeSpeedProfile,
   getRuntimeConfigReport,
   getWorkerFundingThresholds,
   getWorkerPositionExitPolicy,
   getWorkerPricePollPolicy,
   getWorkerSignalPolicy,
   getWorkerSizingPolicy,
+  normalizeRuntimeSpeedProfileName,
+  type RuntimeSpeedProfileName,
   type JupiterPriceConfig,
   type PythPriceConfig,
   type TradeSizingDecision,
@@ -76,12 +80,6 @@ const API_BASE = process.env.API_URL;
 const WORKER_INTERNAL_SECRET = process.env.RZ_INTERNAL_SECRET?.trim() ?? '';
 const POLL_MS  = Number(process.env.WORKER_POLL_INTERVAL_MS ?? 5000);
 const MIN_LOOP_MS = Number(process.env.WORKER_MIN_LOOP_INTERVAL_MS ?? 250);
-const READY_STARTING_POLL_MS = Number(process.env.WORKER_READY_STARTING_POLL_MS ?? 3000);
-const ACTIVE_IN_POSITION_POLL_MS = Number(process.env.WORKER_ACTIVE_IN_POSITION_POLL_MS ?? 5000);
-const ACTIVE_FLAT_POLL_MS = Number(process.env.WORKER_ACTIVE_FLAT_POLL_MS ?? 30000);
-const ACTIVE_GUARDED_POLL_MS = Number(process.env.WORKER_ACTIVE_GUARDED_POLL_MS ?? 45000);
-const STOPPING_POLL_MS = Number(process.env.WORKER_STOPPING_POLL_MS ?? 5000);
-const POST_SUBMIT_FAST_POLL_MS = Number(process.env.WORKER_POST_SUBMIT_FAST_POLL_MS ?? 1500);
 const LOOP_JITTER_RATIO = Number(process.env.WORKER_LOOP_JITTER_RATIO ?? 0.1);
 const FUNDING_POLL_FALLBACK_MS = Number(process.env.WORKER_FUNDING_POLL_FALLBACK_MS ?? 60000);
 const POST_SUBMIT_RECONCILE_GRACE_MS = Number(process.env.WORKER_POST_SUBMIT_RECONCILE_GRACE_MS ?? 10000);
@@ -121,6 +119,11 @@ const TX_FEE_LAMPORTS = fundingThresholds.txFeeLamports;
 const MIN_TRADEABLE_LAMPORTS = fundingThresholds.minimumTradeableLamports;
 const MIN_SOL_OPERATING_RESERVE_LAMPORTS = TX_FEE_LAMPORTS + OPERATING_BUFFER_LAMPORTS;
 const MIN_USDC_ENTRY_ATOMIC = Number(process.env.WORKER_MIN_USDC_ENTRY_ATOMIC ?? 1_000_000);
+const RUNTIME_CONTROL_KEY = 'global_live_runtime';
+const RUNTIME_CONTROL_REFRESH_MS = Number(process.env.RUNTIME_CONTROL_REFRESH_MS ?? 5000);
+let liveSpeedProfileName: RuntimeSpeedProfileName = normalizeRuntimeSpeedProfileName(process.env.WORKER_SPEED_PROFILE);
+let liveSpeedProfile = getRuntimeSpeedProfile(liveSpeedProfileName, process.env);
+let lastRuntimeControlRefreshAt = 0;
 
 // â”€â”€ DB pool â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
@@ -172,6 +175,12 @@ type RawSession = {
   funding: Session['funding'];
 };
 
+type RuntimeControlRow = {
+  state: {
+    speedProfile?: unknown;
+  } | null;
+};
+
 const querySessions = async (statuses: string[]): Promise<RawSession[]> => {
   const dbPool = getPool();
   const placeholders = statuses.map((_, i) => `$${i + 1}`).join(', ');
@@ -196,6 +205,55 @@ const getSessionById = async (id: string): Promise<RawSession | null> => {
   );
   return result.rows[0] ?? null;
 };
+
+const ensureRuntimeControlStore = async () => {
+  await getPool().query(`
+    CREATE TABLE IF NOT EXISTS runtime_control_settings (
+      control_key TEXT PRIMARY KEY,
+      state JSONB NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+};
+
+const refreshLiveRuntimeControl = async (force = false) => {
+  const now = Date.now();
+  if (!force && (now - lastRuntimeControlRefreshAt) < RUNTIME_CONTROL_REFRESH_MS) {
+    return liveSpeedProfile;
+  }
+
+  await ensureRuntimeControlStore();
+  const result = await getPool().query<RuntimeControlRow>(
+    `SELECT state
+       FROM runtime_control_settings
+      WHERE control_key = $1
+      LIMIT 1`,
+    [RUNTIME_CONTROL_KEY],
+  );
+
+  const selectedProfile = normalizeRuntimeSpeedProfileName(
+    typeof result.rows[0]?.state?.speedProfile === 'string'
+      ? result.rows[0].state.speedProfile
+      : process.env.WORKER_SPEED_PROFILE,
+  );
+
+  if (result.rowCount === 0) {
+    await getPool().query(
+      `INSERT INTO runtime_control_settings (control_key, state, updated_at)
+       VALUES ($1, $2::jsonb, NOW())
+       ON CONFLICT (control_key)
+       DO UPDATE SET state = runtime_control_settings.state`,
+      [RUNTIME_CONTROL_KEY, JSON.stringify({ speedProfile: selectedProfile })],
+    );
+  }
+
+  liveSpeedProfileName = selectedProfile;
+  liveSpeedProfile = getRuntimeSpeedProfile(selectedProfile, process.env);
+  lastRuntimeControlRefreshAt = now;
+  return liveSpeedProfile;
+};
+
+const getLiveSpeedProfile = () => liveSpeedProfile;
 
 const setSessionStatus = async (
   id: string,
@@ -1109,6 +1167,15 @@ const checkFunding = async (session: RawSession, observedBalance?: number): Prom
     }
     const markedAt = new Date().toISOString();
     const markedPriceUsd = lastPythSolSample?.usdPrice ?? null;
+      const cappedInitialPositionLamports = (() => {
+        const capLamports = computeSolEntryCapLamports({
+          profileName: liveSpeedProfileName,
+          solUsdPrice: markedPriceUsd,
+          env: process.env,
+        });
+
+        return capLamports ? Math.min(balance, capLamports) : balance;
+      })();
     await mergeFundingPatch(session, {
       startingBalanceAtomic: String(balance),
       currentBalanceAtomic: String(balance),
@@ -1118,7 +1185,7 @@ const checkFunding = async (session: RawSession, observedBalance?: number): Prom
         status: 'long_sol',
         entryPriceUsd: markedPriceUsd,
         entryAt: markedAt,
-        quantityAtomic: String(balance),
+          quantityAtomic: String(cappedInitialPositionLamports),
         highWaterPriceUsd: markedPriceUsd,
         lastMarkedPriceUsd: markedPriceUsd,
         lastMarkedAt: markedAt,
@@ -1133,6 +1200,9 @@ const checkFunding = async (session: RawSession, observedBalance?: number): Prom
         log('warn', session.id, `failed to remove funding subscription: ${String(err)}`);
       });
       fundingSubscriptionIds.delete(session.id);
+    }
+    if (cappedInitialPositionLamports < balance) {
+      log('info', session.id, `initial SOL exposure capped by ${liveSpeedProfile.label}: ${cappedInitialPositionLamports}/${balance} lamports`);
     }
     log('info', session.id, `funded (${balance} lamports) â†’ ready`);
   } else {
@@ -1360,11 +1430,12 @@ const getUsdValueFromAtomicAmount = (mint: string, amountAtomic: number): number
 
 const computeUsdcTradeAmountAtomic = (params: {
   balanceAtomic: number;
+  maxPositionUsd: number;
 }): UsdcTradeSizingDecision => {
   const balanceAtomic = Math.max(0, Math.floor(params.balanceAtomic));
   const targetAtomic = balanceAtomic;
-  const maxTradeAtomic = balanceAtomic;
-  const amountAtomic = balanceAtomic;
+  const maxTradeAtomic = Math.max(0, Math.floor(params.maxPositionUsd * USDC_ATOMIC_PER_USD));
+  const amountAtomic = Math.min(balanceAtomic, maxTradeAtomic);
 
   if (balanceAtomic < MIN_USDC_ENTRY_ATOMIC) {
     return {
@@ -2031,6 +2102,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
     const usdcBalanceAtomic = await getTokenBalanceAtomic(keypair.publicKey, USDC_MINT);
     const usdcSizing = computeUsdcTradeAmountAtomic({
       balanceAtomic: usdcBalanceAtomic,
+        maxPositionUsd: getLiveSpeedProfile().maxSolEntryUsd,
     });
 
     const entryInventory: TradeInventoryContext = {
@@ -2627,31 +2699,32 @@ const applyCadenceJitter = (delayMs: number): number => {
 };
 
 const getSessionCadenceMs = (session: RawSession): number => {
+  const cadence = getLiveSpeedProfile().cadenceMs;
   switch (session.status) {
     case 'awaiting_funding':
       return FUNDING_POLL_FALLBACK_MS;
     case 'ready':
     case 'starting':
-      return READY_STARTING_POLL_MS;
+      return cadence.readyStarting;
     case 'stopping':
-      return STOPPING_POLL_MS;
+      return cadence.stopping;
     case 'active': {
       const lastSubmittedMs = getLastTradeSubmittedMs(session);
       if (lastSubmittedMs > 0 && (Date.now() - lastSubmittedMs) < POST_SUBMIT_RECONCILE_GRACE_MS) {
-        return POST_SUBMIT_FAST_POLL_MS;
+        return cadence.postSubmitFast;
       }
 
       const positionState = getPositionState(session);
       if (positionState.status === 'long_sol') {
-        return ACTIVE_IN_POSITION_POLL_MS;
+        return cadence.activeInPosition;
       }
 
       const signalStatus = session.service_control.lastSignal?.status;
       if (signalStatus === 'guarded_off' || signalStatus === 'warming_up') {
-        return ACTIVE_GUARDED_POLL_MS;
+        return cadence.activeGuarded;
       }
 
-      return ACTIVE_FLAT_POLL_MS;
+      return cadence.activeFlat;
     }
     default:
       return POLL_MS;
@@ -3066,6 +3139,7 @@ const log = (level: 'info' | 'warn' | 'error', sessionId: string, msg: string) =
 };
 
 const tick = async (): Promise<number> => {
+  await refreshLiveRuntimeControl();
   let sessions: RawSession[];
   try {
     sessions = await querySessions(['awaiting_funding', 'ready', 'starting', 'active', 'stopping']);
@@ -3127,7 +3201,7 @@ const tick = async (): Promise<number> => {
           if (startedAtMs > 0 && (Date.now() - startedAtMs) > targetMs) {
             await setSessionStatus(session.id, 'stopping', { stop_reason: 'user_requested' }, { expectedStatuses: ['active'] });
             log('info', session.id, `target duration ${session.user_control.targetDurationMinutes}min exceeded â†’ stopping`);
-            nextCadenceMs = Math.min(nextCadenceMs, STOPPING_POLL_MS);
+            nextCadenceMs = Math.min(nextCadenceMs, getLiveSpeedProfile().cadenceMs.stopping);
             break;
           }
 
@@ -3137,7 +3211,7 @@ const tick = async (): Promise<number> => {
           if (lastAttemptMs > 0 && (Date.now() - lastAttemptMs) > staleLimitMs) {
             await setSessionStatus(session.id, 'stopping', { stop_reason: 'runtime_error' }, { expectedStatuses: ['active'] });
             log('warn', session.id, `no trade attempt for ${STALE_SESSION_MINUTES}min â†’ stale auto-stop`);
-            nextCadenceMs = Math.min(nextCadenceMs, STOPPING_POLL_MS);
+            nextCadenceMs = Math.min(nextCadenceMs, getLiveSpeedProfile().cadenceMs.stopping);
             break;
           }
 
@@ -3210,13 +3284,16 @@ console.log(JSON.stringify({
   missingLiveValues: configReport.missingLiveValues,
   pollIntervalMs: POLL_MS,
   minLoopIntervalMs: MIN_LOOP_MS,
+  speedProfile: liveSpeedProfile.name,
+  maxSolEntryUsd: liveSpeedProfile.maxSolEntryUsd,
+  concurrentCapacity: liveSpeedProfile.concurrentCapacity,
   cadenceMs: {
-    readyStarting: READY_STARTING_POLL_MS,
-    activeInPosition: ACTIVE_IN_POSITION_POLL_MS,
-    activeFlat: ACTIVE_FLAT_POLL_MS,
-    activeGuarded: ACTIVE_GUARDED_POLL_MS,
-    stopping: STOPPING_POLL_MS,
-    postSubmitFast: POST_SUBMIT_FAST_POLL_MS,
+    readyStarting: liveSpeedProfile.cadenceMs.readyStarting,
+    activeInPosition: liveSpeedProfile.cadenceMs.activeInPosition,
+    activeFlat: liveSpeedProfile.cadenceMs.activeFlat,
+    activeGuarded: liveSpeedProfile.cadenceMs.activeGuarded,
+    stopping: liveSpeedProfile.cadenceMs.stopping,
+    postSubmitFast: liveSpeedProfile.cadenceMs.postSubmitFast,
     jitterRatio: LOOP_JITTER_RATIO,
   },
   apiBase: API_BASE,
@@ -3268,6 +3345,7 @@ getPool().query('SELECT 1').then(() => {
 
 const boot = async () => {
   try {
+    await refreshLiveRuntimeControl(true);
     await ensureWorkerRuntimeStateStore();
     await loadPersistedMarketTapeState();
   } catch (err) {

@@ -1,4 +1,5 @@
 import { Pool } from 'pg';
+import { getRuntimeSpeedProfile, normalizeRuntimeSpeedProfileName } from '@/lib/runtimeControl';
 
 let pool: Pool | null = null;
 
@@ -64,6 +65,8 @@ export async function usersTableReady(): Promise<void> {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
     ALTER TABLE rz_users
+      ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       ADD COLUMN IF NOT EXISTS gated_access_enrolled_at TIMESTAMPTZ,
       ADD COLUMN IF NOT EXISTS license_key_revealed_at TIMESTAMPTZ;
     CREATE INDEX IF NOT EXISTS rz_users_wallet_idx ON rz_users(wallet_address);
@@ -153,6 +156,16 @@ export interface AdminSessionRow {
   service_control: Record<string, unknown>;
 }
 
+type RuntimeControlRow = {
+  control_key: string;
+  state: {
+    speedProfile?: unknown;
+  } | null;
+  updated_at: string;
+};
+
+const RUNTIME_CONTROL_KEY = 'global_live_runtime';
+
 export async function listActiveSessions(): Promise<AdminSessionRow[]> {
   const { rows } = await getPool().query<AdminSessionRow>(
     `SELECT s.id, s.user_id, u.username, s.owner_wallet, s.session_wallet, s.requested_at, s.status, s.started_at, s.stop_reason, s.funding, s.service_control
@@ -174,4 +187,96 @@ export async function forceStopSession(sessionId: string): Promise<AdminSessionR
     [sessionId]
   );
   return rows[0] ?? null;
+}
+
+async function runtimeControlReady(): Promise<void> {
+  await getPool().query(`
+    CREATE TABLE IF NOT EXISTS runtime_control_settings (
+      control_key TEXT PRIMARY KEY,
+      state JSONB NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+}
+
+const hydrateRuntimeControl = (row: RuntimeControlRow | null) => {
+  const speedProfile = normalizeRuntimeSpeedProfileName(
+    typeof row?.state?.speedProfile === 'string' ? row.state.speedProfile : undefined,
+  );
+  const profile = getRuntimeSpeedProfile(speedProfile);
+
+  return {
+    speedProfile,
+    profile,
+    updatedAt: row?.updated_at ?? new Date().toISOString(),
+  };
+};
+
+async function getRuntimeControlState() {
+  await runtimeControlReady();
+  const result = await getPool().query<RuntimeControlRow>(
+    `SELECT control_key, state, updated_at
+       FROM runtime_control_settings
+      WHERE control_key = $1
+      LIMIT 1`,
+    [RUNTIME_CONTROL_KEY],
+  );
+
+  const existing = result.rows[0] ?? null;
+  if (existing) {
+    return hydrateRuntimeControl(existing);
+  }
+
+  const speedProfile = normalizeRuntimeSpeedProfileName(process.env.WORKER_SPEED_PROFILE);
+  const insertResult = await getPool().query<RuntimeControlRow>(
+    `INSERT INTO runtime_control_settings (control_key, state, updated_at)
+     VALUES ($1, $2::jsonb, NOW())
+     ON CONFLICT (control_key)
+     DO UPDATE SET state = runtime_control_settings.state
+     RETURNING control_key, state, updated_at`,
+    [RUNTIME_CONTROL_KEY, JSON.stringify({ speedProfile })],
+  );
+
+  return hydrateRuntimeControl(insertResult.rows[0] ?? null);
+}
+
+export async function getLiveRuntimeControlSnapshot() {
+  const control = await getRuntimeControlState();
+  const liveResult = await getPool().query<{ count: string }>(
+    `SELECT count(DISTINCT user_id)::text AS count
+       FROM sessions
+      WHERE status IN ('active', 'starting')`,
+  );
+  const reservedResult = await getPool().query<{ count: string }>(
+    `SELECT count(*)::text AS count
+       FROM sessions
+      WHERE status IN ('awaiting_funding', 'ready', 'starting', 'active', 'paused', 'stopping')`,
+  );
+
+  return {
+    speedProfile: control.speedProfile,
+    label: control.profile.label,
+    maxSolEntryUsd: control.profile.maxSolEntryUsd,
+    concurrentCapacity: control.profile.concurrentCapacity,
+    cadenceMs: control.profile.cadenceMs,
+    liveSessions: Number(liveResult.rows[0]?.count ?? '0'),
+    reservedSessions: Number(reservedResult.rows[0]?.count ?? '0'),
+    updatedAt: control.updatedAt,
+  };
+}
+
+export async function setLiveRuntimeSpeedProfile(speedProfileInput: string) {
+  await runtimeControlReady();
+  const speedProfile = normalizeRuntimeSpeedProfileName(speedProfileInput);
+
+  await getPool().query(
+    `INSERT INTO runtime_control_settings (control_key, state, updated_at)
+     VALUES ($1, $2::jsonb, NOW())
+     ON CONFLICT (control_key)
+     DO UPDATE SET state = EXCLUDED.state,
+                   updated_at = NOW()`,
+    [RUNTIME_CONTROL_KEY, JSON.stringify({ speedProfile })],
+  );
+
+  return getLiveRuntimeControlSnapshot();
 }

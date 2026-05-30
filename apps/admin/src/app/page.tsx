@@ -145,6 +145,24 @@ interface RateLimitData {
   tigerdata: TigerDataRateLimitData;
 }
 
+interface RuntimeControlData {
+  speedProfile: 'glide' | 'pulse' | 'surge';
+  label: string;
+  maxSolEntryUsd: number;
+  concurrentCapacity: number;
+  cadenceMs: {
+    readyStarting: number;
+    activeInPosition: number;
+    activeFlat: number;
+    activeGuarded: number;
+    stopping: number;
+    postSubmitFast: number;
+  };
+  liveSessions: number;
+  reservedSessions: number;
+  updatedAt: string;
+}
+
 const DURATIONS = [
   { value: '1month',  label: '1 Month' },
   { value: '6months', label: '6 Months' },
@@ -285,10 +303,12 @@ function SpeedGauge({
 function CapacityPanel({
   active,
   capacity,
+  reserved,
   traders,
 }: {
   active: number;
   capacity: number;
+  reserved: number;
   traders: { id: string; username: string }[];
 }) {
   const pct = capacity > 0 ? active / capacity : 0;
@@ -366,6 +386,9 @@ function CapacityPanel({
               }}
             />
           </div>
+          <div className="text-[10px] text-gray-500">
+            reserved slots {reserved} · available {Math.max(capacity - reserved, 0)}
+          </div>
         </div>
 
         {/* ── Right: who's trading ── */}
@@ -399,6 +422,77 @@ function CapacityPanel({
         </div>
 
       </div>
+    </div>
+  );
+}
+
+function RuntimeControlPanel({
+  control,
+  updating,
+  onSelect,
+}: {
+  control: RuntimeControlData | null;
+  updating: boolean;
+  onSelect: (profile: 'glide' | 'pulse' | 'surge') => void;
+}) {
+  const profiles = [
+    { id: 'glide', label: 'Glide', detail: '$1.5k SOL max · highest capacity' },
+    { id: 'pulse', label: 'Pulse', detail: '$4.5k SOL max · balanced flow' },
+    { id: 'surge', label: 'Surge', detail: '$10k SOL max · hardest bite' },
+  ] as const;
+
+  return (
+    <div className="bg-gray-900 border border-gray-800 rounded-xl p-5 space-y-4">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <p className="text-sm font-semibold text-white">Global Flow Control</p>
+          <p className="text-xs text-gray-600 mt-0.5">Switches cadence, SOL entry cap, and concurrent bot capacity across the whole stack.</p>
+        </div>
+        {control && (
+          <div className="text-right text-[10px] uppercase tracking-[0.18em] text-cyan-200">
+            {control.label}
+            <div className="mt-1 normal-case tracking-normal text-gray-500">updated {formatDateTime(control.updatedAt)}</div>
+          </div>
+        )}
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+        {profiles.map((profile) => {
+          const active = control?.speedProfile === profile.id;
+          return (
+            <button
+              key={profile.id}
+              type="button"
+              disabled={updating}
+              onClick={() => onSelect(profile.id)}
+              className={[
+                'rounded-xl border px-4 py-4 text-left transition-colors',
+                active
+                  ? 'border-cyan-300/35 bg-cyan-500/10 text-white'
+                  : 'border-gray-800 bg-gray-950/60 text-gray-300 hover:border-cyan-400/20 hover:bg-cyan-500/5',
+                updating ? 'opacity-60 cursor-not-allowed' : '',
+              ].join(' ')}
+            >
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-sm font-semibold">{profile.label}</span>
+                {active && <span className="text-[10px] uppercase tracking-[0.18em] text-cyan-200">live</span>}
+              </div>
+              <div className="mt-2 text-xs text-gray-500">{profile.detail}</div>
+            </button>
+          );
+        })}
+      </div>
+
+      {control && (
+        <div className="grid grid-cols-2 xl:grid-cols-6 gap-3 text-[11px]">
+          <SizingMetric label="SOL entry max" value={`$${control.maxSolEntryUsd.toLocaleString()}`} />
+          <SizingMetric label="bot capacity" value={String(control.concurrentCapacity)} />
+          <SizingMetric label="ready / starting" value={`${control.cadenceMs.readyStarting} ms`} />
+          <SizingMetric label="active in position" value={`${control.cadenceMs.activeInPosition} ms`} />
+          <SizingMetric label="active flat" value={`${control.cadenceMs.activeFlat} ms`} />
+          <SizingMetric label="guarded / post-submit" value={`${control.cadenceMs.activeGuarded} / ${control.cadenceMs.postSubmitFast} ms`} />
+        </div>
+      )}
     </div>
   );
 }
@@ -903,6 +997,9 @@ export default function Home() {
   const [rlLoading, setRlLoading] = useState(false);
   const [sessionHealth, setSessionHealth] = useState<SessionHealthData | null>(null);
   const [sessionHealthLoading, setSessionHealthLoading] = useState(false);
+  const [runtimeControl, setRuntimeControl] = useState<RuntimeControlData | null>(null);
+  const [runtimeControlLoading, setRuntimeControlLoading] = useState(false);
+  const [runtimeControlUpdating, setRuntimeControlUpdating] = useState(false);
   const [nowMs, setNowMs] = useState<number>(() => Date.now());
   const [gateUnlocked, setGateUnlocked] = useState(false);
 
@@ -928,18 +1025,50 @@ export default function Home() {
     }
   }, []);
 
+  const fetchRuntimeControl = useCallback(async () => {
+    setRuntimeControlLoading(true);
+    try {
+      const res = await fetch('/api/runtime-control');
+      if (!res.ok) return;
+      const data = await res.json() as RuntimeControlData;
+      setRuntimeControl(data);
+    } finally {
+      setRuntimeControlLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
     const boot = setTimeout(() => {
       void loadUsers();
       void fetchActiveSessions();
+      void fetchRuntimeControl();
       setNowMs(Date.now());
     }, 0);
-    const t = setInterval(() => void fetchActiveSessions(), 8000);
+    const t = setInterval(() => {
+      void fetchActiveSessions();
+      void fetchRuntimeControl();
+    }, 8000);
     return () => {
       clearTimeout(boot);
       clearInterval(t);
     };
-  }, [loadUsers, fetchActiveSessions]);
+  }, [loadUsers, fetchActiveSessions, fetchRuntimeControl]);
+
+  const updateRuntimeControl = useCallback(async (speedProfile: 'glide' | 'pulse' | 'surge') => {
+    setRuntimeControlUpdating(true);
+    try {
+      const res = await fetch('/api/runtime-control', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ speedProfile }),
+      });
+      if (!res.ok) return;
+      const data = await res.json() as RuntimeControlData;
+      setRuntimeControl(data);
+    } finally {
+      setRuntimeControlUpdating(false);
+    }
+  }, []);
 
   const fetchRateLimits = useCallback(async () => {
     setRlLoading(true);
@@ -1138,6 +1267,12 @@ export default function Home() {
         {/* Overview Tab */}
         {tab === 'overview' && (
           <div className="space-y-6">
+            <RuntimeControlPanel
+              control={runtimeControl}
+              updating={runtimeControlUpdating || runtimeControlLoading}
+              onSelect={updateRuntimeControl}
+            />
+
             <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
               <StatCard label="Total Users"      value={users.length} />
               <StatCard label="Active Licenses"  value={users.filter(u => u.access_enabled && !isExpired(u.expiry_date)).length} sub="trading enabled" />
@@ -1147,8 +1282,9 @@ export default function Home() {
 
             {/* ── Bot Capacity ── */}
             <CapacityPanel
-              active={activeSessions.size}
-              capacity={users.filter(u => u.access_enabled && !isExpired(u.expiry_date)).length}
+              active={runtimeControl?.liveSessions ?? activeSessions.size}
+              capacity={runtimeControl?.concurrentCapacity ?? users.filter(u => u.access_enabled && !isExpired(u.expiry_date)).length}
+              reserved={runtimeControl?.reservedSessions ?? activeSessions.size}
               traders={users.filter(u => activeSessions.has(u.id))}
             />
 

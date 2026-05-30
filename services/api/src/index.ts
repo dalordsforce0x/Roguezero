@@ -17,6 +17,7 @@ import {
 import {
   getHeliusRpcUrl,
   getJupiterSwapBuildConfig,
+  getRuntimeSpeedProfile,
   getRuntimeConfigReport,
   getWorkerFundingThresholds,
   type JupiterFeeToken,
@@ -57,6 +58,10 @@ import {
   verifyTrustedDeviceLicense,
   verifyWebAccessSession,
 } from './accessStore.js';
+import {
+  getLiveRuntimeControl,
+  runtimeControlStoreReady,
+} from './runtimeControlStore.js';
 import {
   schemaVersion,
   sessionActionValues,
@@ -1389,6 +1394,13 @@ void accessTablesReady()
   .catch((error) => {
     app.log.error({ error }, 'access store initialization failed');
   });
+void runtimeControlStoreReady()
+  .then(() => {
+    app.log.info('runtime control store ready');
+  })
+  .catch((error) => {
+    app.log.error({ error }, 'runtime control store initialization failed');
+  });
 
 // ── API rate limiting ─────────────────────────────────────────────────────────
 void app.register(rateLimit, {
@@ -2504,6 +2516,22 @@ app.post('/sessions', { config: { rateLimit: { max: 5, timeWindow: '1 minute' } 
             message: `Send at least ${(workerFundingThresholds.minimumTradeableLamports / 1_000_000_000).toFixed(6)} SOL to ${existingLiveOrPendingSession.sessionWallet} to start your trading session`,
           }
         : null,
+    });
+  }
+
+  const runtimeControl = await getLiveRuntimeControl();
+  const occupiedCapacitySessions = await listSessions({
+    status: ['awaiting_funding', 'ready', 'starting', 'active', 'paused', 'stopping'],
+    limit: runtimeControl.profile.concurrentCapacity + 1,
+  });
+
+  if (occupiedCapacitySessions.length >= runtimeControl.profile.concurrentCapacity) {
+    return reply.status(409).send({
+      error: 'Bot capacity is full',
+      speedProfile: runtimeControl.speedProfile,
+      concurrentCapacity: runtimeControl.profile.concurrentCapacity,
+      maxSolEntryUsd: runtimeControl.profile.maxSolEntryUsd,
+      occupiedCapacity: occupiedCapacitySessions.length,
     });
   }
 
