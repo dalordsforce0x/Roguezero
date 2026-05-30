@@ -1385,34 +1385,28 @@ export default function Home() {
               <div className="relative h-full w-full overflow-hidden rounded-[18px] border border-white/15 bg-transparent">
                 <div className="absolute inset-0">
                   {showLogicVideo ? (
-                    <video
-                      key={`active-bird-${activeBirdVideo}`}
-                      autoPlay
-                      muted
-                      playsInline
-                      onEnded={() => setActiveBirdVideo((current) => current === 'primary' ? 'secondary' : 'primary')}
-                      className="h-full w-full object-contain bg-transparent"
-                      style={{
-                        objectPosition: activeBirdVideo === 'primary' ? 'left bottom' : '22% 70%',
-                      }}
-                    >
-                      <source
-                        src={activeBirdVideo === 'primary' ? ACTIVE_BIRD_PRIMARY_VIDEO_SRC : ACTIVE_BIRD_SECONDARY_VIDEO_SRC}
-                        type="video/webm"
-                      />
-                    </video>
-                  ) : idleBirdMode === 'alt-video' ? (
-                    <video
-                      key="idle-bird-alt"
-                      autoPlay
-                      muted
-                      playsInline
-                      onEnded={() => setIdleBirdMode('still')}
-                      className="h-full w-full scale-[1.16] object-contain bg-transparent"
-                      style={{ objectPosition: 'center 34%' }}
-                    >
-                      <source src={IDLE_BIRD_ALT_VIDEO_SRC} type="video/webm" />
-                    </video>
+                    <>
+                      <video
+                        key="active-bird-primary"
+                        autoPlay
+                        muted
+                        loop
+                        playsInline
+                        className="absolute bottom-0 left-0 w-[62%] h-[58%] object-cover bg-transparent"
+                      >
+                        <source src={ACTIVE_BIRD_PRIMARY_VIDEO_SRC} type="video/webm" />
+                      </video>
+                      <video
+                        key="active-bird-secondary"
+                        autoPlay
+                        muted
+                        loop
+                        playsInline
+                        className="absolute bottom-[14%] left-[10%] w-[55%] h-[52%] object-cover bg-transparent"
+                      >
+                        <source src={ACTIVE_BIRD_SECONDARY_VIDEO_SRC} type="video/webm" />
+                      </video>
+                    </>
                   ) : (
                     // eslint-disable-next-line @next/next/no-img-element
                     <img
