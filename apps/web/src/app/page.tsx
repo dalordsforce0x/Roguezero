@@ -1392,7 +1392,7 @@ export default function Home() {
                         muted
                         loop
                         playsInline
-                        className="absolute bottom-0 left-0 w-[62%] h-[58%] object-cover bg-transparent"
+                        className="absolute inset-0 h-full w-full object-contain bg-transparent"
                       >
                         <source src={ACTIVE_BIRD_PRIMARY_VIDEO_SRC} type="video/webm" />
                       </video>
@@ -1402,7 +1402,7 @@ export default function Home() {
                         muted
                         loop
                         playsInline
-                        className="absolute bottom-[14%] left-[10%] w-[55%] h-[52%] object-cover bg-transparent"
+                        className="absolute inset-0 h-full w-full object-contain bg-transparent"
                       >
                         <source src={ACTIVE_BIRD_SECONDARY_VIDEO_SRC} type="video/webm" />
                       </video>
@@ -1414,7 +1414,7 @@ export default function Home() {
                       src="/media/roguebird-alpha.webp"
                       alt="Idle bird"
                       className="h-full w-full object-contain"
-                      style={{ objectPosition: 'center 34%' }}
+                      style={{ objectPosition: 'left bottom' }}
                     />
                   )}
                 </div>
