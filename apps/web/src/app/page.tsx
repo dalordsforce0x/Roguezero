@@ -319,6 +319,7 @@ const GATE_VIDEO_SRC = '/media/rz-gated-access-intro.mp4';
 const IDLE_BIRD_ALT_VIDEO_SRC = '/media/birds2-alpha.webm';
 const IDLE_BIRD_STILL_DELAY_MS = 12000;
 const LICENSE_REVEAL_STORAGE_KEY = 'rz-pending-license-reveal';
+const FUNDING_FEE_CUSHION_LAMPORTS = 50_000;
 
 const SESSION_PRIORITY: SessionStatus[] = [
   'active',
@@ -1063,10 +1064,14 @@ export default function Home() {
         'confirmed',
       )).value ?? 5_000;
       const walletBalanceLamports = await connection.getBalance(publicKey, 'confirmed');
-      const transferLamports = Math.max(0, walletBalanceLamports - estimatedFeeLamports);
+      const reservedLamports = Math.max(
+        estimatedFeeLamports + FUNDING_FEE_CUSHION_LAMPORTS,
+        FUNDING_FEE_CUSHION_LAMPORTS,
+      );
+      const transferLamports = Math.max(0, walletBalanceLamports - reservedLamports);
 
       if (transferLamports <= 0) {
-        throw new Error('Wallet balance is too low to fund the session after network fees');
+        throw new Error('Wallet balance is too low after reserving network fee cushion for funding');
       }
 
       const transaction = new Transaction().add(
@@ -1097,7 +1102,7 @@ export default function Home() {
     } finally {
       setFundingSessionId(null);
     }
-  }, [auth, connection, fetchSessions, minimumFundingLamports, publicKey, sendTransaction]);
+  }, [auth, connection, fetchSessions, publicKey, sendTransaction]);
 
   // ── Session action ────────────────────────────────────────────────────────
 
