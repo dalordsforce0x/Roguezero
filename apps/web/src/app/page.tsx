@@ -688,6 +688,7 @@ export default function Home() {
   const [fundingSessionId, setFundingSessionId] = useState<string | null>(null);
   const [fundingError, setFundingError] = useState<string | null>(null);
   const [fundingSignature, setFundingSignature] = useState<string | null>(null);
+  const [fundingPercent, setFundingPercent] = useState<25 | 50 | 95>(95);
 
   // Session monitoring
   const [sessions,        setSessions]        = useState<Session[]>([]);
@@ -1047,7 +1048,7 @@ export default function Home() {
     await createSession();
   };
 
-  const fundSession = useCallback(async (session: Session) => {
+  const fundSession = useCallback(async (session: Session, percent: 25 | 50 | 95) => {
     if (auth.status !== 'authorized' || !publicKey) return;
 
     setFundingSessionId(session.id);
@@ -1087,7 +1088,9 @@ export default function Home() {
         estimatedFeeLamports + FUNDING_FEE_CUSHION_LAMPORTS,
         FUNDING_FEE_CUSHION_LAMPORTS,
       );
-      const transferLamports = Math.max(0, walletBalanceLamports - reservedLamports);
+      const maxSpendable = Math.max(0, walletBalanceLamports - reservedLamports);
+      const desiredLamports = Math.floor((walletBalanceLamports * percent) / 100);
+      const transferLamports = Math.min(desiredLamports, maxSpendable);
 
       if (transferLamports <= 0) {
         throw new Error(
@@ -1274,9 +1277,9 @@ export default function Home() {
 
     if (primarySession.status === 'awaiting_funding') {
       return {
-        label: fundingSessionId === primarySession.id ? 'Funding…' : 'Fund Wallet',
+        label: fundingSessionId === primarySession.id ? 'Funding…' : `Fund Wallet (${fundingPercent}%)`,
         disabled: fundingSessionId === primarySession.id,
-        onClick: () => void fundSession(primarySession),
+        onClick: () => void fundSession(primarySession, fundingPercent),
       };
     }
 
@@ -1390,7 +1393,7 @@ export default function Home() {
                       onEnded={() => setActiveBirdVideo((current) => current === 'primary' ? 'secondary' : 'primary')}
                       className="h-full w-full object-contain bg-transparent"
                       style={{
-                        objectPosition: activeBirdVideo === 'primary' ? 'left bottom' : '32% 56%',
+                        objectPosition: activeBirdVideo === 'primary' ? 'left bottom' : '22% 70%',
                       }}
                     >
                       <source
@@ -1446,6 +1449,19 @@ export default function Home() {
                     >
                       {primaryAction.label.toLowerCase()}
                     </button>
+                    {primarySession?.status === 'awaiting_funding' && (
+                      <select
+                        value={fundingPercent}
+                        onChange={(e) => setFundingPercent(Number(e.target.value) as 25 | 50 | 95)}
+                        disabled={fundingSessionId === primarySession.id}
+                        className="rounded border border-emerald-300/30 bg-emerald-500/10 px-1 py-0.5 text-emerald-100 outline-none transition hover:bg-emerald-500/20 disabled:cursor-not-allowed disabled:opacity-40"
+                        aria-label="Funding percent"
+                      >
+                        <option value={25}>25%</option>
+                        <option value={50}>50%</option>
+                        <option value={95}>95%</option>
+                      </select>
+                    )}
                     <button
                       type="button"
                       onClick={() => primarySession && void handleAction(primarySession.id, 'stop')}
