@@ -65,6 +65,9 @@ dotenv.config({ path: '../../.env' });
 
 const app = Fastify({ logger: true });
 const port = Number(process.env.API_PORT || 4000);
+const internalApiSecret = process.env.RZ_INTERNAL_API_SECRET?.trim() || null;
+const webPublicOrigin = process.env.WEB_PUBLIC_ORIGIN ?? process.env.FRONTEND_ORIGIN ?? 'http://localhost:3002';
+const internalSecretBypassPaths = new Set(['/health']);
 const configReport = getRuntimeConfigReport(process.env);
 const JUPITER_GENERAL_RPS = Number(process.env.JUPITER_GENERAL_RPS ?? 8);
 const JUPITER_GENERAL_BURST = Number(process.env.JUPITER_GENERAL_BURST ?? JUPITER_GENERAL_RPS);
@@ -1374,16 +1377,43 @@ void app.register(rateLimit, {
   addHeaders: { 'x-ratelimit-limit': true, 'x-ratelimit-remaining': true, 'x-ratelimit-reset': true, 'retry-after': true },
 });
 
-// CORS — allow all origins for local dev; tighten to web origin in production
+// Require an internal trust header for backend routes.
+app.addHook('onRequest', async (request, reply) => {
+  if (request.method === 'OPTIONS') {
+    return;
+  }
+
+  const requestPath = request.url.split('?')[0] ?? '/';
+  if (internalSecretBypassPaths.has(requestPath)) {
+    return;
+  }
+
+  if (!internalApiSecret) {
+    if (process.env.NODE_ENV === 'production') {
+      app.log.error('RZ_INTERNAL_API_SECRET is not set in production');
+      return reply.status(503).send({ error: 'Service not configured for secure internal access' });
+    }
+    return;
+  }
+
+  const providedSecret = request.headers['x-rz-internal-secret'];
+  if (typeof providedSecret !== 'string' || providedSecret !== internalApiSecret) {
+    return reply.status(401).send({ error: 'Unauthorized internal request' });
+  }
+});
+
+// CORS — only allow configured frontend origin.
 app.addHook('onSend', async (_req, reply) => {
-  void reply.header('Access-Control-Allow-Origin', '*');
+  void reply.header('Access-Control-Allow-Origin', webPublicOrigin);
   void reply.header('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
   void reply.header('Access-Control-Allow-Headers', 'Content-Type, x-rz-internal-secret');
+  void reply.header('Vary', 'Origin');
 });
 app.options('*', async (_req, reply) => {
-  reply.header('Access-Control-Allow-Origin', '*');
+  reply.header('Access-Control-Allow-Origin', webPublicOrigin);
   reply.header('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
   reply.header('Access-Control-Allow-Headers', 'Content-Type, x-rz-internal-secret');
+  reply.header('Vary', 'Origin');
   return reply.status(204).send();
 });
 

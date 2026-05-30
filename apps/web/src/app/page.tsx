@@ -229,7 +229,7 @@ type PerformanceResponse = {
   sessionHistory: PerformanceSessionHistory[];
 };
 
-const API = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:4000';
+const API = '/api/rz';
 
 const DEFAULT_SESSION_REQUEST = {
   startingBalanceAtomic: '0',
