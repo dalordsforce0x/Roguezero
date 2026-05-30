@@ -1,9 +1,10 @@
-// build: 202605300920
+// build: 20260530093932
 'use client';
 
 import { useState, useEffect, useCallback } from 'react';
-import { useWallet } from '@solana/wallet-adapter-react';
+import { useConnection, useWallet } from '@solana/wallet-adapter-react';
 import { useWalletModal } from '@solana/wallet-adapter-react-ui';
+import { PublicKey, SystemProgram, Transaction } from '@solana/web3.js';
 
 // ── Auth types ────────────────────────────────────────────────────────────────
 
@@ -133,6 +134,7 @@ type CreateResponse = {
   sessionWallet: string;
   fundingInstructions: {
     sendTo: string;
+    minimumFundingLamports: number;
     minimumFundingSol: number;
     message: string;
   };
@@ -666,19 +668,24 @@ function IntroGate({ mode, onUnlock }: GateProps) {
 // ── Main page ─────────────────────────────────────────────────────────────────
 
 export default function Home() {
-  const { publicKey, disconnect, connecting, connected } = useWallet();
+  const { connection } = useConnection();
+  const { publicKey, disconnect, connecting, connected, sendTransaction } = useWallet();
   const { setVisible } = useWalletModal();
 
   const [auth, setAuth] = useState<AuthState>({ status: 'disconnected' });
   const [creating,     setCreating]     = useState(false);
   const [createResult, setCreateResult] = useState<CreateResponse | null>(null);
   const [createError,  setCreateError]  = useState<string | null>(null);
+  const [fundingSessionId, setFundingSessionId] = useState<string | null>(null);
+  const [fundingError, setFundingError] = useState<string | null>(null);
+  const [fundingSignature, setFundingSignature] = useState<string | null>(null);
 
   // Session monitoring
   const [sessions,        setSessions]        = useState<Session[]>([]);
   const [sessionsLoading,  setSessionsLoading]  = useState(false);
   const [actioning,        setActioning]        = useState<string | null>(null);
   const [minimumFundingSol, setMinimumFundingSol] = useState<number>(0);
+  const [minimumFundingLamports, setMinimumFundingLamports] = useState<number>(0);
   const [panelView, setPanelView] = useState<PanelView>('activity');
   const [dashboardView, setDashboardView] = useState<DashboardView>('overview');
   const [performance, setPerformance] = useState<PerformanceResponse | null>(null);
@@ -921,8 +928,9 @@ export default function Home() {
         return;
       }
       if (!res.ok) return;
-      const data = await res.json() as { sessions: Session[]; minimumFundingSol?: number };
+      const data = await res.json() as { sessions: Session[]; minimumFundingLamports?: number; minimumFundingSol?: number };
       setSessions(data.sessions ?? []);
+      setMinimumFundingLamports(data.minimumFundingLamports ?? 0);
       setMinimumFundingSol(data.minimumFundingSol ?? 0);
     } finally {
       setSessionsLoading(false);
@@ -989,6 +997,8 @@ export default function Home() {
     setCreating(true);
     setCreateError(null);
     setCreateResult(null);
+    setFundingError(null);
+    setFundingSignature(null);
 
     try {
       const res = await fetch(`${API}/sessions`, {
@@ -1026,6 +1036,58 @@ export default function Home() {
     e.preventDefault();
     await createSession();
   };
+
+  const fundSession = useCallback(async (session: Session) => {
+    if (auth.status !== 'authorized' || !publicKey) return;
+
+    const currentBalanceLamports = Number(session.funding.currentBalanceAtomic ?? '0');
+    const requiredLamports = Math.max(
+      0,
+      minimumFundingLamports - (Number.isFinite(currentBalanceLamports) ? currentBalanceLamports : 0),
+    );
+
+    if (requiredLamports <= 0) {
+      setFundingError(null);
+      void fetchSessions(auth.user.id);
+      return;
+    }
+
+    setFundingSessionId(session.id);
+    setFundingError(null);
+    setFundingSignature(null);
+    setCreateError(null);
+
+    try {
+      const transaction = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: publicKey,
+          toPubkey: new PublicKey(session.sessionWallet),
+          lamports: requiredLamports,
+        }),
+      );
+
+      const latestBlockhash = await connection.getLatestBlockhash('confirmed');
+      transaction.feePayer = publicKey;
+      transaction.recentBlockhash = latestBlockhash.blockhash;
+
+      const signature = await sendTransaction(transaction, connection, {
+        preflightCommitment: 'confirmed',
+      });
+
+      await connection.confirmTransaction({
+        signature,
+        blockhash: latestBlockhash.blockhash,
+        lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
+      }, 'confirmed');
+
+      setFundingSignature(signature);
+      void fetchSessions(auth.user.id);
+    } catch (error) {
+      setFundingError(error instanceof Error ? error.message : 'Funding transaction failed');
+    } finally {
+      setFundingSessionId(null);
+    }
+  }, [auth, connection, fetchSessions, minimumFundingLamports, publicKey, sendTransaction]);
 
   // ── Session action ────────────────────────────────────────────────────────
 
@@ -1169,7 +1231,11 @@ export default function Home() {
     }
 
     if (primarySession.status === 'awaiting_funding') {
-      return { label: 'Waiting for Deposit', disabled: true, onClick: () => undefined };
+      return {
+        label: fundingSessionId === primarySession.id ? 'Funding…' : 'Fund Wallet',
+        disabled: fundingSessionId === primarySession.id,
+        onClick: () => void fundSession(primarySession),
+      };
     }
 
     if (primarySession.status === 'ready') {
@@ -1438,6 +1504,20 @@ export default function Home() {
                             <div className="mt-3 text-emerald-200">
                               &gt; session created
                               <div className="text-emerald-300/80 break-all">{createResult.fundingInstructions.sendTo}</div>
+                            </div>
+                          )}
+
+                          {fundingSignature && (
+                            <div className="mt-3 text-emerald-200">
+                              &gt; funding submitted
+                              <div className="break-all text-emerald-300/80">{fundingSignature}</div>
+                            </div>
+                          )}
+
+                          {fundingError && (
+                            <div className="mt-3 text-red-300">
+                              &gt; funding failed
+                              <div className="text-red-200/80">{fundingError}</div>
                             </div>
                           )}
                         </div>
@@ -1752,4 +1832,7 @@ export default function Home() {
     </div>
   );
 }
+
+
+
 
