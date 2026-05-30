@@ -375,6 +375,12 @@ const formatExecutionAmountSol = (atomic: string | null) => {
   return `${(numeric / 1_000_000_000).toFixed(4)} SOL`;
 };
 
+const formatLamportsSol = (lamports: number) => (
+  Number.isFinite(lamports) && lamports > 0
+    ? `${(lamports / 1_000_000_000).toFixed(6)} SOL`
+    : '0.000000 SOL'
+);
+
 const formatWalletShort = (wallet: string) => `${wallet.slice(0, 6)}…${wallet.slice(-4)}`;
 
 const formatDuration = (startedAt: string | null, endedAt: string | null) => {
@@ -1051,6 +1057,17 @@ export default function Home() {
 
     try {
       const latestBlockhash = await connection.getLatestBlockhash('confirmed');
+      const balanceSnapshots = await Promise.all([
+        connection.getBalance(publicKey, 'processed').catch(() => 0),
+        connection.getBalance(publicKey, 'confirmed').catch(() => 0),
+        connection.getBalance(publicKey, 'finalized').catch(() => 0),
+        connection.getAccountInfo(publicKey, 'confirmed').then((account) => account?.lamports ?? 0).catch(() => 0),
+      ]);
+      const walletBalanceLamports = balanceSnapshots.reduce(
+        (highest, value) => (Number.isFinite(value) ? Math.max(highest, value) : highest),
+        0,
+      );
+
       const feeProbeTransaction = new Transaction().add(
         SystemProgram.transfer({
           fromPubkey: publicKey,
@@ -1066,7 +1083,6 @@ export default function Home() {
         feeProbeTransaction.compileMessage(),
         'confirmed',
       )).value ?? 5_000;
-      const walletBalanceLamports = await connection.getBalance(publicKey, 'confirmed');
       const reservedLamports = Math.max(
         estimatedFeeLamports + FUNDING_FEE_CUSHION_LAMPORTS,
         FUNDING_FEE_CUSHION_LAMPORTS,
@@ -1074,7 +1090,9 @@ export default function Home() {
       const transferLamports = Math.max(0, walletBalanceLamports - reservedLamports);
 
       if (transferLamports <= 0) {
-        throw new Error('Wallet balance is too low after reserving network fee cushion for funding');
+        throw new Error(
+          `Detected ${formatLamportsSol(walletBalanceLamports)} in wallet; need more than ${formatLamportsSol(reservedLamports)} to fund after fee buffer`,
+        );
       }
 
       const transaction = new Transaction().add(
