@@ -61,11 +61,15 @@ import {
   type TradeGateAssessment,
 } from './tradeExecutionPolicy.js';
 import {
+  DEFAULT_BOLLINGER_CONFIG,
+  DEFAULT_SUPERTREND_CONFIG,
   computeBollingerSignal,
   computeSupertrendSignal,
   recommendStrategy,
+  type BollingerConfig,
   type SignalDecision,
   type PriceSample,
+  type SupertrendConfig,
 } from './strategies.js';
 
 dotenv.config({ path: '../../.env' });
@@ -119,6 +123,30 @@ const TX_FEE_LAMPORTS = fundingThresholds.txFeeLamports;
 const MIN_TRADEABLE_LAMPORTS = fundingThresholds.minimumTradeableLamports;
 const MIN_SOL_OPERATING_RESERVE_LAMPORTS = TX_FEE_LAMPORTS + OPERATING_BUFFER_LAMPORTS;
 const MIN_USDC_ENTRY_ATOMIC = Number(process.env.WORKER_MIN_USDC_ENTRY_ATOMIC ?? 1_000_000);
+const MIN_ENTRY_SIGNAL_PERSISTENCE_SAMPLES = Number(process.env.WORKER_MIN_ENTRY_SIGNAL_PERSISTENCE_SAMPLES ?? 2);
+const MAX_QUOTE_PRICE_IMPACT_BPS = Number(process.env.WORKER_MAX_QUOTE_PRICE_IMPACT_BPS ?? 120);
+const WORKER_UNIVERSE_SCOUT_ENABLED = process.env.WORKER_UNIVERSE_SCOUT_ENABLED !== 'false';
+const WORKER_UNIVERSE_SCOUT_MAX_CANDIDATES = Number(process.env.WORKER_UNIVERSE_SCOUT_MAX_CANDIDATES ?? 6);
+const WORKER_UNIVERSE_SCOUT_MAX_SOL_PRICE_IMPACT_BPS = Number(process.env.WORKER_UNIVERSE_SCOUT_MAX_SOL_PRICE_IMPACT_BPS ?? 150);
+const WORKER_UNIVERSE_SCOUT_MIN_SOL_RANK = Number(process.env.WORKER_UNIVERSE_SCOUT_MIN_SOL_RANK ?? 2);
+const TOKEN_UNIVERSE_AUTO_SORT_ENABLED = process.env.WORKER_TOKEN_UNIVERSE_AUTO_SORT_ENABLED !== 'false';
+const TOKEN_UNIVERSE_AUTO_SORT_INTERVAL_MS = Number(process.env.WORKER_TOKEN_UNIVERSE_AUTO_SORT_INTERVAL_MS ?? 180000);
+const TOKEN_UNIVERSE_AUTO_SORT_MAX_MINTS = Number(process.env.WORKER_TOKEN_UNIVERSE_AUTO_SORT_MAX_MINTS ?? 16);
+const TOKEN_UNIVERSE_AUTO_SORT_TOP_ENABLED = Number(process.env.WORKER_TOKEN_UNIVERSE_AUTO_SORT_TOP_ENABLED ?? 8);
+const TOKEN_UNIVERSE_AUTO_SORT_NOTIONAL_USDC_ATOMIC = Number(process.env.WORKER_TOKEN_UNIVERSE_AUTO_SORT_NOTIONAL_USDC_ATOMIC ?? 10_000_000);
+const TOKEN_UNIVERSE_AUTO_SORT_MAX_PRICE_IMPACT_BPS = Number(process.env.WORKER_TOKEN_UNIVERSE_AUTO_SORT_MAX_PRICE_IMPACT_BPS ?? 200);
+const TOKEN_UNIVERSE_ENGINE_MAX_STALE_MS = Number(process.env.WORKER_TOKEN_UNIVERSE_ENGINE_MAX_STALE_MS ?? 900000);
+const TOKEN_UNIVERSE_DEAD_RUN_THRESHOLD = Number(process.env.WORKER_TOKEN_UNIVERSE_DEAD_RUN_THRESHOLD ?? 6);
+const TOKEN_UNIVERSE_HEALTH_MAX_TRACKED_MINTS = Number(process.env.WORKER_TOKEN_UNIVERSE_HEALTH_MAX_TRACKED_MINTS ?? 512);
+const TOKEN_UNIVERSE_DEAD_PRUNE_ENABLED = process.env.WORKER_TOKEN_UNIVERSE_DEAD_PRUNE_ENABLED !== 'false';
+const TOKEN_UNIVERSE_ADMISSION_STREAK = Number(process.env.WORKER_TOKEN_UNIVERSE_ADMISSION_STREAK ?? 2);
+const TOKEN_UNIVERSE_EVICTION_STREAK = Number(process.env.WORKER_TOKEN_UNIVERSE_EVICTION_STREAK ?? 3);
+const TOKEN_UNIVERSE_MIN_STAY_RUNS = Number(process.env.WORKER_TOKEN_UNIVERSE_MIN_STAY_RUNS ?? 4);
+const TOKEN_UNIVERSE_EVICTION_RANK_BUFFER = Number(process.env.WORKER_TOKEN_UNIVERSE_EVICTION_RANK_BUFFER ?? 2);
+const TOKEN_UNIVERSE_PROBE_FREEZE_FAILURE_STREAK = Number(process.env.WORKER_TOKEN_UNIVERSE_PROBE_FREEZE_FAILURE_STREAK ?? 3);
+const TOKEN_UNIVERSE_PROBE_UNFREEZE_HEALTHY_STREAK = Number(process.env.WORKER_TOKEN_UNIVERSE_PROBE_UNFREEZE_HEALTHY_STREAK ?? 2);
+const TOKEN_UNIVERSE_AUTOSORT_STATE_WRITE_MIN_INTERVAL_MS = Number(process.env.WORKER_TOKEN_UNIVERSE_AUTOSORT_STATE_WRITE_MIN_INTERVAL_MS ?? 120000);
+const TOKEN_UNIVERSE_METADATA_WRITE_MIN_INTERVAL_MS = Number(process.env.WORKER_TOKEN_UNIVERSE_METADATA_WRITE_MIN_INTERVAL_MS ?? 300000);
 const RUNTIME_CONTROL_KEY = 'global_live_runtime';
 const RUNTIME_CONTROL_REFRESH_MS = Number(process.env.RUNTIME_CONTROL_REFRESH_MS ?? 5000);
 let liveSpeedProfileName: RuntimeSpeedProfileName = normalizeRuntimeSpeedProfileName(process.env.WORKER_SPEED_PROFILE);
@@ -129,6 +157,7 @@ let lastRuntimeControlRefreshAt = 0;
 
 const { Pool } = pg;
 let pool: pg.Pool | null = null;
+let tokenUniversePool: pg.Pool | null = null;
 
 const getPool = () => {
   if (pool) return pool;
@@ -145,6 +174,30 @@ const getPool = () => {
     idle_in_transaction_session_timeout: DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS,
   });
   return pool;
+};
+
+const getTokenUniversePool = () => {
+  if (tokenUniversePool) return tokenUniversePool;
+
+  const overrideUrl = process.env.ROGUEAI_TOKEN_UNIVERSE_DATABASE_URL?.trim();
+  if (!overrideUrl) {
+    tokenUniversePool = getPool();
+    return tokenUniversePool;
+  }
+
+  const parsed = new URL(overrideUrl);
+  parsed.searchParams.delete('sslmode');
+  tokenUniversePool = new Pool({
+    connectionString: parsed.toString(),
+    ssl: { rejectUnauthorized: false },
+    max: 2,
+    query_timeout: DATABASE_QUERY_TIMEOUT_MS,
+    statement_timeout: DATABASE_STATEMENT_TIMEOUT_MS,
+    lock_timeout: DATABASE_LOCK_TIMEOUT_MS,
+    idle_in_transaction_session_timeout: DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS,
+  });
+
+  return tokenUniversePool;
 };
 
 // â”€â”€ Solana connection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -413,6 +466,55 @@ let lastJupiterSolSample: JupiterPriceSample | null = null;
 let lastSignalSnapshot: NonNullable<Session['serviceControl']['lastSignal']> | null = null;
 let pythConsecutiveFailures = 0;
 let jupiterPriceConsecutiveFailures = 0;
+let tokenUniverseMints: string[] = [];
+let tokenUniverseSourceTable: string | null = null;
+let tokenUniverseTableMeta: TokenUniverseTableMeta | null = null;
+let lastTokenUniverseRefreshAt = 0;
+let tokenUniverseBootstrapAttempted = false;
+let lastTokenUniverseAutoSortAt = 0;
+let lastTokenUniverseEngineAppliedAt = 0;
+let lastTokenUniverseEngineEnabledCount = 0;
+let tokenUniverseProbeFrozen = false;
+let lastTokenUniverseAutoSortStateWriteMs = 0;
+let lastTokenUniverseAutoSortStateSignature: string | null = null;
+let lastTokenUniverseMetadataWriteMs = 0;
+let lastTokenUniverseMetadataSignature: string | null = null;
+const universeSortProbeTaker = Keypair.generate().publicKey.toBase58();
+const latestJupiterUsdByMint = new Map<string, number>();
+const previousJupiterUsdByMint = new Map<string, number>();
+
+const TOKEN_UNIVERSE_REFRESH_MS = Number(process.env.WORKER_TOKEN_UNIVERSE_REFRESH_MS ?? 60000);
+const TOKEN_UNIVERSE_TABLE_CANDIDATES = (process.env.ROGUEAI_TOKEN_UNIVERSE_TABLES
+  ?? 'rogueai_token_universe,token_universe,rz_token_universe')
+  .split(',')
+  .map((value) => value.trim())
+  .filter((value) => value.length > 0);
+const TOKEN_UNIVERSE_MAX_MINTS = Number(process.env.WORKER_TOKEN_UNIVERSE_MAX_MINTS ?? 64);
+const solanaPublicKeyPattern = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+const TOKEN_UNIVERSE_BOOTSTRAP_ENABLED = process.env.WORKER_TOKEN_UNIVERSE_BOOTSTRAP_ENABLED !== 'false';
+const DEFAULT_TOKEN_UNIVERSE_SEED = [
+  { mint: SOL_MINT, symbol: 'SOL', priority: 100 },
+  { mint: USDC_MINT, symbol: 'USDC', priority: 90 },
+  { mint: 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', symbol: 'USDT', priority: 80 },
+];
+
+type TokenUniverseTableMeta = {
+  tableName: string;
+  mintColumn: string;
+  enabledColumn: string | null;
+  priorityColumn: string | null;
+  updatedAtColumn: string | null;
+};
+
+type TokenUniverseRankSample = {
+  mint: string;
+  usdPrice: number | null;
+  priorUsdPrice: number | null;
+  momentumBps: number;
+  routeFound: boolean;
+  priceImpactBps: number | null;
+  score: number;
+};
 
 type MarketTapePoint = {
   sampledAt: string;
@@ -445,9 +547,46 @@ type PersistedMarketTapeRow = {
 };
 
 const WORKER_RUNTIME_STATE_KEY = 'shared_market_tape_v1';
+const TOKEN_UNIVERSE_AUTOSORT_STATE_KEY = 'token_universe_autosort_v1';
+const TOKEN_UNIVERSE_HEALTH_STATE_KEY = 'token_universe_health_v1';
 const MARKET_TAPE_PERSIST_MIN_INTERVAL_MS = Number(process.env.WORKER_MARKET_TAPE_PERSIST_MIN_INTERVAL_MS ?? 3000);
 let workerRuntimeStateReadyPromise: Promise<void> | null = null;
 let lastMarketTapePersistMs = 0;
+
+type TokenUniverseHealthEntry = {
+  deadRuns: number;
+  admitRuns: number;
+  evictRuns: number;
+  enabled: boolean;
+  enabledSinceRun: number | null;
+  lastReason: string | null;
+  lastSeenAt: string;
+};
+
+type TokenUniverseHealthState = {
+  run: number;
+  mints: Record<string, TokenUniverseHealthEntry>;
+  probeFailureStreak: number;
+  probeHealthyStreak: number;
+  probeFrozen: boolean;
+  probeFrozenAt: string | null;
+  lastSuccessfulProbeAt: string | null;
+};
+
+const trimTokenUniverseHealthState = (state: TokenUniverseHealthState): TokenUniverseHealthState => {
+  const trackedEntries = Object.entries(state.mints)
+    .sort((a, b) => {
+      const aSeen = Date.parse(a[1].lastSeenAt);
+      const bSeen = Date.parse(b[1].lastSeenAt);
+      return (Number.isFinite(bSeen) ? bSeen : 0) - (Number.isFinite(aSeen) ? aSeen : 0);
+    })
+    .slice(0, Math.max(32, TOKEN_UNIVERSE_HEALTH_MAX_TRACKED_MINTS));
+
+  return {
+    ...state,
+    mints: Object.fromEntries(trackedEntries),
+  };
+};
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === 'object';
@@ -651,6 +790,168 @@ const persistMarketTapeState = async () => {
   );
 };
 
+const stableJsonStringify = (value: unknown): string => {
+  if (value === null || typeof value !== 'object') {
+    return JSON.stringify(value);
+  }
+
+  if (Array.isArray(value)) {
+    return `[${value.map((entry) => stableJsonStringify(entry)).join(',')}]`;
+  }
+
+  const entries = Object.entries(value as Record<string, unknown>)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, nestedValue]) => `${JSON.stringify(key)}:${stableJsonStringify(nestedValue)}`);
+
+  return `{${entries.join(',')}}`;
+};
+
+type TokenUniverseMetadataWrite = {
+  sourceTable: string | null;
+  status: string;
+  reason: string | null;
+  candidateCount: number;
+  enabledCount: number;
+  avgMomentumBps?: number | null;
+  avgPriceImpactBps?: number | null;
+  topTokens: unknown[];
+};
+
+const persistTokenUniverseMetadata = async (
+  write: TokenUniverseMetadataWrite,
+  dbPool: pg.Pool = getTokenUniversePool(),
+) => {
+  const nowMs = Date.now();
+  const signature = stableJsonStringify(write);
+
+  if (
+    signature === lastTokenUniverseMetadataSignature
+    && (nowMs - lastTokenUniverseMetadataWriteMs) < TOKEN_UNIVERSE_METADATA_WRITE_MIN_INTERVAL_MS
+  ) {
+    return;
+  }
+
+  try {
+    await dbPool.query(
+      `INSERT INTO public.rogueai_token_universe_metadata (
+         source_table, status, reason, candidate_count, enabled_count,
+         avg_momentum_bps, avg_price_impact_bps, top_tokens, built_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, now())`,
+      [
+        write.sourceTable,
+        write.status,
+        write.reason,
+        write.candidateCount,
+        write.enabledCount,
+        write.avgMomentumBps ?? null,
+        write.avgPriceImpactBps ?? null,
+        JSON.stringify(write.topTokens),
+      ],
+    );
+    lastTokenUniverseMetadataWriteMs = nowMs;
+    lastTokenUniverseMetadataSignature = signature;
+  } catch {
+    // metadata writes are best-effort only
+  }
+};
+
+const persistTokenUniverseAutoSortState = async (state: Record<string, unknown>) => {
+  const nowMs = Date.now();
+  const signature = stableJsonStringify(state);
+
+  if (
+    signature === lastTokenUniverseAutoSortStateSignature
+    && (nowMs - lastTokenUniverseAutoSortStateWriteMs) < TOKEN_UNIVERSE_AUTOSORT_STATE_WRITE_MIN_INTERVAL_MS
+  ) {
+    return;
+  }
+
+  await ensureWorkerRuntimeStateStore();
+  const dbPool = getPool();
+  await dbPool.query(
+    `INSERT INTO worker_runtime_state_cache (state_key, state, updated_at)
+     VALUES ($1, $2::jsonb, now())
+     ON CONFLICT (state_key)
+     DO UPDATE SET state = EXCLUDED.state, updated_at = now()`,
+    [TOKEN_UNIVERSE_AUTOSORT_STATE_KEY, JSON.stringify(state)],
+  );
+
+  lastTokenUniverseAutoSortStateWriteMs = nowMs;
+  lastTokenUniverseAutoSortStateSignature = signature;
+};
+
+const loadTokenUniverseHealthState = async (): Promise<TokenUniverseHealthState> => {
+  await ensureWorkerRuntimeStateStore();
+  const dbPool = getPool();
+  const result = await dbPool.query<{ state: unknown | null }>(
+    `SELECT state FROM worker_runtime_state_cache WHERE state_key = $1 LIMIT 1`,
+    [TOKEN_UNIVERSE_HEALTH_STATE_KEY],
+  );
+
+  const state = result.rows[0]?.state;
+  if (!isRecord(state) || !isRecord(state.mints)) {
+    return {
+      run: 0,
+      mints: {},
+      probeFailureStreak: 0,
+      probeHealthyStreak: 0,
+      probeFrozen: false,
+      probeFrozenAt: null,
+      lastSuccessfulProbeAt: null,
+    };
+  }
+
+  const runValue = toFiniteNumber(state.run);
+  const probeFailureStreakValue = toFiniteNumber(state.probeFailureStreak);
+  const probeHealthyStreakValue = toFiniteNumber(state.probeHealthyStreak);
+  const probeFrozen = state.probeFrozen === true;
+  const probeFrozenAt = typeof state.probeFrozenAt === 'string' ? state.probeFrozenAt : null;
+  const lastSuccessfulProbeAt = typeof state.lastSuccessfulProbeAt === 'string' ? state.lastSuccessfulProbeAt : null;
+  const mints: Record<string, TokenUniverseHealthEntry> = {};
+  for (const [mint, rawEntry] of Object.entries(state.mints)) {
+    if (!isRecord(rawEntry)) continue;
+    const deadRuns = toFiniteNumber(rawEntry.deadRuns);
+    const admitRuns = toFiniteNumber(rawEntry.admitRuns);
+    const evictRuns = toFiniteNumber(rawEntry.evictRuns);
+    const enabledSinceRun = rawEntry.enabledSinceRun === null ? null : toFiniteNumber(rawEntry.enabledSinceRun);
+    const enabled = rawEntry.enabled === true;
+    const lastReason = typeof rawEntry.lastReason === 'string' ? rawEntry.lastReason : null;
+    const lastSeenAt = typeof rawEntry.lastSeenAt === 'string' ? rawEntry.lastSeenAt : new Date().toISOString();
+    if (!Number.isFinite(deadRuns ?? null)) continue;
+    mints[mint] = {
+      deadRuns: Math.max(0, Math.floor(deadRuns ?? 0)),
+      admitRuns: Math.max(0, Math.floor(admitRuns ?? 0)),
+      evictRuns: Math.max(0, Math.floor(evictRuns ?? 0)),
+      enabled,
+      enabledSinceRun: enabledSinceRun === null || !Number.isFinite(enabledSinceRun) ? null : Math.max(0, Math.floor(enabledSinceRun)),
+      lastReason,
+      lastSeenAt,
+    };
+  }
+
+  return {
+    run: runValue === null ? 0 : Math.max(0, Math.floor(runValue)),
+    mints,
+    probeFailureStreak: probeFailureStreakValue === null ? 0 : Math.max(0, Math.floor(probeFailureStreakValue)),
+    probeHealthyStreak: probeHealthyStreakValue === null ? 0 : Math.max(0, Math.floor(probeHealthyStreakValue)),
+    probeFrozen,
+    probeFrozenAt,
+    lastSuccessfulProbeAt,
+  };
+};
+
+const persistTokenUniverseHealthState = async (state: TokenUniverseHealthState) => {
+  await ensureWorkerRuntimeStateStore();
+  const dbPool = getPool();
+  await dbPool.query(
+    `INSERT INTO worker_runtime_state_cache (state_key, state, updated_at)
+     VALUES ($1, $2::jsonb, now())
+     ON CONFLICT (state_key)
+     DO UPDATE SET state = EXCLUDED.state, updated_at = now()`,
+    [TOKEN_UNIVERSE_HEALTH_STATE_KEY, JSON.stringify(state)],
+  );
+};
+
 const pushBounded = <T>(tape: T[], point: T, maxSize: number) => {
   tape.push(point);
   if (tape.length > maxSize) {
@@ -692,6 +993,74 @@ const classifyMomentum = (momentumBps: number, thresholdBps: number) => {
   return 'flat';
 };
 
+const computeMomentumBpsAtOffset = (
+  samples: readonly MarketTapePoint[],
+  lookbackSamples: number,
+  offsetFromEnd: number,
+): number | null => {
+  const latestIdx = samples.length - 1 - offsetFromEnd;
+  const baselineIdx = latestIdx - lookbackSamples;
+  if (latestIdx < 0 || baselineIdx < 0) {
+    return null;
+  }
+
+  const latest = samples[latestIdx];
+  const baseline = samples[baselineIdx];
+  if (!latest || !baseline || baseline.usdPrice <= 0) {
+    return null;
+  }
+
+  return Math.round(((latest.usdPrice - baseline.usdPrice) / baseline.usdPrice) * 10_000);
+};
+
+const hasMomentumRegimePersistence = (params: {
+  samples: readonly MarketTapePoint[];
+  lookbackSamples: number;
+  thresholdBps: number;
+  regime: 'bullish' | 'bearish';
+  requiredSamples: number;
+}) => {
+  const requiredSamples = Math.max(1, params.requiredSamples);
+  if (requiredSamples <= 1) {
+    return true;
+  }
+
+  for (let offset = 0; offset < requiredSamples; offset += 1) {
+    const momentumBps = computeMomentumBpsAtOffset(
+      params.samples,
+      params.lookbackSamples,
+      offset,
+    );
+    if (momentumBps === null) {
+      return false;
+    }
+
+    const regime = classifyMomentum(momentumBps, params.thresholdBps);
+    if (regime !== params.regime) {
+      return false;
+    }
+  }
+
+  return true;
+};
+
+const parseQuotePriceImpactBps = (priceImpactPct: string | null | undefined): number | null => {
+  if (!priceImpactPct) {
+    return null;
+  }
+
+  const parsed = Number(priceImpactPct);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return null;
+  }
+
+  // Jupiter payloads have historically appeared as either fraction (0.01 = 1%)
+  // or percentage-like values. Support both defensively.
+  return parsed <= 1
+    ? Math.round(parsed * 10_000)
+    : Math.round(parsed * 100);
+};
+
 const logSignalEvent = (event: object) => {
   console.log(JSON.stringify({
     service: 'roguezero-worker',
@@ -725,6 +1094,801 @@ const getPythGuardReason = (sample: PythSample): string | null => {
   }
 
   return null;
+};
+
+const isSafeSqlIdentifier = (value: string) => /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(value);
+
+const dedupeMints = (mints: readonly string[]) => {
+  const next: string[] = [];
+  const seen = new Set<string>();
+
+  for (const mint of mints) {
+    if (!solanaPublicKeyPattern.test(mint)) continue;
+    if (seen.has(mint)) continue;
+    seen.add(mint);
+    next.push(mint);
+  }
+
+  return next;
+};
+
+const computePriceMomentumBps = (latestUsd: number | null, priorUsd: number | null) => {
+  if (!latestUsd || !priorUsd || priorUsd <= 0) {
+    return 0;
+  }
+  return Math.round(((latestUsd - priorUsd) / priorUsd) * 10_000);
+};
+
+const buildUniverseSortScore = (params: {
+  momentumBps: number;
+  routeFound: boolean;
+  priceImpactBps: number | null;
+}) => {
+  const boundedMomentum = Math.max(-1_000, Math.min(1_000, params.momentumBps));
+  const impactPenalty = params.priceImpactBps ?? 1_000;
+  const routeBonus = params.routeFound ? 200 : -2_000;
+  return boundedMomentum - impactPenalty + routeBonus;
+};
+
+const applyTokenUniverseAutoSort = async () => {
+  if (!TOKEN_UNIVERSE_AUTO_SORT_ENABLED) {
+    return;
+  }
+
+  const now = Date.now();
+  if ((now - lastTokenUniverseAutoSortAt) < TOKEN_UNIVERSE_AUTO_SORT_INTERVAL_MS) {
+    return;
+  }
+  lastTokenUniverseAutoSortAt = now;
+
+  if (!tokenUniverseTableMeta?.enabledColumn || !tokenUniverseTableMeta?.priorityColumn) {
+    await persistTokenUniverseMetadata({
+      sourceTable: tokenUniverseSourceTable,
+      status: 'skipped',
+      reason: 'missing_enabled_or_priority_column',
+      candidateCount: 0,
+      enabledCount: 0,
+      topTokens: [],
+    });
+    await persistTokenUniverseAutoSortState({
+      status: 'skipped',
+      reason: 'missing_enabled_or_priority_column',
+      sourceTable: tokenUniverseSourceTable,
+      lastRunAt: new Date().toISOString(),
+    });
+    logPriceEvent({
+      provider: 'token-universe',
+      autoSort: 'skipped',
+      reason: 'missing_enabled_or_priority_column',
+      sourceTable: tokenUniverseSourceTable,
+    });
+    return;
+  }
+
+  const candidateMints = dedupeMints(tokenUniverseMints)
+    .filter((mint) => mint !== USDC_MINT)
+    .slice(0, Math.max(1, TOKEN_UNIVERSE_AUTO_SORT_MAX_MINTS));
+
+  if (candidateMints.length === 0) {
+    await persistTokenUniverseMetadata({
+      sourceTable: tokenUniverseSourceTable,
+      status: 'skipped',
+      reason: 'no_candidates',
+      candidateCount: 0,
+      enabledCount: 0,
+      topTokens: [],
+    });
+    await persistTokenUniverseAutoSortState({
+      status: 'skipped',
+      reason: 'no_candidates',
+      sourceTable: tokenUniverseSourceTable,
+      lastRunAt: new Date().toISOString(),
+    });
+    logPriceEvent({
+      provider: 'token-universe',
+      autoSort: 'skipped',
+      reason: 'no_candidates',
+      sourceTable: tokenUniverseSourceTable,
+    });
+    return;
+  }
+
+  const rankedSamples: TokenUniverseRankSample[] = [];
+  const healthState = await loadTokenUniverseHealthState();
+  tokenUniverseProbeFrozen = healthState.probeFrozen;
+  const currentRun = healthState.run + 1;
+  const nextHealthState: TokenUniverseHealthState = {
+    run: currentRun,
+    mints: { ...healthState.mints },
+    probeFailureStreak: healthState.probeFailureStreak,
+    probeHealthyStreak: healthState.probeHealthyStreak,
+    probeFrozen: healthState.probeFrozen,
+    probeFrozenAt: healthState.probeFrozenAt,
+    lastSuccessfulProbeAt: healthState.lastSuccessfulProbeAt,
+  };
+  const pruneDecisions = new Map<string, { reason: string; deadRuns: number; crossedThreshold: boolean }>();
+  const recoveredMints: string[] = [];
+  let routeProbeUnavailableCount = 0;
+  const protectedMints = new Set<string>([
+    SOL_MINT,
+    USDC_MINT,
+    'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',
+  ]);
+  for (const mint of candidateMints) {
+    const previous = nextHealthState.mints[mint] ?? null;
+    const routeCheck = await apiPost<BuildRouteScoutResponse>('/jupiter/swap/build', {
+      inputMint: USDC_MINT,
+      outputMint: mint,
+      amount: String(TOKEN_UNIVERSE_AUTO_SORT_NOTIONAL_USDC_ATOMIC),
+      taker: universeSortProbeTaker,
+      feeTokenSymbol: 'USDC',
+      slippageBps: '50',
+    }, { limiter: jupiterLimiter });
+
+    if (!routeCheck.ok && routeCheck.status >= 500) {
+      routeProbeUnavailableCount += 1;
+      if (previous) {
+        nextHealthState.mints[mint] = {
+          ...previous,
+          lastReason: 'route_probe_unavailable',
+          lastSeenAt: new Date().toISOString(),
+        };
+      }
+      continue;
+    }
+
+    const outAmountAtomic = parseUnsignedNumeric(routeCheck.data?.build?.outAmount);
+    const routeFound = routeCheck.ok && Boolean(outAmountAtomic && outAmountAtomic > 0);
+    const priceImpactBps = parseQuotePriceImpactBps(routeCheck.data?.build?.priceImpactPct ?? null);
+    const usdPrice = latestJupiterUsdByMint.get(mint) ?? null;
+    const priorUsdPrice = previousJupiterUsdByMint.get(mint) ?? null;
+    const momentumBps = computePriceMomentumBps(usdPrice, priorUsdPrice);
+
+    rankedSamples.push({
+      mint,
+      usdPrice,
+      priorUsdPrice,
+      momentumBps,
+      routeFound,
+      priceImpactBps,
+      score: buildUniverseSortScore({ momentumBps, routeFound, priceImpactBps }),
+    });
+
+    let deadReason: string | null = null;
+    if (!routeFound) {
+      deadReason = 'route_not_found';
+    } else if (priceImpactBps !== null && priceImpactBps > (TOKEN_UNIVERSE_AUTO_SORT_MAX_PRICE_IMPACT_BPS * 2)) {
+      deadReason = 'extreme_price_impact';
+    }
+
+    if (deadReason) {
+      const deadRuns = (previous?.deadRuns ?? 0) + 1;
+      nextHealthState.mints[mint] = {
+        deadRuns,
+        admitRuns: previous?.admitRuns ?? 0,
+        evictRuns: previous?.evictRuns ?? 0,
+        enabled: previous?.enabled ?? false,
+        enabledSinceRun: previous?.enabledSinceRun ?? null,
+        lastReason: deadReason,
+        lastSeenAt: new Date().toISOString(),
+      };
+      const crossedThreshold = (previous?.deadRuns ?? 0) < TOKEN_UNIVERSE_DEAD_RUN_THRESHOLD
+        && deadRuns >= TOKEN_UNIVERSE_DEAD_RUN_THRESHOLD;
+      pruneDecisions.set(mint, {
+        reason: deadReason,
+        deadRuns,
+        crossedThreshold,
+      });
+    } else {
+      if ((previous?.deadRuns ?? 0) >= TOKEN_UNIVERSE_DEAD_RUN_THRESHOLD) {
+        recoveredMints.push(mint);
+      }
+      nextHealthState.mints[mint] = {
+        deadRuns: 0,
+        admitRuns: previous?.admitRuns ?? 0,
+        evictRuns: previous?.evictRuns ?? 0,
+        enabled: previous?.enabled ?? false,
+        enabledSinceRun: previous?.enabledSinceRun ?? null,
+        lastReason: null,
+        lastSeenAt: new Date().toISOString(),
+      };
+    }
+  }
+
+  const nowIso = new Date().toISOString();
+  const hasProbeUnavailable = routeProbeUnavailableCount > 0;
+
+  if (hasProbeUnavailable) {
+    nextHealthState.probeFailureStreak = Math.max(1, nextHealthState.probeFailureStreak + 1);
+    nextHealthState.probeHealthyStreak = 0;
+  } else {
+    nextHealthState.probeFailureStreak = 0;
+    nextHealthState.probeHealthyStreak = Math.min(10_000, nextHealthState.probeHealthyStreak + 1);
+    if (rankedSamples.length > 0) {
+      nextHealthState.lastSuccessfulProbeAt = nowIso;
+    }
+  }
+
+  if (!nextHealthState.probeFrozen
+    && nextHealthState.probeFailureStreak >= Math.max(1, TOKEN_UNIVERSE_PROBE_FREEZE_FAILURE_STREAK)) {
+    nextHealthState.probeFrozen = true;
+    nextHealthState.probeFrozenAt = nowIso;
+  }
+
+  if (nextHealthState.probeFrozen
+    && !hasProbeUnavailable
+    && nextHealthState.probeHealthyStreak >= Math.max(1, TOKEN_UNIVERSE_PROBE_UNFREEZE_HEALTHY_STREAK)) {
+    nextHealthState.probeFrozen = false;
+    nextHealthState.probeFrozenAt = null;
+    nextHealthState.probeFailureStreak = 0;
+  }
+
+  if (hasProbeUnavailable) {
+    const reason = nextHealthState.probeFrozen
+      ? 'probe_health_frozen'
+      : 'route_probe_unavailable';
+    const trimmed = trimTokenUniverseHealthState(nextHealthState);
+    await persistTokenUniverseHealthState(trimmed);
+    tokenUniverseProbeFrozen = trimmed.probeFrozen;
+
+    await persistTokenUniverseMetadata({
+      sourceTable: tokenUniverseSourceTable,
+      status: 'skipped',
+      reason,
+      candidateCount: rankedSamples.length,
+      enabledCount: 0,
+      topTokens: [],
+    });
+
+    await persistTokenUniverseAutoSortState({
+      status: 'skipped',
+      reason,
+      sourceTable: tokenUniverseSourceTable,
+      routeProbeUnavailableCount,
+      probeFailureStreak: trimmed.probeFailureStreak,
+      probeHealthyStreak: trimmed.probeHealthyStreak,
+      probeFrozenAt: trimmed.probeFrozenAt,
+      lastSuccessfulProbeAt: trimmed.lastSuccessfulProbeAt,
+      lastRunAt: nowIso,
+    });
+    logPriceEvent({
+      provider: 'token-universe',
+      autoSort: 'skipped',
+      reason,
+      sourceTable: tokenUniverseSourceTable,
+      routeProbeUnavailableCount,
+      probeFailureStreak: trimmed.probeFailureStreak,
+      probeHealthyStreak: trimmed.probeHealthyStreak,
+      probeFrozenAt: trimmed.probeFrozenAt,
+      lastSuccessfulProbeAt: trimmed.lastSuccessfulProbeAt,
+    });
+    return;
+  }
+
+  if (nextHealthState.probeFrozen) {
+    const trimmed = trimTokenUniverseHealthState(nextHealthState);
+    await persistTokenUniverseHealthState(trimmed);
+    tokenUniverseProbeFrozen = trimmed.probeFrozen;
+
+    await persistTokenUniverseMetadata({
+      sourceTable: tokenUniverseSourceTable,
+      status: 'skipped',
+      reason: 'probe_health_frozen',
+      candidateCount: rankedSamples.length,
+      enabledCount: 0,
+      topTokens: [],
+    });
+
+    await persistTokenUniverseAutoSortState({
+      status: 'skipped',
+      reason: 'probe_health_frozen',
+      sourceTable: tokenUniverseSourceTable,
+      routeProbeUnavailableCount,
+      probeFailureStreak: trimmed.probeFailureStreak,
+      probeHealthyStreak: trimmed.probeHealthyStreak,
+      probeFrozenAt: trimmed.probeFrozenAt,
+      lastSuccessfulProbeAt: trimmed.lastSuccessfulProbeAt,
+      lastRunAt: nowIso,
+    });
+
+    logPriceEvent({
+      provider: 'token-universe',
+      autoSort: 'skipped',
+      reason: 'probe_health_frozen',
+      sourceTable: tokenUniverseSourceTable,
+      routeProbeUnavailableCount,
+      probeFailureStreak: trimmed.probeFailureStreak,
+      probeHealthyStreak: trimmed.probeHealthyStreak,
+      probeFrozenAt: trimmed.probeFrozenAt,
+      lastSuccessfulProbeAt: trimmed.lastSuccessfulProbeAt,
+    });
+    return;
+  }
+
+  if (rankedSamples.length === 0) {
+    const reason = 'no_candidates_after_probe';
+
+    const trimmed = trimTokenUniverseHealthState(nextHealthState);
+    await persistTokenUniverseHealthState(trimmed);
+    tokenUniverseProbeFrozen = trimmed.probeFrozen;
+
+    await persistTokenUniverseMetadata({
+      sourceTable: tokenUniverseSourceTable,
+      status: 'skipped',
+      reason,
+      candidateCount: 0,
+      enabledCount: 0,
+      topTokens: [],
+    });
+
+    await persistTokenUniverseAutoSortState({
+      status: 'skipped',
+      reason,
+      sourceTable: tokenUniverseSourceTable,
+      routeProbeUnavailableCount,
+      probeFailureStreak: trimmed.probeFailureStreak,
+      probeHealthyStreak: trimmed.probeHealthyStreak,
+      probeFrozenAt: trimmed.probeFrozenAt,
+      lastSuccessfulProbeAt: trimmed.lastSuccessfulProbeAt,
+      lastRunAt: nowIso,
+    });
+    logPriceEvent({
+      provider: 'token-universe',
+      autoSort: 'skipped',
+      reason,
+      sourceTable: tokenUniverseSourceTable,
+      routeProbeUnavailableCount,
+      probeFailureStreak: trimmed.probeFailureStreak,
+      probeHealthyStreak: trimmed.probeHealthyStreak,
+      probeFrozenAt: trimmed.probeFrozenAt,
+      lastSuccessfulProbeAt: trimmed.lastSuccessfulProbeAt,
+    });
+    return;
+  }
+
+  rankedSamples.sort((a, b) => b.score - a.score);
+  const enabledTop = Math.max(1, TOKEN_UNIVERSE_AUTO_SORT_TOP_ENABLED);
+
+  const dbPool = getTokenUniversePool();
+  const table = tokenUniverseTableMeta.tableName;
+  const mintColumn = tokenUniverseTableMeta.mintColumn;
+  const enabledColumn = tokenUniverseTableMeta.enabledColumn;
+  const priorityColumn = tokenUniverseTableMeta.priorityColumn;
+  const updatedAtColumn = tokenUniverseTableMeta.updatedAtColumn;
+  const deadletterRows: Array<{
+    mint: string;
+    reason: string;
+    deadRuns: number;
+    score: number;
+    momentumBps: number;
+    priceImpactBps: number | null;
+  }> = [];
+  const admittedRows: string[] = [];
+  const evictedRows: string[] = [];
+
+  for (let index = 0; index < rankedSamples.length; index += 1) {
+    const sample = rankedSamples[index];
+    const entry = nextHealthState.mints[sample.mint] ?? {
+      deadRuns: 0,
+      admitRuns: 0,
+      evictRuns: 0,
+      enabled: false,
+      enabledSinceRun: null,
+      lastReason: null,
+      lastSeenAt: new Date().toISOString(),
+    };
+
+    const enableByRank = index < enabledTop;
+    const evictionRank = enabledTop + Math.max(1, TOKEN_UNIVERSE_EVICTION_RANK_BUFFER);
+    const rankAllowsStay = index < evictionRank;
+    const enableByImpact = sample.priceImpactBps === null || sample.priceImpactBps <= TOKEN_UNIVERSE_AUTO_SORT_MAX_PRICE_IMPACT_BPS;
+    const qualityPass = sample.routeFound && enableByImpact;
+    const strongCandidate = qualityPass && enableByRank;
+    const weakCandidate = !qualityPass || !rankAllowsStay;
+    const pruneDecision = pruneDecisions.get(sample.mint);
+    const shouldPrune = TOKEN_UNIVERSE_DEAD_PRUNE_ENABLED
+      && Boolean(pruneDecision)
+      && !protectedMints.has(sample.mint)
+      && (pruneDecision?.deadRuns ?? 0) >= TOKEN_UNIVERSE_DEAD_RUN_THRESHOLD;
+
+    let shouldEnable = entry.enabled;
+    let enabledSinceRun = entry.enabledSinceRun;
+    let admitRuns = entry.admitRuns;
+    let evictRuns = entry.evictRuns;
+
+    if (shouldPrune) {
+      shouldEnable = false;
+      enabledSinceRun = null;
+      admitRuns = 0;
+      evictRuns = 0;
+    } else if (!shouldEnable) {
+      admitRuns = strongCandidate ? (admitRuns + 1) : 0;
+      evictRuns = 0;
+      if (admitRuns >= Math.max(1, TOKEN_UNIVERSE_ADMISSION_STREAK)) {
+        shouldEnable = true;
+        enabledSinceRun = currentRun;
+        evictRuns = 0;
+        admittedRows.push(sample.mint);
+      }
+    } else {
+      admitRuns = strongCandidate ? Math.min(admitRuns + 1, 10_000) : admitRuns;
+      const stayAge = enabledSinceRun === null ? 0 : (currentRun - enabledSinceRun);
+      if (stayAge < Math.max(1, TOKEN_UNIVERSE_MIN_STAY_RUNS)) {
+        evictRuns = 0;
+      } else if (weakCandidate) {
+        evictRuns += 1;
+      } else {
+        evictRuns = 0;
+      }
+
+      if (evictRuns >= Math.max(1, TOKEN_UNIVERSE_EVICTION_STREAK)) {
+        shouldEnable = false;
+        enabledSinceRun = null;
+        admitRuns = 0;
+        evictRuns = 0;
+        evictedRows.push(sample.mint);
+      }
+    }
+
+    nextHealthState.mints[sample.mint] = {
+      ...entry,
+      admitRuns,
+      evictRuns,
+      enabled: shouldEnable,
+      enabledSinceRun,
+      lastReason: shouldPrune
+        ? (pruneDecision?.reason ?? entry.lastReason)
+        : weakCandidate
+          ? 'weak_candidate'
+          : strongCandidate
+            ? 'strong_candidate'
+            : entry.lastReason,
+      lastSeenAt: new Date().toISOString(),
+    };
+
+    const priority = shouldPrune ? 0 : Math.max(0, 1_000 - index);
+
+    const updateSql = updatedAtColumn
+      ? `UPDATE public.${table}
+           SET ${enabledColumn} = $1,
+               ${priorityColumn} = $2,
+               ${updatedAtColumn} = NOW()
+         WHERE ${mintColumn}::text = $3`
+      : `UPDATE public.${table}
+           SET ${enabledColumn} = $1,
+               ${priorityColumn} = $2
+         WHERE ${mintColumn}::text = $3`;
+
+    await dbPool.query(updateSql, [shouldEnable, priority, sample.mint]);
+
+    if (shouldPrune && pruneDecision?.crossedThreshold) {
+      deadletterRows.push({
+        mint: sample.mint,
+        reason: pruneDecision.reason,
+        deadRuns: pruneDecision.deadRuns,
+        score: sample.score,
+        momentumBps: sample.momentumBps,
+        priceImpactBps: sample.priceImpactBps,
+      });
+    }
+  }
+
+  if (deadletterRows.length > 0) {
+    for (const row of deadletterRows) {
+      try {
+        await dbPool.query(
+          `INSERT INTO public.rogueai_token_universe_deadletter (
+             source_table, mint, symbol, reason, dead_runs, score,
+             momentum_bps, price_impact_bps, details, dumped_at
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, now())`,
+          [
+            table,
+            row.mint,
+            null,
+            row.reason,
+            row.deadRuns,
+            row.score,
+            row.momentumBps,
+            row.priceImpactBps,
+            JSON.stringify({
+              reason: row.reason,
+              deadRuns: row.deadRuns,
+              score: row.score,
+              momentumBps: row.momentumBps,
+              priceImpactBps: row.priceImpactBps,
+            }),
+          ],
+        );
+      } catch {
+        // deadletter writes are best-effort only
+      }
+    }
+  }
+
+  if (recoveredMints.length > 0) {
+    for (const mint of recoveredMints) {
+      try {
+        await dbPool.query(
+          `UPDATE public.rogueai_token_universe_deadletter
+              SET recovered_at = now(),
+                  recovered_reason = 'route_and_impact_recovered'
+            WHERE id = (
+              SELECT id
+                FROM public.rogueai_token_universe_deadletter
+               WHERE mint = $1
+                 AND recovered_at IS NULL
+               ORDER BY dumped_at DESC
+               LIMIT 1
+            )`,
+          [mint],
+        );
+      } catch {
+        // best-effort only
+      }
+    }
+  }
+
+  const trimmed = trimTokenUniverseHealthState(nextHealthState);
+  await persistTokenUniverseHealthState(trimmed);
+  tokenUniverseProbeFrozen = trimmed.probeFrozen;
+
+  logPriceEvent({
+    provider: 'token-universe',
+    autoSort: 'applied',
+    sourceTable: table,
+    candidateCount: rankedSamples.length,
+    enabledCount: rankedSamples.filter((sample, idx) => idx < enabledTop && sample.routeFound && (sample.priceImpactBps === null || sample.priceImpactBps <= TOKEN_UNIVERSE_AUTO_SORT_MAX_PRICE_IMPACT_BPS)).length,
+    deadDumpCount: deadletterRows.length,
+    recoveredCount: recoveredMints.length,
+    admittedCount: admittedRows.length,
+    evictedCount: evictedRows.length,
+    routeProbeUnavailableCount,
+    probeFailureStreak: trimmed.probeFailureStreak,
+    probeHealthyStreak: trimmed.probeHealthyStreak,
+    probeFrozenAt: trimmed.probeFrozenAt,
+    lastSuccessfulProbeAt: trimmed.lastSuccessfulProbeAt,
+    top: rankedSamples.slice(0, 5).map((sample, idx) => ({
+      rank: idx + 1,
+      mint: sample.mint,
+      score: sample.score,
+      momentumBps: sample.momentumBps,
+      priceImpactBps: sample.priceImpactBps,
+      routeFound: sample.routeFound,
+    })),
+  });
+
+  const enabledCount = rankedSamples.filter((sample, idx) => idx < enabledTop && sample.routeFound && (sample.priceImpactBps === null || sample.priceImpactBps <= TOKEN_UNIVERSE_AUTO_SORT_MAX_PRICE_IMPACT_BPS)).length;
+  lastTokenUniverseEngineAppliedAt = Date.now();
+  lastTokenUniverseEngineEnabledCount = enabledCount;
+
+  const avgMomentumBps = rankedSamples.length > 0
+    ? rankedSamples.reduce((sum, sample) => sum + sample.momentumBps, 0) / rankedSamples.length
+    : 0;
+  const impactSamples = rankedSamples
+    .map((sample) => sample.priceImpactBps)
+    .filter((value): value is number => value !== null);
+  const avgPriceImpactBps = impactSamples.length > 0
+    ? impactSamples.reduce((sum, value) => sum + value, 0) / impactSamples.length
+    : null;
+
+  await persistTokenUniverseMetadata({
+    sourceTable: table,
+    status: 'applied',
+    reason: null,
+    candidateCount: rankedSamples.length,
+    enabledCount,
+    avgMomentumBps,
+    avgPriceImpactBps,
+    topTokens: rankedSamples.slice(0, 10).map((sample, idx) => ({
+      rank: idx + 1,
+      mint: sample.mint,
+      score: sample.score,
+      momentumBps: sample.momentumBps,
+      priceImpactBps: sample.priceImpactBps,
+      routeFound: sample.routeFound,
+    })),
+  }, dbPool);
+
+  await persistTokenUniverseAutoSortState({
+    status: 'applied',
+    reason: null,
+    sourceTable: table,
+    candidateCount: rankedSamples.length,
+    enabledCount,
+    deadDumpCount: deadletterRows.length,
+    recoveredCount: recoveredMints.length,
+    admittedCount: admittedRows.length,
+    evictedCount: evictedRows.length,
+    routeProbeUnavailableCount,
+    probeFailureStreak: trimmed.probeFailureStreak,
+    probeHealthyStreak: trimmed.probeHealthyStreak,
+    probeFrozenAt: trimmed.probeFrozenAt,
+    lastSuccessfulProbeAt: trimmed.lastSuccessfulProbeAt,
+    top: rankedSamples.slice(0, 5).map((sample, idx) => ({
+      rank: idx + 1,
+      mint: sample.mint,
+      score: sample.score,
+      momentumBps: sample.momentumBps,
+      priceImpactBps: sample.priceImpactBps,
+      routeFound: sample.routeFound,
+    })),
+    lastRunAt: new Date().toISOString(),
+  });
+};
+
+const ensureTokenUniverseTable = async () => {
+  if (tokenUniverseBootstrapAttempted || !TOKEN_UNIVERSE_BOOTSTRAP_ENABLED) {
+    return;
+  }
+  tokenUniverseBootstrapAttempted = true;
+
+  try {
+    const dbPool = getTokenUniversePool();
+    await dbPool.query(`
+      CREATE TABLE IF NOT EXISTS public.rogueai_token_universe (
+        mint TEXT PRIMARY KEY,
+        symbol TEXT,
+        enabled BOOLEAN NOT NULL DEFAULT true,
+        priority INTEGER NOT NULL DEFAULT 0,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      )
+    `);
+
+    await dbPool.query(`
+      CREATE TABLE IF NOT EXISTS public.rogueai_token_universe_metadata (
+        id BIGSERIAL PRIMARY KEY,
+        source_table TEXT,
+        status TEXT NOT NULL,
+        reason TEXT,
+        candidate_count INTEGER,
+        enabled_count INTEGER,
+        avg_momentum_bps DOUBLE PRECISION,
+        avg_price_impact_bps DOUBLE PRECISION,
+        top_tokens JSONB,
+        built_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      )
+    `);
+
+    await dbPool.query(`
+      CREATE TABLE IF NOT EXISTS public.rogueai_token_universe_deadletter (
+        id BIGSERIAL PRIMARY KEY,
+        source_table TEXT,
+        mint TEXT NOT NULL,
+        symbol TEXT,
+        reason TEXT NOT NULL,
+        dead_runs INTEGER NOT NULL,
+        score DOUBLE PRECISION,
+        momentum_bps DOUBLE PRECISION,
+        price_impact_bps DOUBLE PRECISION,
+        dumped_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        details JSONB
+      )
+    `);
+
+    await dbPool.query(`
+      ALTER TABLE public.rogueai_token_universe_deadletter
+      ADD COLUMN IF NOT EXISTS recovered_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS recovered_reason TEXT
+    `);
+
+    for (const token of DEFAULT_TOKEN_UNIVERSE_SEED) {
+      await dbPool.query(
+        `INSERT INTO public.rogueai_token_universe (mint, symbol, enabled, priority)
+         VALUES ($1, $2, true, $3)
+         ON CONFLICT (mint) DO NOTHING`,
+        [token.mint, token.symbol, token.priority],
+      );
+    }
+
+    logPriceEvent({
+      provider: 'token-universe',
+      bootstrap: 'completed',
+      table: 'rogueai_token_universe',
+      seeded: DEFAULT_TOKEN_UNIVERSE_SEED.length,
+    });
+  } catch (err) {
+    logPriceEvent({
+      provider: 'token-universe',
+      bootstrap: 'failed',
+      error: String(err),
+    });
+  }
+};
+
+const refreshTokenUniverseMints = async (force = false) => {
+  const now = Date.now();
+  if (!force && (now - lastTokenUniverseRefreshAt) < TOKEN_UNIVERSE_REFRESH_MS) {
+    return tokenUniverseMints;
+  }
+  lastTokenUniverseRefreshAt = now;
+
+  if (TOKEN_UNIVERSE_TABLE_CANDIDATES.length === 0) {
+    tokenUniverseMints = [];
+    tokenUniverseSourceTable = null;
+    tokenUniverseTableMeta = null;
+    return tokenUniverseMints;
+  }
+
+  try {
+    await ensureTokenUniverseTable();
+    const dbPool = getTokenUniversePool();
+    const tableResult = await dbPool.query<{ table_name: string }>(
+      `SELECT table_name
+         FROM information_schema.tables
+        WHERE table_schema = 'public'
+          AND table_name = ANY($1::text[])
+        ORDER BY table_name`,
+      [TOKEN_UNIVERSE_TABLE_CANDIDATES],
+    );
+
+    const existingTables = new Set(tableResult.rows.map((row) => row.table_name));
+    const selectedTable = TOKEN_UNIVERSE_TABLE_CANDIDATES.find((candidate) => existingTables.has(candidate)) ?? null;
+
+    if (!selectedTable || !isSafeSqlIdentifier(selectedTable)) {
+      tokenUniverseMints = [];
+      tokenUniverseSourceTable = null;
+      tokenUniverseTableMeta = null;
+      return tokenUniverseMints;
+    }
+
+    const columnsResult = await dbPool.query<{ column_name: string }>(
+      `SELECT column_name
+         FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = $1`,
+      [selectedTable],
+    );
+    const columns = new Set(columnsResult.rows.map((row) => row.column_name));
+
+    const mintColumn = ['mint', 'mint_address', 'token_mint', 'address'].find((column) => columns.has(column)) ?? null;
+    if (!mintColumn || !isSafeSqlIdentifier(mintColumn)) {
+      tokenUniverseMints = [];
+      tokenUniverseSourceTable = selectedTable;
+      tokenUniverseTableMeta = null;
+      return tokenUniverseMints;
+    }
+
+    const enabledColumn = ['enabled', 'is_enabled', 'active'].find((column) => columns.has(column)) ?? null;
+    const priorityColumn = ['priority', 'rank', 'score', 'weight'].find((column) => columns.has(column)) ?? null;
+    const updatedAtColumn = ['updated_at', 'updatedAt', 'modified_at'].find((column) => columns.has(column)) ?? null;
+
+    const whereClause = (!TOKEN_UNIVERSE_AUTO_SORT_ENABLED && enabledColumn && isSafeSqlIdentifier(enabledColumn))
+      ? `WHERE COALESCE(${enabledColumn}, true) = true`
+      : '';
+    const orderClause = priorityColumn && isSafeSqlIdentifier(priorityColumn)
+      ? `ORDER BY ${priorityColumn} DESC NULLS LAST`
+      : '';
+
+    const query = `SELECT ${mintColumn}::text AS mint
+                     FROM public.${selectedTable}
+                     ${whereClause}
+                     ${orderClause}
+                     LIMIT ${Math.max(1, TOKEN_UNIVERSE_MAX_MINTS)}`;
+
+    const mintResult = await dbPool.query<{ mint: string | null }>(query);
+    tokenUniverseMints = dedupeMints(mintResult.rows.map((row) => row.mint ?? ''));
+    tokenUniverseSourceTable = selectedTable;
+    tokenUniverseTableMeta = {
+      tableName: selectedTable,
+      mintColumn,
+      enabledColumn: enabledColumn && isSafeSqlIdentifier(enabledColumn) ? enabledColumn : null,
+      priorityColumn: priorityColumn && isSafeSqlIdentifier(priorityColumn) ? priorityColumn : null,
+      updatedAtColumn: updatedAtColumn && isSafeSqlIdentifier(updatedAtColumn) ? updatedAtColumn : null,
+    };
+
+    logPriceEvent({
+      provider: 'token-universe',
+      sourceTable: tokenUniverseSourceTable,
+      mintCount: tokenUniverseMints.length,
+    });
+  } catch (err) {
+    logPriceEvent({
+      provider: 'token-universe',
+      error: String(err),
+    });
+  }
+
+  return tokenUniverseMints;
 };
 
 const fetchPythSolUsd = async (): Promise<PythSample> => {
@@ -922,8 +2086,23 @@ const runPythPollTick = async (): Promise<void> => {
 const runJupiterPricePollTick = async (): Promise<void> => {
   if (!jupiterPriceConfig) return;
   try {
-    const mints = jupiterPriceConfig.defaultMints;
+    await refreshTokenUniverseMints();
+    const mints = dedupeMints([
+      ...jupiterPriceConfig.defaultMints,
+      ...tokenUniverseMints,
+    ]);
     const samples = await fetchJupiterPricesUsd(mints);
+    for (const mint of Object.keys(samples)) {
+      const nextUsd = samples[mint]?.usdPrice;
+      if (typeof nextUsd !== 'number' || !Number.isFinite(nextUsd) || nextUsd <= 0) {
+        continue;
+      }
+      const currentUsd = latestJupiterUsdByMint.get(mint);
+      if (typeof currentUsd === 'number' && Number.isFinite(currentUsd) && currentUsd > 0) {
+        previousJupiterUsdByMint.set(mint, currentUsd);
+      }
+      latestJupiterUsdByMint.set(mint, nextUsd);
+    }
     const sol = samples[SOL_MINT];
     const usdc = samples[USDC_MINT];
     if (sol) {
@@ -949,6 +2128,9 @@ const runJupiterPricePollTick = async (): Promise<void> => {
     }
     logPriceEvent({
       provider: 'jupiter-price-v3',
+      trackedMintCount: mints.length,
+      tokenUniverseMintCount: tokenUniverseMints.length,
+      tokenUniverseSourceTable,
       solUsd: sol?.usdPrice ?? null,
       solBlockId: sol?.blockId ?? null,
       usdcUsd: usdc?.usdPrice ?? null,
@@ -956,6 +2138,8 @@ const runJupiterPricePollTick = async (): Promise<void> => {
       driftBpsJupiterMinusPyth: driftBpsVsPyth,
       tape: getSharedMarketTapeSummary(),
     });
+
+    await applyTokenUniverseAutoSort();
 
     await persistMarketTapeState();
   } catch (err) {
@@ -1178,26 +2362,17 @@ const checkFunding = async (session: RawSession, observedBalance?: number): Prom
     }
     const markedAt = new Date().toISOString();
     const markedPriceUsd = lastPythSolSample?.usdPrice ?? null;
-      const cappedInitialPositionLamports = (() => {
-        const capLamports = computeSolEntryCapLamports({
-          profileName: liveSpeedProfileName,
-          solUsdPrice: markedPriceUsd,
-          env: process.env,
-        });
-
-        return capLamports ? Math.min(balance, capLamports) : balance;
-      })();
     await mergeFundingPatch(session, {
       startingBalanceAtomic: balanceAtomic,
       currentBalanceAtomic: balanceAtomic,
     });
     await persistServiceControl(session, {
       positionState: {
-        status: 'long_sol',
-        entryPriceUsd: markedPriceUsd,
-        entryAt: markedAt,
-          quantityAtomic: String(cappedInitialPositionLamports),
-        highWaterPriceUsd: markedPriceUsd,
+        status: 'flat',
+        entryPriceUsd: null,
+        entryAt: null,
+        quantityAtomic: null,
+        highWaterPriceUsd: null,
         lastMarkedPriceUsd: markedPriceUsd,
         lastMarkedAt: markedAt,
         pendingExitReason: null,
@@ -1211,9 +2386,6 @@ const checkFunding = async (session: RawSession, observedBalance?: number): Prom
         log('warn', session.id, `failed to remove funding subscription: ${String(err)}`);
       });
       fundingSubscriptionIds.delete(session.id);
-    }
-    if (cappedInitialPositionLamports < balance) {
-      log('info', session.id, `initial SOL exposure capped by ${liveSpeedProfile.label}: ${cappedInitialPositionLamports}/${balance} lamports`);
     }
     log('info', session.id, `funded (${balance} lamports) â†’ ready`);
   } else {
@@ -1337,6 +2509,21 @@ type PrepareResponse = {
   error?: string;
 };
 
+type BuildRouteScoutResponse = {
+  build?: {
+    outAmount?: string;
+    priceImpactPct?: string | null;
+  };
+  error?: string;
+};
+
+type UniverseScoutSample = {
+  mint: string;
+  routeFound: boolean;
+  outAmountAtomic: number | null;
+  priceImpactBps: number | null;
+};
+
 type SubmitResponse = {
   submitted?: boolean;
   signature?: string;
@@ -1417,6 +2604,73 @@ const parseUnsignedNumeric = (value: string | null | undefined) => {
 
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
+};
+
+const getUniverseScoutCandidateMints = () => dedupeMints([
+  SOL_MINT,
+  ...tokenUniverseMints,
+])
+  .filter((mint) => mint !== USDC_MINT)
+  .slice(0, Math.max(1, WORKER_UNIVERSE_SCOUT_MAX_CANDIDATES));
+
+const scoutEntryUniverse = async (params: {
+  amountAtomic: number;
+  takerWallet: string;
+  slippageBps: number;
+}) => {
+  const candidates = getUniverseScoutCandidateMints();
+  const samples: UniverseScoutSample[] = [];
+
+  for (const candidateMint of candidates) {
+    const build = await apiPost<BuildRouteScoutResponse>('/jupiter/swap/build', {
+      inputMint: USDC_MINT,
+      outputMint: candidateMint,
+      amount: String(params.amountAtomic),
+      taker: params.takerWallet,
+      feeTokenSymbol: 'USDC',
+      slippageBps: String(params.slippageBps),
+    }, { limiter: jupiterLimiter });
+
+    if (!build.ok || !build.data.build) {
+      samples.push({
+        mint: candidateMint,
+        routeFound: false,
+        outAmountAtomic: null,
+        priceImpactBps: null,
+      });
+      continue;
+    }
+
+    const outAmountAtomic = parseUnsignedNumeric(build.data.build.outAmount);
+    const priceImpactBps = parseQuotePriceImpactBps(build.data.build.priceImpactPct ?? null);
+
+    samples.push({
+      mint: candidateMint,
+      routeFound: Boolean(outAmountAtomic && outAmountAtomic > 0),
+      outAmountAtomic,
+      priceImpactBps,
+    });
+  }
+
+  const ranked = samples
+    .filter((sample) => sample.routeFound)
+    .map((sample) => ({
+      ...sample,
+      effectiveImpactBps: sample.priceImpactBps ?? Number.POSITIVE_INFINITY,
+    }))
+    .sort((a, b) => a.effectiveImpactBps - b.effectiveImpactBps);
+
+  const solRankIndex = ranked.findIndex((sample) => sample.mint === SOL_MINT);
+  const solRank = solRankIndex >= 0 ? solRankIndex + 1 : null;
+  const solSample = ranked.find((sample) => sample.mint === SOL_MINT) ?? null;
+
+  return {
+    candidates,
+    ranked,
+    solRank,
+    solPriceImpactBps: solSample?.priceImpactBps ?? null,
+    bestMint: ranked[0]?.mint ?? null,
+  };
 };
 
 const getUsdValueFromAtomicAmount = (mint: string, amountAtomic: number): number => {
@@ -1791,6 +3045,37 @@ const evaluateExitTrigger = (
   };
 };
 
+const getSessionStrategyConfig = (session: RawSession) => {
+  const configured = session.service_control.strategyConfig;
+
+  const momentum = {
+    lookbackSamples: configured?.momentum?.lookbackSamples ?? signalPolicy.momentumLookbackSamples,
+    thresholdBps: configured?.momentum?.thresholdBps ?? signalPolicy.momentumThresholdBps,
+    edgeSafetyBufferBps: configured?.momentum?.edgeSafetyBufferBps ?? signalPolicy.edgeSafetyBufferBps,
+  };
+
+  const meanReversion: BollingerConfig = {
+    length: configured?.meanReversion?.length ?? DEFAULT_BOLLINGER_CONFIG.length,
+    stdMultiplier: configured?.meanReversion?.stdMultiplier ?? DEFAULT_BOLLINGER_CONFIG.stdMultiplier,
+    minBandWidthFraction: configured?.meanReversion?.minBandWidthFraction ?? DEFAULT_BOLLINGER_CONFIG.minBandWidthFraction,
+    entryThreshold: configured?.meanReversion?.entryThreshold ?? DEFAULT_BOLLINGER_CONFIG.entryThreshold,
+    exitThreshold: configured?.meanReversion?.exitThreshold ?? DEFAULT_BOLLINGER_CONFIG.exitThreshold,
+  };
+
+  const supertrend: SupertrendConfig = {
+    candleSamples: configured?.supertrend?.candleSamples ?? DEFAULT_SUPERTREND_CONFIG.candleSamples,
+    atrPeriod: configured?.supertrend?.atrPeriod ?? DEFAULT_SUPERTREND_CONFIG.atrPeriod,
+    multiplier: configured?.supertrend?.multiplier ?? DEFAULT_SUPERTREND_CONFIG.multiplier,
+  };
+
+  return {
+    autoRotationEnabled: configured?.autoRotationEnabled ?? true,
+    momentum,
+    meanReversion,
+    supertrend,
+  };
+};
+
 const executeTrade = async (session: RawSession): Promise<void> => {
   // Dedup guard: skip if there's an in-flight execution for this wallet.
   // Prevents double-submit if worker restarts between prepare and confirm.
@@ -1816,6 +3101,36 @@ const executeTrade = async (session: RawSession): Promise<void> => {
 
   let positionState = await refreshPositionMark(session, getPositionState(session));
 
+  // Recovery guard: older funding flow could incorrectly mark a session as
+  // long_sol before any submitted trade exists. Reset to flat so entry logic
+  // can run normally.
+  if (
+    positionState.status === 'long_sol'
+    && !session.service_control.schedulingState?.lastTradeSubmittedAt
+  ) {
+    const markedAt = new Date().toISOString();
+    const markedPriceUsd = positionState.lastMarkedPriceUsd ?? lastPythSolSample?.usdPrice ?? null;
+
+    const recoveredPositionState: NonNullable<Session['serviceControl']['positionState']> = {
+      status: 'flat',
+      entryPriceUsd: null,
+      entryAt: null,
+      quantityAtomic: null,
+      highWaterPriceUsd: null,
+      lastMarkedPriceUsd: markedPriceUsd,
+      lastMarkedAt: markedAt,
+      pendingExitReason: null,
+      exitReason: null,
+    };
+
+    await persistServiceControl(session, {
+      positionState: recoveredPositionState,
+    });
+
+    positionState = recoveredPositionState;
+    log('warn', session.id, 'recovered inconsistent bootstrap position state (long_sol without submitted trade)');
+  }
+
   if (positionState.status === 'long_sol' && positionState.exitReason !== null) {
     await persistServiceControl(session, {
       positionState: {
@@ -1829,8 +3144,30 @@ const executeTrade = async (session: RawSession): Promise<void> => {
     };
   }
 
-  // Resolve which strategy this session should use
-  const activeStrategy = session.service_control.rotationState?.activeStrategy ?? 'momentum';
+  const strategyConfig = getSessionStrategyConfig(session);
+
+  // Resolve which strategy this session should use (respect enabled flags)
+  const strategyUniverse = session.service_control.strategyUniverse ?? [];
+  const enabledStrategies = strategyUniverse
+    .filter((strategy) => strategy.enabled)
+    .map((strategy) => strategy.key);
+
+  const configuredActiveStrategy = session.service_control.rotationState?.activeStrategy ?? 'momentum';
+  const fallbackStrategy = enabledStrategies[0] ?? 'momentum';
+  const activeStrategy = enabledStrategies.includes(configuredActiveStrategy)
+    ? configuredActiveStrategy
+    : fallbackStrategy;
+
+  if (activeStrategy !== configuredActiveStrategy) {
+    await persistServiceControl(session, {
+      rotationState: {
+        activeStrategy,
+        queuedStrategy: activeStrategy,
+      },
+    } as any);
+    log('info', session.id, `strategy override: ${configuredActiveStrategy} disabled → ${activeStrategy}`);
+  }
+
   const pythTape: PriceSample[] = sharedMarketTape.solUsdPyth.map(p => ({
     usdPrice: p.usdPrice,
     sampledAt: p.sampledAt,
@@ -1840,56 +3177,82 @@ const executeTrade = async (session: RawSession): Promise<void> => {
   let effectiveSignal: NonNullable<Session['serviceControl']['lastSignal']> | null = null;
 
   if (activeStrategy === 'mean_reversion') {
-    const bbSignal = computeBollingerSignal(pythTape);
+    const bbSignal = computeBollingerSignal(pythTape, strategyConfig.meanReversion);
     effectiveSignal = {
       at: new Date().toISOString(),
       source: 'pyth-hermes',
       signal: 'momentum', // schema field name, reused for all strategies
       status: bbSignal.status,
       regime: bbSignal.regime,
-      lookbackSamples: signalPolicy.momentumLookbackSamples,
-      thresholdBps: signalPolicy.momentumThresholdBps,
+      lookbackSamples: strategyConfig.momentum.lookbackSamples,
+      thresholdBps: strategyConfig.momentum.thresholdBps,
       momentumBps: bbSignal.momentumBps,
       guardReason: bbSignal.guardReason,
     };
     logSignalEvent({ ...bbSignal.meta, strategy: 'mean_reversion', regime: bbSignal.regime, status: bbSignal.status });
   } else if (activeStrategy === 'supertrend') {
-    const stSignal = computeSupertrendSignal(pythTape);
+    const stSignal = computeSupertrendSignal(pythTape, strategyConfig.supertrend);
     effectiveSignal = {
       at: new Date().toISOString(),
       source: 'pyth-hermes',
       signal: 'momentum',
       status: stSignal.status,
       regime: stSignal.regime,
-      lookbackSamples: signalPolicy.momentumLookbackSamples,
-      thresholdBps: signalPolicy.momentumThresholdBps,
+      lookbackSamples: strategyConfig.momentum.lookbackSamples,
+      thresholdBps: strategyConfig.momentum.thresholdBps,
       momentumBps: stSignal.momentumBps,
       guardReason: stSignal.guardReason,
     };
     logSignalEvent({ ...stSignal.meta, strategy: 'supertrend', regime: stSignal.regime, status: stSignal.status });
   } else {
-    // Default: momentum (existing behavior)
-    if (!lastSignalSnapshot) {
-      await persistTradeDecision(session, 'blocked', 'signal_not_ready');
-      await persistLastTradeGate(session, {
+    // Session-configured momentum signal
+    if (!lastPythSolSample) {
+      effectiveSignal = {
         at: new Date().toISOString(),
-        decision: 'blocked',
-        reason: 'signal_not_ready',
-        expectedEdgeBps: null,
-        estimatedCostBps: null,
-        safetyBufferBps: null,
-      });
-      log('info', session.id, 'strategy skip: momentum signal not ready');
-      return;
+        source: 'pyth-hermes',
+        signal: 'momentum',
+        status: 'warming_up',
+        regime: null,
+        lookbackSamples: strategyConfig.momentum.lookbackSamples,
+        thresholdBps: strategyConfig.momentum.thresholdBps,
+        momentumBps: null,
+        guardReason: null,
+      };
+    } else {
+      const guardReason = getPythGuardReason(lastPythSolSample);
+      const momentumBps = computeMomentumBps(
+        sharedMarketTape.solUsdPyth,
+        strategyConfig.momentum.lookbackSamples,
+      );
+
+      effectiveSignal = {
+        at: new Date().toISOString(),
+        source: 'pyth-hermes',
+        signal: 'momentum',
+        status: guardReason
+          ? 'guarded_off'
+          : momentumBps === null
+            ? 'warming_up'
+            : 'ready',
+        regime: guardReason || momentumBps === null
+          ? null
+          : classifyMomentum(momentumBps, strategyConfig.momentum.thresholdBps),
+        lookbackSamples: strategyConfig.momentum.lookbackSamples,
+        thresholdBps: strategyConfig.momentum.thresholdBps,
+        momentumBps,
+        guardReason,
+      };
     }
-    effectiveSignal = lastSignalSnapshot;
   }
 
   // Auto-rotate strategy based on market regime (if rotation is enabled)
-  const recommendation = recommendStrategy(pythTape);
-  const shouldRotate = recommendation.recommended !== activeStrategy
-    && pythTape.length >= 21; // only rotate once we have enough data
-  if (shouldRotate) {
+  const recommendation = recommendStrategy(pythTape, strategyConfig.meanReversion);
+  const recommendedStrategy = enabledStrategies.includes(recommendation.recommended)
+    ? recommendation.recommended
+    : activeStrategy;
+  const shouldRotate = recommendedStrategy !== activeStrategy
+    && pythTape.length >= (strategyConfig.meanReversion.length + 1); // only rotate once we have enough data
+  if (strategyConfig.autoRotationEnabled && shouldRotate) {
     const rotationState = session.service_control.rotationState;
     const lockedUntil = rotationState?.lockedUntil ? new Date(rotationState.lockedUntil).getTime() : 0;
     if (Date.now() > lockedUntil) {
@@ -1898,14 +3261,14 @@ const executeTrade = async (session: RawSession): Promise<void> => {
       if (Date.now() - lastRotatedAt > rotationIntervalMs || lastRotatedAt === 0) {
         await persistServiceControl(session, {
           rotationState: {
-            activeStrategy: recommendation.recommended,
-            queuedStrategy: recommendation.recommended,
+            activeStrategy: recommendedStrategy,
+            queuedStrategy: recommendedStrategy,
             rotationIntervalMinutes: rotationState?.rotationIntervalMinutes ?? 60,
             lastRotatedAt: new Date().toISOString(),
             lockedUntil: new Date(Date.now() + 60_000).toISOString(), // lock for 1 min to prevent thrashing
           },
         } as any);
-        log('info', session.id, `strategy rotation: ${activeStrategy} â†’ ${recommendation.recommended} (${recommendation.reason})`);
+        log('info', session.id, `strategy rotation: ${activeStrategy} â†’ ${recommendedStrategy} (${recommendation.reason})`);
       }
     }
   }
@@ -2000,6 +3363,8 @@ const executeTrade = async (session: RawSession): Promise<void> => {
   }
 
   let tradePlan: TradeExecutionPlan | null = null;
+  let useBasicPairEntryFallback = false;
+  let basicPairEntryFallbackReason: string | null = null;
 
   if (positionState.status === 'long_sol') {
     const exitTrigger = evaluateExitTrigger(positionState, effectiveSignal);
@@ -2110,6 +3475,28 @@ const executeTrade = async (session: RawSession): Promise<void> => {
       exitReason: exitTrigger.reason,
     };
   } else {
+    const universeEngineAgeMs = lastTokenUniverseEngineAppliedAt > 0
+      ? (Date.now() - lastTokenUniverseEngineAppliedAt)
+      : Number.POSITIVE_INFINITY;
+    const universeEngineFresh = universeEngineAgeMs <= TOKEN_UNIVERSE_ENGINE_MAX_STALE_MS;
+    const universeEngineEmpty = lastTokenUniverseEngineEnabledCount <= 0;
+    basicPairEntryFallbackReason = !universeEngineFresh
+      ? 'universe_engine_stale'
+      : tokenUniverseProbeFrozen
+        ? 'probe_health_frozen'
+        : universeEngineEmpty
+          ? 'universe_engine_empty'
+          : null;
+    useBasicPairEntryFallback = basicPairEntryFallbackReason !== null;
+
+    if (useBasicPairEntryFallback) {
+      log(
+        'info',
+        session.id,
+        `entry fallback active: basic_pairs_only (${basicPairEntryFallbackReason}) ageMs=${Number.isFinite(universeEngineAgeMs) ? universeEngineAgeMs : -1} enabledCount=${lastTokenUniverseEngineEnabledCount} probeFrozen=${tokenUniverseProbeFrozen}`,
+      );
+    }
+
     if (effectiveSignal.regime !== 'bullish') {
       await persistTradeDecision(session, 'blocked', 'no_bullish_entry_signal');
       await persistLastTradeGate(session, {
@@ -2121,6 +3508,31 @@ const executeTrade = async (session: RawSession): Promise<void> => {
         safetyBufferBps: null,
       });
       log('info', session.id, `strategy skip: regime=${effectiveSignal.regime} momentum=${effectiveSignal.momentumBps}`);
+      return;
+    }
+
+    const persistentBullishRegime = hasMomentumRegimePersistence({
+      samples: sharedMarketTape.solUsdPyth,
+      lookbackSamples: strategyConfig.momentum.lookbackSamples,
+      thresholdBps: strategyConfig.momentum.thresholdBps,
+      regime: 'bullish',
+      requiredSamples: MIN_ENTRY_SIGNAL_PERSISTENCE_SAMPLES,
+    });
+    if (!persistentBullishRegime) {
+      await persistTradeDecision(session, 'blocked', 'regime_not_persistent');
+      await persistLastTradeGate(session, {
+        at: new Date().toISOString(),
+        decision: 'blocked',
+        reason: 'regime_not_persistent',
+        expectedEdgeBps: effectiveSignal.momentumBps,
+        estimatedCostBps: null,
+        safetyBufferBps: strategyConfig.momentum.edgeSafetyBufferBps,
+      });
+      log(
+        'info',
+        session.id,
+        `entry blocked: bullish regime not persistent (${MIN_ENTRY_SIGNAL_PERSISTENCE_SAMPLES} samples required)`,
+      );
       return;
     }
 
@@ -2200,6 +3612,71 @@ const executeTrade = async (session: RawSession): Promise<void> => {
       return;
     }
 
+    if (WORKER_UNIVERSE_SCOUT_ENABLED && !useBasicPairEntryFallback) {
+      const scout = await scoutEntryUniverse({
+        amountAtomic: usdcSizing.amountAtomic,
+        takerWallet: session.session_wallet,
+        slippageBps: session.risk_limits.maxSlippageBps,
+      });
+
+      if (scout.solRank === null) {
+        await persistTradeDecision(session, 'blocked', 'universe_scout_no_sol_route');
+        await persistLastTradeGate(session, {
+          at: new Date().toISOString(),
+          decision: 'blocked',
+          reason: 'universe_scout_no_sol_route',
+          expectedEdgeBps: effectiveSignal.momentumBps,
+          estimatedCostBps: null,
+          safetyBufferBps: strategyConfig.momentum.edgeSafetyBufferBps,
+        });
+        log(
+          'info',
+          session.id,
+          `universe scout blocked entry: no SOL route (candidates=${scout.candidates.length} best=${scout.bestMint})`,
+        );
+        return;
+      }
+
+      if (
+        scout.solPriceImpactBps !== null
+        && scout.solPriceImpactBps > WORKER_UNIVERSE_SCOUT_MAX_SOL_PRICE_IMPACT_BPS
+      ) {
+        await persistTradeDecision(session, 'blocked', 'universe_scout_sol_impact_too_high');
+        await persistLastTradeGate(session, {
+          at: new Date().toISOString(),
+          decision: 'blocked',
+          reason: 'universe_scout_sol_impact_too_high',
+          expectedEdgeBps: effectiveSignal.momentumBps,
+          estimatedCostBps: scout.solPriceImpactBps,
+          safetyBufferBps: strategyConfig.momentum.edgeSafetyBufferBps,
+        });
+        log(
+          'info',
+          session.id,
+          `universe scout blocked entry: SOL impact=${scout.solPriceImpactBps}bps max=${WORKER_UNIVERSE_SCOUT_MAX_SOL_PRICE_IMPACT_BPS}bps rank=${scout.solRank} best=${scout.bestMint}`,
+        );
+        return;
+      }
+
+      if (scout.solRank > Math.max(1, WORKER_UNIVERSE_SCOUT_MIN_SOL_RANK)) {
+        await persistTradeDecision(session, 'blocked', 'universe_scout_sol_rank_too_low');
+        await persistLastTradeGate(session, {
+          at: new Date().toISOString(),
+          decision: 'blocked',
+          reason: 'universe_scout_sol_rank_too_low',
+          expectedEdgeBps: effectiveSignal.momentumBps,
+          estimatedCostBps: scout.solPriceImpactBps,
+          safetyBufferBps: strategyConfig.momentum.edgeSafetyBufferBps,
+        });
+        log(
+          'info',
+          session.id,
+          `universe scout blocked entry: SOL rank=${scout.solRank} minRequiredTop=${WORKER_UNIVERSE_SCOUT_MIN_SOL_RANK} best=${scout.bestMint} impact=${scout.solPriceImpactBps}`,
+        );
+        return;
+      }
+    }
+
     tradePlan = {
       direction: 'enter_long_sol',
       inventory: entryInventory,
@@ -2218,6 +3695,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
   let economics: PreparedTradeEconomics | null = null;
   let tradeGate: TradeGateAssessment | null = null;
   let sizingReason: string | null = null;
+  let observedPriceImpactBps: number | null = null;
   const forceExitExecution = shouldForceExitExecution(tradePlan.direction, tradePlan.exitReason);
 
   for (let attempt = 1; attempt <= 2; attempt++) {
@@ -2286,6 +3764,16 @@ const executeTrade = async (session: RawSession): Promise<void> => {
       break;
     }
 
+    observedPriceImpactBps = parseQuotePriceImpactBps(economics.priceImpactPct);
+    if (
+      !forceExitExecution
+      && observedPriceImpactBps !== null
+      && observedPriceImpactBps > MAX_QUOTE_PRICE_IMPACT_BPS
+    ) {
+      sizingReason = 'price_impact_too_high';
+      break;
+    }
+
     tradeGate = resolveTradeGateAssessment({
       direction: tradePlan.direction,
       exitReason: tradePlan.exitReason,
@@ -2294,7 +3782,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
       economics,
       confidenceBps: lastPythSolSample?.confidenceBps ?? signalPolicy.maxPythConfidenceBps,
       driftBps: getLatestObservedDriftBps(),
-      safetyBufferBps: signalPolicy.edgeSafetyBufferBps,
+      safetyBufferBps: strategyConfig.momentum.edgeSafetyBufferBps,
       }),
     });
 
@@ -2339,7 +3827,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
       reason: sizingReason ?? 'economics_blocked',
       expectedEdgeBps: tradeGate?.expectedEdgeBps ?? effectiveSignal.momentumBps ?? null,
       estimatedCostBps: tradeGate?.estimatedCostBps ?? null,
-      safetyBufferBps: tradeGate?.safetyBufferBps ?? signalPolicy.edgeSafetyBufferBps,
+      safetyBufferBps: tradeGate?.safetyBufferBps ?? strategyConfig.momentum.edgeSafetyBufferBps,
     });
     try {
       await persistLastSizing(session, {
@@ -2436,6 +3924,36 @@ const executeTrade = async (session: RawSession): Promise<void> => {
         await apiPost(`/jupiter/swap/executions/${prepare.data.executionId}/cancel`, {
           stage: 'worker_cancel',
           reason: tradeGate.reason,
+        });
+      } catch (err) {
+        log('warn', session.id, `cancel prepared execution failed: ${String(err)}`);
+      }
+    }
+    return;
+  }
+
+  if (sizingReason === 'price_impact_too_high') {
+    await persistTradeDecision(session, 'blocked', sizingReason);
+    await persistLastTradeGate(session, {
+      at: new Date().toISOString(),
+      decision: 'blocked',
+      reason: sizingReason,
+      expectedEdgeBps: tradeGate?.expectedEdgeBps ?? effectiveSignal.momentumBps ?? null,
+      estimatedCostBps: tradeGate?.estimatedCostBps ?? null,
+      safetyBufferBps: tradeGate?.safetyBufferBps ?? strategyConfig.momentum.edgeSafetyBufferBps,
+    });
+
+    log(
+      'info',
+      session.id,
+      `trade gate blocked (${sizingReason}): quoteImpactBps=${observedPriceImpactBps} maxAllowedBps=${MAX_QUOTE_PRICE_IMPACT_BPS}`,
+    );
+
+    if (prepare?.data?.executionId) {
+      try {
+        await apiPost(`/jupiter/swap/executions/${prepare.data.executionId}/cancel`, {
+          stage: 'worker_cancel',
+          reason: sizingReason,
         });
       } catch (err) {
         log('warn', session.id, `cancel prepared execution failed: ${String(err)}`);
@@ -3286,6 +4804,8 @@ const tick = async (): Promise<number> => {
           }
           break;
         case 'ready':
+          await activateSession(session);
+          nextCadenceMs = Math.min(nextCadenceMs, getLiveSpeedProfile().cadenceMs.activeFlat);
           break;
         case 'starting':
           await activateSession(session);
@@ -3419,6 +4939,24 @@ console.log(JSON.stringify({
     maxPythAgeSeconds: signalPolicy.maxPythAgeSeconds,
     maxPythConfidenceBps: signalPolicy.maxPythConfidenceBps,
     edgeSafetyBufferBps: signalPolicy.edgeSafetyBufferBps,
+    minEntrySignalPersistenceSamples: MIN_ENTRY_SIGNAL_PERSISTENCE_SAMPLES,
+    maxQuotePriceImpactBps: MAX_QUOTE_PRICE_IMPACT_BPS,
+    tokenUniverseAutoSortEnabled: TOKEN_UNIVERSE_AUTO_SORT_ENABLED,
+    tokenUniverseAutoSortIntervalMs: TOKEN_UNIVERSE_AUTO_SORT_INTERVAL_MS,
+    tokenUniverseAutoSortTopEnabled: TOKEN_UNIVERSE_AUTO_SORT_TOP_ENABLED,
+    tokenUniverseAutoSortNotionalUsdcAtomic: TOKEN_UNIVERSE_AUTO_SORT_NOTIONAL_USDC_ATOMIC,
+    tokenUniverseAutoSortMaxPriceImpactBps: TOKEN_UNIVERSE_AUTO_SORT_MAX_PRICE_IMPACT_BPS,
+    tokenUniverseEngineMaxStaleMs: TOKEN_UNIVERSE_ENGINE_MAX_STALE_MS,
+    tokenUniverseDeadPruneEnabled: TOKEN_UNIVERSE_DEAD_PRUNE_ENABLED,
+    tokenUniverseDeadRunThreshold: TOKEN_UNIVERSE_DEAD_RUN_THRESHOLD,
+    tokenUniverseAdmissionStreak: TOKEN_UNIVERSE_ADMISSION_STREAK,
+    tokenUniverseEvictionStreak: TOKEN_UNIVERSE_EVICTION_STREAK,
+    tokenUniverseMinStayRuns: TOKEN_UNIVERSE_MIN_STAY_RUNS,
+    tokenUniverseEvictionRankBuffer: TOKEN_UNIVERSE_EVICTION_RANK_BUFFER,
+    universeScoutEnabled: WORKER_UNIVERSE_SCOUT_ENABLED,
+    universeScoutMaxCandidates: WORKER_UNIVERSE_SCOUT_MAX_CANDIDATES,
+    universeScoutMaxSolPriceImpactBps: WORKER_UNIVERSE_SCOUT_MAX_SOL_PRICE_IMPACT_BPS,
+    universeScoutMinSolRank: WORKER_UNIVERSE_SCOUT_MIN_SOL_RANK,
   },
   exits: {
     takeProfitBps: positionExitPolicy.takeProfitBps,
@@ -3444,6 +4982,7 @@ const boot = async () => {
     await refreshLiveRuntimeControl(true);
     await ensureWorkerRuntimeStateStore();
     await loadPersistedMarketTapeState();
+    await refreshTokenUniverseMints(true);
   } catch (err) {
     console.error('[worker] market tape restore failed:', String(err));
   }
