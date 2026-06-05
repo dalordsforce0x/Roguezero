@@ -4,9 +4,9 @@ import 'dotenv/config';
 const sql = process.argv.slice(2).join(' ');
 if (!sql) { console.error('usage: node dbcli.mjs "<SQL>"'); process.exit(2); }
 
-const databaseUrl = process.env.DATABASE_PRIVATE_URL || process.env.DATABASE_URL;
+const databaseUrl = process.env.DATABASE_PRIVATE_URL?.trim();
 if (!databaseUrl) {
-  throw new Error('DATABASE_PRIVATE_URL or DATABASE_URL is required');
+  throw new Error('DATABASE_PRIVATE_URL is required');
 }
 
 const url = databaseUrl.replace('sslmode=require','uselibpqcompat=true&sslmode=require');

@@ -23,6 +23,38 @@ export type SignalDecision = {
   meta: Record<string, number | string | null>;
 };
 
+export const STRATEGY_SCAN_ORDER = ['momentum', 'mean_reversion', 'supertrend'] as const;
+export type StrategyKey = (typeof STRATEGY_SCAN_ORDER)[number];
+
+export const getNextStrategyInSequence = (
+  current: StrategyKey,
+  enabledStrategies: readonly StrategyKey[],
+): StrategyKey => {
+  const enabledSet = new Set(enabledStrategies);
+  const orderedEnabled = STRATEGY_SCAN_ORDER.filter((strategy) => enabledSet.has(strategy));
+  if (orderedEnabled.length === 0) return current;
+
+  const currentIndex = orderedEnabled.indexOf(current);
+  if (currentIndex < 0) return orderedEnabled[0];
+  return orderedEnabled[(currentIndex + 1) % orderedEnabled.length];
+};
+
+export const getStrategyScanOrder = (
+  current: StrategyKey,
+  enabledStrategies: readonly StrategyKey[],
+): StrategyKey[] => {
+  const enabledSet = new Set(enabledStrategies);
+  const orderedEnabled = STRATEGY_SCAN_ORDER.filter((strategy) => enabledSet.has(strategy));
+  if (orderedEnabled.length === 0) return [current];
+
+  const start = orderedEnabled.includes(current) ? current : orderedEnabled[0];
+  const startIndex = orderedEnabled.indexOf(start);
+  return [
+    ...orderedEnabled.slice(startIndex),
+    ...orderedEnabled.slice(0, startIndex),
+  ];
+};
+
 export type PriceSample = {
   usdPrice: number;
   sampledAt: string;
@@ -323,6 +355,32 @@ export const computeSupertrendSignal = (
       candleCount: candles.length,
       flipped: flippedUp ? 'up' : flippedDown ? 'down' : null,
     },
+  };
+};
+
+export const computeAtrFromTape = (
+  tape: readonly PriceSample[],
+  config: SupertrendConfig = DEFAULT_SUPERTREND_CONFIG,
+): { atrUsd: number; atrBps: number; candleCount: number } | null => {
+  const prices = tape.map(s => s.usdPrice);
+  const minSamples = (config.atrPeriod + 2) * config.candleSamples;
+
+  if (prices.length < minSamples) {
+    return null;
+  }
+
+  const candles = buildCandles(prices, config.candleSamples);
+  const st = computeSupertrend(candles, config);
+  const currentPrice = prices[prices.length - 1];
+
+  if (!st || currentPrice <= 0) {
+    return null;
+  }
+
+  return {
+    atrUsd: st.atr,
+    atrBps: Math.max(1, Math.round((st.atr / currentPrice) * 10_000)),
+    candleCount: candles.length,
   };
 };
 

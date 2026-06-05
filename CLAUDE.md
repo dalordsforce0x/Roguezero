@@ -798,16 +798,22 @@ Still required:
 
 ## Operational limits
 
-These are hard constraints for the current project:
+These are hard constraints for the current project. The rate-limit buckets are DB-backed and shared fleet-wide across worker + API by key, so these are combined-fleet ceilings (not per-process). Defaults equal 90% of the provider cap (10% safety headroom).
 
-### Jupiter
+### Jupiter (Pro, yearly)
 - 1 account, 3 API keys, shared bucket
-- safe target: <= 8 RPS general
+- provider cap: 150 RPS general; fleet target: **135 RPS (90%)**
 - high-throughput submit path exists conceptually in the Router model, but current code submits signed transactions through Helius RPC
 
-### Helius
+### Helius (Business)
 - 1 account, 5 API keys, shared bucket
-- safe target: <= 40 RPS RPC
+- provider cap: 200 RPS RPC; fleet target: **180 RPS (90%)**
+- Sender: 50 TPS cap; fleet target: **45 TPS (90%)**
+
+### Fleet throttle
+- The worker runs a single fleet-wide Surge/Pulse/Glide auto-shift loop for all 350 bots.
+- It downshifts (toward Glide) fast on worst-lane pressure and upshifts (toward Surge) slowly on recovery; admin can pin a mode or return to auto.
+- Measured call accounting: ~1 Jupiter : ~7 Helius RPC per entry trade (Helius RPC is the binding lane), reduced to ~3 RPC/trade via ALT caching + subscription-backed balance.
 
 ## Source-of-truth files
 

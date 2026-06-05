@@ -12,9 +12,9 @@ if (!sessionId || !inputMint || !outputMint || !amount) {
 dotenv.config({ path: '.env' });
 
 const API = process.env.API_URL ?? 'http://localhost:4000';
-const databaseUrl = process.env.DATABASE_PRIVATE_URL || process.env.DATABASE_URL;
+const databaseUrl = process.env.DATABASE_PRIVATE_URL?.trim();
 if (!databaseUrl) {
-  throw new Error('DATABASE_PRIVATE_URL or DATABASE_URL is required');
+  throw new Error('DATABASE_PRIVATE_URL is required');
 }
 
 const parsed = new URL(databaseUrl);
@@ -46,9 +46,15 @@ const loadSessionKeypair = async (id) => {
 };
 
 const apiPost = async (path, body) => {
+  const internalSecret = process.env.RZ_INTERNAL_SECRET?.trim();
+  const headers = {
+    'Content-Type': 'application/json',
+    ...(internalSecret ? { 'x-rz-internal-secret': internalSecret } : {}),
+  };
+
   const response = await fetch(`${API}${path}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: JSON.stringify(body),
   });
 

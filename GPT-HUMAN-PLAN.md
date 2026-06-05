@@ -1129,6 +1129,40 @@ Every next proposed move should be written in this format:
 
 All SDLC stages through Stage 5 are complete. Stage 6 and 7 are mostly complete.
 
+## Current implementation status (2026-06-04 live reset)
+
+The previous deploy-ready claim was too broad. Live debugging showed the actual product path was not complete:
+
+- The worker was effectively momentum-only for new sessions because API session creation disabled `mean_reversion` and `supertrend` by default.
+- Multi-position storage/UI existed, and the worker was portfolio-aware, but user-created sessions still requested `maxOpenPositions: 1`, so live behavior was single-position by default.
+- The token universe scripts existed, but live `rz_token_universe` still had enabled pump/junk targets including APPLE/USELESS-style rows, so the worker could chase low-quality entries.
+- The latest live session was stopped after a route/setup SOL shortfall, so it is not valid proof of profitable token trading.
+
+Changes applied in this reset:
+
+- New sessions now enable all 3 strategies by default: `momentum`, `mean_reversion`, and `supertrend`.
+- Strategy rotation is sequential scanner rotation, not regime-recommender replacement: scan the current strategy first, if it is flat/bearish/not ready then scan the next enabled strategy, and after an entry trade submits advance the scanner to the next strategy while existing positions continue to be monitored by the strategy that opened them.
+- New sessions now default to `maxOpenPositions: 10` as the session/bot safety ceiling, so GLIDE/PULSE/SURGE can clamp behavior correctly: GLIDE = 3, PULSE = 10, SURGE = bot/session-decided.
+- Worker entry selection now excludes stablecoin targets, pump mints by default, and hard-blocked symbols such as APPLE/USELESS.
+- Worker candidate ordering now prefers trusted Solana ecosystem assets before admitted long-tail tokens.
+- Token admission/sync scripts now reject pump mints by default with `TOKEN_ADMISSION_BLOCK_PUMP_MINTS` unless explicitly overridden.
+- Live DB universe was repaired: enabled pump count is `0`, enabled APPLE/USELESS count is `0`, trusted ecosystem tokens are enabled at top priority.
+
+Current proof status:
+
+- Build proof passed for `@roguezero/session-schema`, `@roguezero/api`, `@roguezero/worker`, and `web` after the changes.
+- No active/ready sessions currently exist; all sessions are stopped. A fresh funded session is required for live proof.
+
+Next proof before any deploy claim:
+
+- Create/fund a fresh session through the frontend.
+- Confirm the start modal appears and records explicit profit handling.
+- Confirm the session starts with all 3 strategies enabled and session `maxOpenPositions: 10`, then verify the active runtime profile applies GLIDE/PULSE/SURGE caps correctly.
+- Confirm strategy scanner behavior: current strategy scans first; flat/bearish/no-entry moves to the next strategy; a submitted entry records `entryStrategy` on the position and advances `rotationState.activeStrategy` to the next strategy.
+- Confirm worker scout candidates exclude APPLE/USELESS/pump mints and prefer trusted Solana ecosystem tokens.
+- Confirm at least one real USDC→trusted-token entry, then a token→USDC exit, with positions tracked in `positionsState`.
+- Confirm profile-aware multi-position behavior: GLIDE caps at 3, PULSE caps at 10, and SURGE uses the session/bot ceiling; do not claim multi-position complete from UI/schema alone.
+
 ### What has been built and proven
 - Stage 1: Foundation — real mainnet swaps confirmed, fee capture working
 - Stage 2: Rate governance — DB-backed shared token buckets, 10 concurrent sessions proven

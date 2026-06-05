@@ -26,6 +26,7 @@ type PreparedExecutionRecord = {
   confirmation: Record<string, unknown> | null;
   signatureStatus: Record<string, unknown> | null;
   lastError: Record<string, unknown> | null;
+  metadata: Record<string, unknown>;
   preparedAt: string;
   submittedAt: string | null;
   confirmedAt: string | null;
@@ -78,6 +79,7 @@ type RawExecutionRow = {
   confirmation: Record<string, unknown> | null;
   signature_status: Record<string, unknown> | null;
   last_error: Record<string, unknown> | null;
+  metadata: Record<string, unknown> | null;
   prepared_at: Date | string;
   submitted_at: Date | string | null;
   confirmed_at: Date | string | null;
@@ -145,6 +147,7 @@ const mapRow = (row: RawExecutionRow): SwapExecution =>
     confirmation: row.confirmation,
     signatureStatus: row.signature_status,
     lastError: row.last_error,
+    metadata: row.metadata ?? undefined,
     preparedAt: toIsoString(row.prepared_at),
     submittedAt: toIsoString(row.submitted_at),
     confirmedAt: toIsoString(row.confirmed_at),
@@ -180,6 +183,7 @@ const ensureReady = async () => {
           confirmation JSONB,
           signature_status JSONB,
           last_error JSONB,
+          metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
           prepared_at TIMESTAMPTZ NOT NULL,
           submitted_at TIMESTAMPTZ,
           confirmed_at TIMESTAMPTZ,
@@ -187,6 +191,15 @@ const ensureReady = async () => {
           updated_at TIMESTAMPTZ NOT NULL
         )
       `)
+      .then(() => pool.query(`
+        ALTER TABLE swap_executions
+        ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+      `))
+      .then(() => pool.query(`
+        CREATE UNIQUE INDEX IF NOT EXISTS swap_executions_one_inflight_per_taker_idx
+        ON swap_executions (taker)
+        WHERE status IN ('prepared', 'submitted')
+      `))
       .then(() => undefined);
   }
 
@@ -194,6 +207,15 @@ const ensureReady = async () => {
 };
 
 export const executionStoreReady = () => ensureReady();
+
+const uniqueViolationCode = '23505';
+
+export const isSwapExecutionUniqueViolation = (error: unknown) => (
+  typeof error === 'object'
+  && error !== null
+  && 'code' in error
+  && (error as { code?: unknown }).code === uniqueViolationCode
+);
 
 export const createPreparedExecution = async (record: PreparedExecutionRecord) => {
   await ensureReady();
@@ -223,6 +245,7 @@ export const createPreparedExecution = async (record: PreparedExecutionRecord) =
         confirmation,
         signature_status,
         last_error,
+        metadata,
         prepared_at,
         submitted_at,
         confirmed_at,
@@ -230,8 +253,8 @@ export const createPreparedExecution = async (record: PreparedExecutionRecord) =
         updated_at
       ) VALUES (
         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-        $11, $12, $13, $14, $15, $16, $17::jsonb, $18::jsonb, $19::jsonb, $20::jsonb, $21::jsonb,
-        $22::timestamptz, $23::timestamptz, $24::timestamptz, $25::timestamptz, $26::timestamptz
+        $11, $12, $13, $14, $15, $16, $17::jsonb, $18::jsonb, $19::jsonb, $20::jsonb, $21::jsonb, $22::jsonb,
+        $23::timestamptz, $24::timestamptz, $25::timestamptz, $26::timestamptz, $27::timestamptz
       )
       RETURNING *
     `,
@@ -257,6 +280,7 @@ export const createPreparedExecution = async (record: PreparedExecutionRecord) =
       record.confirmation ? JSON.stringify(record.confirmation) : null,
       record.signatureStatus ? JSON.stringify(record.signatureStatus) : null,
       record.lastError ? JSON.stringify(record.lastError) : null,
+      JSON.stringify(record.metadata),
       record.preparedAt,
       record.submittedAt,
       record.confirmedAt,
@@ -340,6 +364,29 @@ export const getExecutionById = async (id: string) => {
   const result = await pool.query<RawExecutionRow>(
     'SELECT * FROM swap_executions WHERE id = $1',
     [id],
+  );
+
+  if (result.rowCount === 0) {
+    return null;
+  }
+
+  return mapRow(result.rows[0]);
+};
+
+export const getActiveExecutionByTaker = async (taker: string) => {
+  await ensureReady();
+  const pool = getPool();
+
+  const result = await pool.query<RawExecutionRow>(
+    `
+      SELECT *
+      FROM swap_executions
+      WHERE taker = $1
+        AND status IN ('prepared', 'submitted')
+      ORDER BY updated_at ASC
+      LIMIT 1
+    `,
+    [taker],
   );
 
   if (result.rowCount === 0) {

@@ -5,11 +5,12 @@ const keyLabelPattern = /^[A-Z0-9_]+$/;
 export const jupiterFeeTokenValues = ['SOL', 'USDC', 'USDT'] as const;
 
 const isPlaceholderValue = (value: string | undefined) => {
-  if (!value) {
+  const trimmed = value?.trim();
+  if (!trimmed) {
     return true;
   }
 
-  return placeholderPrefixes.some((prefix) => value.startsWith(prefix));
+  return placeholderPrefixes.some((prefix) => trimmed.startsWith(prefix));
 };
 
 const getConfiguredEnvValue = (value: string | undefined) => {
@@ -17,28 +18,33 @@ const getConfiguredEnvValue = (value: string | undefined) => {
   return trimmed ? trimmed : undefined;
 };
 
+const optionalConfiguredString = (schema: z.ZodString) => z.preprocess(
+  (value) => (typeof value === 'string' && value.trim() === '' ? undefined : value),
+  schema.optional(),
+);
+
 const envSchema = z.object({
   SOLANA_NETWORK: z.enum(['mainnet-beta', 'devnet']).default('mainnet-beta'),
   HELIUS_API_KEY: z.string().min(1),
   HELIUS_RPC_URL: z.string().url(),
   HELIUS_GATEKEEPER_ENABLED: z.coerce.boolean().optional(),
   JUPITER_API_KEY: z.string().min(1),
-  PYTH_API_KEY: z.string().min(1).optional(),
-  PYTH_HERMES_URL: z.string().url().optional(),
+  PYTH_API_KEY: optionalConfiguredString(z.string().min(1)),
+  PYTH_HERMES_URL: optionalConfiguredString(z.string().url()),
   JUPITER_PLATFORM_FEE_BPS: z.coerce.number().int().min(0).max(1000),
   JUPITER_FEE_ACCOUNT_SOL: z.string().min(32),
   JUPITER_FEE_ACCOUNT_USDC: z.string().min(32),
   JUPITER_FEE_ACCOUNT_USDT: z.string().min(32),
   JUPITER_SWAP_MAX_ACCOUNTS: z.coerce.number().int().min(1).max(64).optional(),
-  JUPITER_SWAP_DEXES: z.string().min(1).optional(),
-  JUPITER_SWAP_EXCLUDE_DEXES: z.string().min(1).optional(),
-  JUPITER_TRIGGER_REFERRAL_ACCOUNT: z.string().min(32).optional(),
+  JUPITER_SWAP_DEXES: optionalConfiguredString(z.string().min(1)),
+  JUPITER_SWAP_EXCLUDE_DEXES: optionalConfiguredString(z.string().min(1)),
+  JUPITER_TRIGGER_REFERRAL_ACCOUNT: optionalConfiguredString(z.string().min(32)),
   KEYAUTH_APP_NAME: z.string().min(1),
   KEYAUTH_OWNER_ID: z.string().min(1),
   KEYAUTH_APP_SECRET: z.string().min(1),
   DATABASE_PROVIDER: z.enum(['tigerdata', 'supabase']).default('tigerdata'),
-  DATABASE_URL: z.string().min(1).optional(),
-  DATABASE_PRIVATE_URL: z.string().min(1).optional(),
+  DATABASE_URL: optionalConfiguredString(z.string().min(1)),
+  DATABASE_PRIVATE_URL: optionalConfiguredString(z.string().min(1)),
   NEXT_PUBLIC_APP_NAME: z.string().min(1),
   NEXT_PUBLIC_SOLANA_NETWORK: z.enum(['mainnet-beta', 'devnet']).default('mainnet-beta'),
 });
@@ -61,8 +67,9 @@ export type RuntimeSpeedProfileName = (typeof runtimeSpeedProfileValues)[number]
 export type RuntimeSpeedProfile = {
   name: RuntimeSpeedProfileName;
   label: string;
-  maxSolEntryUsd: number;
   concurrentCapacity: number;
+  // Max open positions per bot for this fleet mode. null = dynamic / bot-decided (Surge).
+  maxOpenPositions: number | null;
   cadenceMs: {
     readyStarting: number;
     activeInPosition: number;
@@ -76,11 +83,13 @@ export type RuntimeSpeedProfile = {
 const runtimeSpeedProfileDefinitions = {
   glide: {
     label: 'Glide',
-    maxSolEntryUsd: 1_500,
     capacityDivisor: 1,
+    maxOpenPositions: 3,
     cadenceMs: {
+      // activeInPosition lifted 9_000 -> 11_000 to clear the 350-bot Jupiter fleet floor
+      // (350 bots / 135 RPS safe cap = 2.59s/call; deep-fallback Glide must stay above ~10.4s).
       readyStarting: 6_000,
-      activeInPosition: 9_000,
+      activeInPosition: 11_000,
       activeFlat: 45_000,
       activeGuarded: 60_000,
       stopping: 6_000,
@@ -89,8 +98,8 @@ const runtimeSpeedProfileDefinitions = {
   },
   pulse: {
     label: 'Pulse',
-    maxSolEntryUsd: 4_500,
-    capacityDivisor: 2,
+    capacityDivisor: 1,
+    maxOpenPositions: 10,
     cadenceMs: {
       readyStarting: 3_500,
       activeInPosition: 5_500,
@@ -102,8 +111,8 @@ const runtimeSpeedProfileDefinitions = {
   },
   surge: {
     label: 'Surge',
-    maxSolEntryUsd: 10_000,
-    capacityDivisor: 3,
+    capacityDivisor: 1,
+    maxOpenPositions: null,
     cadenceMs: {
       readyStarting: 2_000,
       activeInPosition: 3_000,
@@ -129,13 +138,14 @@ export const getRuntimeSpeedProfile = (
 ): RuntimeSpeedProfile => {
   const name = normalizeRuntimeSpeedProfileName(value);
   const definition = runtimeSpeedProfileDefinitions[name];
-  const baseConcurrentCapacity = Number(env.WORKER_BASE_CONCURRENT_CAPACITY ?? 120);
+  // Fleet-wide base capacity default aligned to the 350-bot target.
+  const baseConcurrentCapacity = Number(env.WORKER_BASE_CONCURRENT_CAPACITY ?? 350);
 
   return {
     name,
     label: definition.label,
-    maxSolEntryUsd: definition.maxSolEntryUsd,
     concurrentCapacity: Math.max(1, Math.floor(baseConcurrentCapacity / definition.capacityDivisor)),
+    maxOpenPositions: definition.maxOpenPositions,
     cadenceMs: definition.cadenceMs,
   };
 };
@@ -156,10 +166,67 @@ const collectNamedKeys = (env: NodeJS.ProcessEnv, prefix: 'HELIUS_API_KEY_' | 'J
       configured: !isPlaceholderValue(value),
     }));
 
+const collectNamedKeyValues = (env: NodeJS.ProcessEnv, prefix: 'HELIUS_API_KEY_' | 'JUPITER_API_KEY_') =>
+  Object.entries(env)
+    .filter(([key, value]) => key.startsWith(prefix) && keyLabelPattern.test(key) && !!value)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([, value]) => value!.trim())
+    .filter((value) => value.length > 0 && !isPlaceholderValue(value));
+
+const uniqueNonEmptyKeys = (keys: readonly string[]) => {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const key of keys) {
+    const trimmed = key.trim();
+    if (!trimmed || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    out.push(trimmed);
+  }
+  return out;
+};
+
+export const getJupiterApiKeys = (env: NodeJS.ProcessEnv): readonly string[] => {
+  const config = getValidatedRuntimeConfig(env);
+  return uniqueNonEmptyKeys([
+    config.JUPITER_API_KEY,
+    ...collectNamedKeyValues(env, 'JUPITER_API_KEY_'),
+  ]);
+};
+
+export const getHeliusApiKeys = (env: NodeJS.ProcessEnv): readonly string[] => {
+  const config = getValidatedRuntimeConfig(env);
+  return uniqueNonEmptyKeys([
+    config.HELIUS_API_KEY,
+    ...collectNamedKeyValues(env, 'HELIUS_API_KEY_'),
+  ]);
+};
+
+export const createRoundRobinKeySelector = (keys: readonly string[]) => {
+  const keyPool = uniqueNonEmptyKeys(keys);
+  if (keyPool.length === 0) {
+    throw new Error('createRoundRobinKeySelector requires at least one configured key');
+  }
+
+  let cursor = 0;
+  return {
+    next: () => {
+      const key = keyPool[cursor % keyPool.length];
+      cursor = (cursor + 1) % keyPool.length;
+      return key;
+    },
+    size: keyPool.length,
+    keys: keyPool as readonly string[],
+  };
+};
+
 export const getDatabaseConnectionUrl = (env: NodeJS.ProcessEnv) => {
   const privateUrl = getConfiguredEnvValue(env.DATABASE_PRIVATE_URL);
   if (privateUrl && !isPlaceholderValue(privateUrl)) {
     return privateUrl;
+  }
+
+  if (env.ALLOW_PUBLIC_DATABASE_URL_FALLBACK !== 'true') {
+    throw new Error('DATABASE_PRIVATE_URL must be configured for runtime database access');
   }
 
   const publicUrl = getConfiguredEnvValue(env.DATABASE_URL);
@@ -181,7 +248,7 @@ export const getRuntimeConfigReport = (env: NodeJS.ProcessEnv) => {
   });
   const databasePrivateConfigured = !isPlaceholderValue(env.DATABASE_PRIVATE_URL);
   const databasePublicConfigured = !isPlaceholderValue(env.DATABASE_URL);
-  if (!databasePrivateConfigured && !databasePublicConfigured) {
+  if (!databasePrivateConfigured) {
     missingLiveValues.push('DATABASE_PRIVATE_URL');
   }
   const heliusKeyPool = collectNamedKeys(env, 'HELIUS_API_KEY_');
@@ -195,6 +262,7 @@ export const getRuntimeConfigReport = (env: NodeJS.ProcessEnv) => {
       privateConfigured: databasePrivateConfigured,
       publicConfigured: databasePublicConfigured,
       activeTarget: databasePrivateConfigured ? 'private' : databasePublicConfigured ? 'public' : 'missing',
+      publicFallbackAllowed: env.ALLOW_PUBLIC_DATABASE_URL_FALLBACK === 'true',
     },
     feeAccountsPresent: {
       sol: !isPlaceholderValue(env.JUPITER_FEE_ACCOUNT_SOL),
@@ -235,13 +303,17 @@ export const getValidatedRuntimeConfig = (env: NodeJS.ProcessEnv) => {
 };
 
 export const getHeliusRpcUrl = (env: NodeJS.ProcessEnv) => {
+  return getHeliusRpcUrls(env)[0];
+};
+
+export const getHeliusRpcUrls = (env: NodeJS.ProcessEnv): readonly string[] => {
   const config = getValidatedRuntimeConfig(env);
 
   if (config.HELIUS_GATEKEEPER_ENABLED) {
-    return `https://beta.helius-rpc.com/?api-key=${config.HELIUS_API_KEY}`;
+    return getHeliusApiKeys(env).map((apiKey) => `https://beta.helius-rpc.com/?api-key=${apiKey}`);
   }
 
-  return config.HELIUS_RPC_URL;
+  return [config.HELIUS_RPC_URL];
 };
 
 export const getJupiterFeeAccounts = (env: NodeJS.ProcessEnv) => {
@@ -257,6 +329,7 @@ export const getJupiterFeeAccounts = (env: NodeJS.ProcessEnv) => {
 export const getJupiterSwapBuildConfig = (env: NodeJS.ProcessEnv) => {
   const config = getValidatedRuntimeConfig(env);
   const feeAccounts = getJupiterFeeAccounts(env);
+  const apiKeys = getJupiterApiKeys(env);
 
   if (config.JUPITER_SWAP_DEXES && config.JUPITER_SWAP_EXCLUDE_DEXES) {
     throw new Error('JUPITER_SWAP_DEXES and JUPITER_SWAP_EXCLUDE_DEXES are mutually exclusive');
@@ -265,6 +338,7 @@ export const getJupiterSwapBuildConfig = (env: NodeJS.ProcessEnv) => {
   return {
     apiBaseUrl: 'https://api.jup.ag/swap/v2',
     apiKey: config.JUPITER_API_KEY,
+    apiKeys,
     platformFeeBps: config.JUPITER_PLATFORM_FEE_BPS,
     feeAccounts,
     routeControls: {
@@ -399,26 +473,12 @@ export const computeTradeAmountLamports = (params: {
   };
 };
 
-export const computeSolEntryCapLamports = (params: {
-  profileName: string | null | undefined;
-  solUsdPrice: number | null | undefined;
-  env: NodeJS.ProcessEnv;
-}) => {
-  const solUsdPrice = params.solUsdPrice ?? 0;
-  if (!Number.isFinite(solUsdPrice) || solUsdPrice <= 0) {
-    return null;
-  }
-
-  const profile = getRuntimeSpeedProfile(params.profileName, params.env);
-  return Math.max(1, Math.floor((profile.maxSolEntryUsd / solUsdPrice) * 1_000_000_000));
-};
-
 // ── Stage 4 price feeds ──────────────────────────────────────────────────────
 // Two independent providers on independent rate buckets:
 //   • Pyth Hermes (no auth, no shared bucket) → primary signal + TP/SL/trailing
 //   • Jupiter /price/v3 (already on Jupiter general bucket) → slow drift check
-// Jupiter execution bucket (≤8 RPS) is NOT touched by price polling beyond
-// one batched /price/v3 call per minute.
+// Jupiter execution bucket (135 RPS fleet cap, 90% of 150) is NOT touched by
+// price polling beyond one batched /price/v3 call per minute.
 
 export const SOL_MINT = 'So11111111111111111111111111111111111111112';
 export const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
@@ -431,14 +491,17 @@ const PYTH_SOL_USD_FEED_ID =
 export type JupiterPriceConfig = {
   apiBaseUrl: string;
   apiKey: string;
+  apiKeys: readonly string[];
   defaultMints: readonly string[];
 };
 
 export const getJupiterPriceConfig = (env: NodeJS.ProcessEnv): JupiterPriceConfig => {
   const config = getValidatedRuntimeConfig(env);
+  const apiKeys = getJupiterApiKeys(env);
   return {
     apiBaseUrl: 'https://api.jup.ag/price/v3',
     apiKey: config.JUPITER_API_KEY,
+    apiKeys,
     defaultMints: [SOL_MINT, USDC_MINT],
   };
 };
@@ -488,14 +551,20 @@ export type WorkerPositionExitPolicy = {
   takeProfitBps: number;
   stopLossBps: number;
   trailingStopBps: number;
+  atrTakeProfitMultiplier: number;
+  atrStopLossMultiplier: number;
+  atrTrailingStopMultiplier: number;
+  exitCostFloorBps: number;
+  takeProfitTimeDecayStartMs: number;
+  takeProfitTimeDecayFullMs: number;
 };
 
 export const getWorkerSignalPolicy = (env: NodeJS.ProcessEnv): WorkerSignalPolicy => {
-  const momentumLookbackSamples = Number(env.WORKER_SIGNAL_MOMENTUM_LOOKBACK_SAMPLES ?? 5);
-  const momentumThresholdBps = Number(env.WORKER_SIGNAL_MOMENTUM_THRESHOLD_BPS ?? 8);
+  const momentumLookbackSamples = Number(env.WORKER_SIGNAL_MOMENTUM_LOOKBACK_SAMPLES ?? 2);
+  const momentumThresholdBps = Number(env.WORKER_SIGNAL_MOMENTUM_THRESHOLD_BPS ?? 2);
   const maxPythAgeSeconds = Number(env.WORKER_SIGNAL_MAX_PYTH_AGE_SECONDS ?? 10);
   const maxPythConfidenceBps = Number(env.WORKER_SIGNAL_MAX_PYTH_CONFIDENCE_BPS ?? 15);
-  const edgeSafetyBufferBps = Number(env.WORKER_SIGNAL_EDGE_SAFETY_BUFFER_BPS ?? 5);
+  const edgeSafetyBufferBps = Number(env.WORKER_SIGNAL_EDGE_SAFETY_BUFFER_BPS ?? 1);
   return {
     momentumLookbackSamples,
     momentumThresholdBps,
@@ -509,10 +578,26 @@ export const getWorkerPositionExitPolicy = (env: NodeJS.ProcessEnv): WorkerPosit
   const takeProfitBps = Number(env.WORKER_TAKE_PROFIT_BPS ?? 30);
   const stopLossBps = Number(env.WORKER_STOP_LOSS_BPS ?? 20);
   const trailingStopBps = Number(env.WORKER_TRAILING_STOP_BPS ?? 15);
+  const atrTakeProfitMultiplier = Number(env.WORKER_ATR_TP_MULT ?? 1.8);
+  const atrStopLossMultiplier = Number(env.WORKER_ATR_SL_MULT ?? 1.0);
+  const atrTrailingStopMultiplier = Number(env.WORKER_ATR_TRAIL_MULT ?? 0.8);
+  const exitCostFloorBps = Number(env.WORKER_EXIT_COST_FLOOR_BPS ?? 60);
+  // Time-decay take-profit ladder: a young position requires its full ATR/static
+  // take-profit target; once it ages past the start window the required target
+  // decays linearly toward the cost floor (breakeven + fees) by the full window,
+  // freeing capital from stale positions without ever selling below cost.
+  const takeProfitTimeDecayStartMs = Number(env.WORKER_TP_DECAY_START_MS ?? 90_000);
+  const takeProfitTimeDecayFullMs = Number(env.WORKER_TP_DECAY_FULL_MS ?? 900_000);
 
   return {
     takeProfitBps,
     stopLossBps,
     trailingStopBps,
+    atrTakeProfitMultiplier,
+    atrStopLossMultiplier,
+    atrTrailingStopMultiplier,
+    exitCostFloorBps,
+    takeProfitTimeDecayStartMs,
+    takeProfitTimeDecayFullMs,
   };
 };

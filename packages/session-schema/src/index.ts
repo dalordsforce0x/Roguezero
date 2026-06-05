@@ -1,6 +1,6 @@
 import { z } from 'zod';
 
-export const schemaVersion = '2026-05-30.1';
+export const schemaVersion = '2026-06-01.1';
 
 export const sessionNetworkValues = ['mainnet-beta', 'devnet'] as const;
 export const sessionStatusValues = [
@@ -23,6 +23,12 @@ export const sessionStopReasonValues = [
   'runtime_error',
   'depleted',
   'repeated_simulation_failures',
+  'funding_timeout',
+  'stale_no_trade_attempts',
+  'duration_exceeded',
+  'stopped_residual_unrecoverable',
+  'operator_cancel_unrequested_zero_funding',
+  'worker_stop',
 ] as const;
 export const strategyKeyValues = ['momentum', 'mean_reversion', 'supertrend'] as const;
 export const executionStatusValues = ['prepared', 'submitted', 'confirmed', 'failed'] as const;
@@ -35,11 +41,15 @@ export const sessionStopReasonSchema = z.enum(sessionStopReasonValues);
 export const strategyKeySchema = z.enum(strategyKeyValues);
 export const executionStatusSchema = z.enum(executionStatusValues);
 export const executionConfirmationStatusSchema = z.enum(executionConfirmationStatusValues);
+export const sessionPositionStatusValues = ['flat', 'long', 'long_sol'] as const;
+export const sessionPositionExitReasonValues = ['take_profit', 'stop_loss', 'trailing_stop', 'signal_reversal'] as const;
+export const sessionPositionStatusSchema = z.enum(sessionPositionStatusValues);
+export const sessionPositionExitReasonSchema = z.enum(sessionPositionExitReasonValues);
 
 const publicKeySchema = z
   .string()
   .regex(/^[1-9A-HJ-NP-Za-km-z]{32,44}$/, 'Expected a Solana public key');
-const isoDatetimeSchema = z.string().datetime();
+const isoDatetimeSchema = z.string().datetime({ offset: true });
 const atomicAmountSchema = z.string().regex(/^\d+$/, 'Expected an unsigned integer string');
 const solMintSchema = z.literal('So11111111111111111111111111111111111111112');
 
@@ -55,6 +65,7 @@ export const sessionRiskLimitsSchema = z.object({
 export const sessionFundingSchema = z.object({
   fundingMint: publicKeySchema,
   fundingTokenSymbol: z.enum(['SOL', 'USDC', 'USDT']),
+  requestedFundingLamports: atomicAmountSchema.default('0'),
   startingBalanceAtomic: atomicAmountSchema,
   currentBalanceAtomic: atomicAmountSchema,
   realizedPnlUsd: z.number(),
@@ -68,10 +79,12 @@ export const managedStrategySchema = z.object({
   enabled: z.boolean(),
 });
 
+export const DEFAULT_ROTATION_INTERVAL_MINUTES = 15;
+
 export const sessionRotationStateSchema = z.object({
   activeStrategy: strategyKeySchema,
   queuedStrategy: strategyKeySchema,
-  rotationIntervalMinutes: z.number().int().positive().default(60),
+  rotationIntervalMinutes: z.number().int().positive().default(DEFAULT_ROTATION_INTERVAL_MINUTES),
   lastRotatedAt: isoDatetimeSchema.nullable(),
   lockedUntil: isoDatetimeSchema.nullable(),
 });
@@ -85,15 +98,28 @@ export const sessionSchedulingStateSchema = z.object({
   lastBlockedAt: isoDatetimeSchema.nullable().default(null),
   lastBlockedReason: z.string().nullable().default(null),
   blockedReasonCounts: z.record(z.string(), z.number().int().nonnegative()).default({}),
+  lastProfitTransferAt: isoDatetimeSchema.nullable().default(null),
+  transferredProfitUsd: z.number().nonnegative().default(0),
+  pendingProfitPayout: z.object({
+    executionId: z.string().uuid(),
+    submittedAt: isoDatetimeSchema,
+    preRealizedPnlUsd: z.number(),
+    exitReason: sessionPositionExitReasonSchema,
+    attempts: z.number().int().nonnegative().default(0),
+  }).nullable().default(null),
+  // Post-stop-loss cooldown locks keyed by correlation-cluster id -> expiry ISO.
+  // After a stop_loss exit the cluster is excluded from new entries until expiry
+  // so the bot does not immediately re-buy what it just stopped out of.
+  recentStopLossLocks: z.record(z.string(), isoDatetimeSchema).default({}),
 });
 
 // Stage 3 adaptive sizing — last decision snapshot for admin visibility.
 // Lamport amounts are strings to match the funding.*Atomic convention.
 export const sessionLastSizingTradeContextSchema = z.object({
   inputMint: publicKeySchema,
-  inputSymbol: z.enum(['SOL', 'USDC', 'USDT']),
+  inputSymbol: z.string().min(1).max(32),
   outputMint: publicKeySchema,
-  outputSymbol: z.enum(['SOL', 'USDC', 'USDT']),
+  outputSymbol: z.string().min(1).max(32),
   balanceAtomic: atomicAmountSchema,
   reserveAtomic: atomicAmountSchema,
   tradableAtomic: atomicAmountSchema,
@@ -132,6 +158,10 @@ export const sessionLastSignalSchema = z.object({
   at: isoDatetimeSchema,
   source: z.enum(['pyth-hermes']),
   signal: z.literal('momentum'),
+  // The strategy that actually produced this signal. `signal` stays the legacy
+  // literal for backward compatibility; `strategy` is the real identity so UIs
+  // stop showing every strategy as "momentum". Optional for older persisted rows.
+  strategy: strategyKeySchema.optional(),
   status: z.enum(['warming_up', 'ready', 'guarded_off']),
   regime: z.enum(['bullish', 'bearish', 'flat']).nullable(),
   lookbackSamples: z.number().int().positive(),
@@ -147,24 +177,127 @@ export const sessionLastTradeGateSchema = z.object({
   expectedEdgeBps: z.number().nullable(),
   estimatedCostBps: z.number().nullable(),
   safetyBufferBps: z.number().nullable(),
+  scout: z.object({
+    candidateCount: z.number().int().nonnegative(),
+    routeFoundCount: z.number().int().nonnegative(),
+    bullishRouteCount: z.number().int().nonnegative(),
+    persistentBullishRouteCount: z.number().int().nonnegative(),
+    bestMint: publicKeySchema.nullable(),
+    bestSymbol: z.string().min(1).max(32).nullable(),
+    bestMomentumBps: z.number().int().nullable(),
+    bestPriceImpactBps: z.number().nullable(),
+  }).optional(),
+});
+
+export const sessionRiskStateSchema = z.object({
+  dayKey: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  dailyRealizedPnlUsd: z.number().default(0),
+  consecutiveLosses: z.number().int().nonnegative().default(0),
+  badFillStreak: z.number().int().nonnegative().default(0),
+  lastLossAt: isoDatetimeSchema.nullable().default(null),
+  lastBadFillAt: isoDatetimeSchema.nullable().default(null),
+});
+
+export const sessionLastExecutionAuditSchema = z.object({
+  at: isoDatetimeSchema,
+  executionId: z.string().uuid(),
+  direction: z.enum(['enter_long', 'exit_long', 'other']),
+  inputMint: publicKeySchema,
+  outputMint: publicKeySchema,
+  inputAmountAtomic: atomicAmountSchema,
+  expectedOutputAtomic: atomicAmountSchema.nullable(),
+  actualOutputAtomic: atomicAmountSchema.nullable(),
+  outputDeltaBps: z.number().int().nullable(),
+  priceImpactBps: z.number().nullable(),
+  badFill: z.boolean(),
+});
+
+export const sessionHealthStateSchema = z.object({
+  state: z.enum([
+    'active_trading',
+    'waiting_market',
+    'blocked',
+    'exit_blocked',
+    'gas_danger',
+    'recovery_required',
+    'stopping',
+    'stopped',
+    'error',
+  ]),
+  severity: z.enum(['info', 'warn', 'error']),
+  reason: z.string().nullable().default(null),
+  detail: z.string().nullable().default(null),
+  updatedAt: isoDatetimeSchema,
+  blockerCount: z.number().int().nonnegative().default(0),
 });
 
 export const sessionPositionStateSchema = z.object({
-  status: z.enum(['flat', 'long_sol']),
+  status: sessionPositionStatusSchema,
+  positionMint: publicKeySchema.nullable().default(null),
+  positionSymbol: z.string().min(1).max(32).nullable().default(null),
+  entryStrategy: strategyKeySchema.nullable().default(null),
   entryPriceUsd: z.number().positive().nullable().default(null),
   entryAt: isoDatetimeSchema.nullable().default(null),
   quantityAtomic: atomicAmountSchema.nullable().default(null),
+  tokenDecimals: z.number().int().min(0).max(18).nullable().default(null),
   highWaterPriceUsd: z.number().positive().nullable().default(null),
   lastMarkedPriceUsd: z.number().positive().nullable().default(null),
   lastMarkedAt: isoDatetimeSchema.nullable().default(null),
-  pendingExitReason: z.enum(['take_profit', 'stop_loss', 'trailing_stop', 'signal_reversal']).nullable().default(null),
-  exitReason: z.enum(['take_profit', 'stop_loss', 'trailing_stop', 'signal_reversal']).nullable().default(null),
+  lastComputedAtrUsd: z.number().positive().nullable().default(null),
+  lastComputedAtrBps: z.number().int().positive().nullable().default(null),
+  atrComputedAt: isoDatetimeSchema.nullable().default(null),
+  pendingExitReason: sessionPositionExitReasonSchema.nullable().default(null),
+  exitReason: sessionPositionExitReasonSchema.nullable().default(null),
+});
+
+export const sessionPositionsStateSchema = z.object({
+  activePositionMint: publicKeySchema.nullable().default(null),
+  positions: z.record(publicKeySchema, sessionPositionStateSchema).default({}),
+});
+
+export const momentumStrategyConfigSchema = z.object({
+  lookbackSamples: z.number().int().min(1).max(120),
+  thresholdBps: z.number().int().min(1).max(500),
+  edgeSafetyBufferBps: z.number().int().min(0).max(500),
+});
+
+export const meanReversionStrategyConfigSchema = z.object({
+  length: z.number().int().min(2).max(200),
+  stdMultiplier: z.number().positive().max(10),
+  minBandWidthFraction: z.number().positive().max(1),
+  entryThreshold: z.number().min(-5).max(5),
+  exitThreshold: z.number().min(-5).max(5),
+});
+
+export const supertrendStrategyConfigSchema = z.object({
+  candleSamples: z.number().int().min(2).max(120),
+  atrPeriod: z.number().int().min(2).max(200),
+  multiplier: z.number().positive().max(20),
+});
+
+export const sessionStrategyConfigSchema = z.object({
+  autoRotationEnabled: z.boolean().default(true),
+  momentum: momentumStrategyConfigSchema,
+  meanReversion: meanReversionStrategyConfigSchema,
+  supertrend: supertrendStrategyConfigSchema,
 });
 
 export const sessionUserControlSchema = z.object({
-  targetDurationMinutes: z.number().int().positive().max(1440),
+  targetDurationMinutes: z.number().int().nonnegative().max(1440),
   autoRestart: z.boolean().default(false),
   stopLossBehavior: z.enum(['pause', 'stop']),
+  profitHandling: z.object({
+    mode: z.enum(['send_to_owner', 'compound']).default('send_to_owner'),
+    payoutToken: z.enum(['SOL', 'USDC']).default('USDC'),
+  }).default({
+    mode: 'send_to_owner',
+    payoutToken: 'USDC',
+  }),
+  // How to handle still-open positions when the user stops the session. The session
+  // wallet is destroyed after stop, so funds must come home one of two ways:
+  //  - 'return_tokens': leave positions open and sweep the raw SPL tokens to the owner wallet (default)
+  //  - 'liquidate': prematurely close (sell) open positions to SOL first, then sweep the proceeds home
+  stopDisposition: z.enum(['return_tokens', 'liquidate']).default('return_tokens'),
 });
 
 export const sessionServiceControlSchema = z.object({
@@ -178,28 +311,61 @@ export const sessionServiceControlSchema = z.object({
   ]),
   rotationState: sessionRotationStateSchema,
   schedulingState: sessionSchedulingStateSchema.optional(),
+  strategyConfig: sessionStrategyConfigSchema.optional(),
   lastSizing: sessionLastSizingSchema.optional(),
   lastSignal: sessionLastSignalSchema.optional(),
   lastTradeGate: sessionLastTradeGateSchema.optional(),
+  riskState: sessionRiskStateSchema.optional(),
+  lastExecutionAudit: sessionLastExecutionAuditSchema.optional(),
+  healthState: sessionHealthStateSchema.optional(),
+  positionsState: sessionPositionsStateSchema.optional(),
   positionState: sessionPositionStateSchema.optional(),
+  // Set when a session finalizes to `stopped` but the session wallet could not be
+  // fully swept because it has insufficient SOL to pay even one transaction fee
+  // (fee-payer bricked). Records the trapped token accounts so the owner/admin can
+  // run a fee-sponsored recovery instead of the worker looping forever in `stopping`.
+  residualRecovery: z.object({
+    state: z.literal('unrecoverable_zero_gas'),
+    sessionWallet: z.string(),
+    ownerWallet: z.string(),
+    solBalance: z.number().int().min(0),
+    residualTokenAccounts: z.array(z.string()),
+    detectedAt: z.string(),
+    note: z.string(),
+  }).optional(),
 });
 
 export type SessionServiceControl = z.infer<typeof sessionServiceControlSchema>;
-export type SessionServiceControlPatch = Partial<Omit<SessionServiceControl, 'positionState' | 'schedulingState'>> & {
+export type SessionPositionsState = z.infer<typeof sessionPositionsStateSchema>;
+export type SessionPositionState = z.infer<typeof sessionPositionStateSchema>;
+export type SessionServiceControlPatch = Partial<Omit<SessionServiceControl, 'positionState' | 'positionsState' | 'schedulingState'>> & {
+  positionsState?: SessionPositionsState;
   positionState?: Partial<NonNullable<SessionServiceControl['positionState']>>;
   schedulingState?: Partial<NonNullable<SessionServiceControl['schedulingState']>>;
 };
 
 const defaultSessionPositionState: NonNullable<SessionServiceControl['positionState']> = {
   status: 'flat',
+  positionMint: null,
+  positionSymbol: null,
+  entryStrategy: null,
   entryPriceUsd: null,
   entryAt: null,
   quantityAtomic: null,
+  tokenDecimals: null,
   highWaterPriceUsd: null,
   lastMarkedPriceUsd: null,
   lastMarkedAt: null,
+  lastComputedAtrUsd: null,
+  lastComputedAtrBps: null,
+  atrComputedAt: null,
   pendingExitReason: null,
   exitReason: null,
+};
+
+const defaultSessionPositionsState: SessionPositionsState = {
+  activePositionMint: null,
+  positions: {},
 };
 
 const defaultSessionSchedulingState: NonNullable<SessionServiceControl['schedulingState']> = {
@@ -211,14 +377,68 @@ const defaultSessionSchedulingState: NonNullable<SessionServiceControl['scheduli
   lastBlockedAt: null,
   lastBlockedReason: null,
   blockedReasonCounts: {},
+  lastProfitTransferAt: null,
+  transferredProfitUsd: 0,
+  pendingProfitPayout: null,
+  recentStopLossLocks: {},
 };
 
 const defaultSessionRotationState: NonNullable<SessionServiceControl['rotationState']> = {
   activeStrategy: 'momentum',
   queuedStrategy: 'momentum',
-  rotationIntervalMinutes: 60,
+  rotationIntervalMinutes: DEFAULT_ROTATION_INTERVAL_MINUTES,
   lastRotatedAt: null,
   lockedUntil: null,
+};
+
+export const buildFlatSessionPositionState = (
+  fallback: Partial<SessionPositionState> = {},
+): SessionPositionState => ({
+  ...defaultSessionPositionState,
+  ...fallback,
+  status: 'flat',
+  positionMint: null,
+  positionSymbol: null,
+  entryPriceUsd: null,
+  entryAt: null,
+  quantityAtomic: null,
+  highWaterPriceUsd: null,
+  pendingExitReason: fallback.pendingExitReason ?? null,
+  exitReason: fallback.exitReason ?? null,
+});
+
+export const getPrimaryOpenSessionPosition = (
+  positionsState: SessionPositionsState | null | undefined,
+): SessionPositionState | null => {
+  if (!positionsState) {
+    return null;
+  }
+
+  const preferredMint = positionsState.activePositionMint;
+  if (preferredMint) {
+    const preferred = positionsState.positions[preferredMint];
+    if (preferred && preferred.status !== 'flat') {
+      return preferred;
+    }
+  }
+
+  for (const position of Object.values(positionsState.positions)) {
+    if (position.status !== 'flat') {
+      return position;
+    }
+  }
+
+  return null;
+};
+
+export const summarizePositionsState = (
+  positionsState: SessionPositionsState | null | undefined,
+  fallback: Partial<SessionPositionState> = {},
+): SessionPositionState => {
+  const primary = getPrimaryOpenSessionPosition(positionsState);
+  return primary
+    ? { ...primary }
+    : buildFlatSessionPositionState(fallback);
 };
 
 export const mergeSessionServiceControl = (
@@ -232,6 +452,12 @@ export const mergeSessionServiceControl = (
     : {
         ...(base.rotationState ?? defaultSessionRotationState),
         ...patch.rotationState,
+      },
+  positionsState: patch.positionsState === undefined
+    ? base.positionsState
+    : {
+        ...defaultSessionPositionsState,
+        ...patch.positionsState,
       },
   positionState: patch.positionState === undefined
     ? base.positionState
@@ -277,16 +503,23 @@ export const createSessionRequestSchema = z.object({
   fundingMint: solMintSchema,
   fundingTokenSymbol: z.literal('SOL'),
   startingBalanceAtomic: atomicAmountSchema.default('0'),
-  targetDurationMinutes: z.number().int().positive().max(1440).default(60),
+  targetDurationMinutes: z.number().int().nonnegative().max(1440).default(0),
   riskLimits: sessionRiskLimitsSchema.default({
     maxSessionLossUsd: 50,
     maxDailyLossUsd: 100,
-    maxPositionSizeUsd: 20,
-    maxOpenPositions: 1,
+    maxPositionSizeUsd: 1000,
+    maxOpenPositions: 10,
     maxSlippageBps: 50,
     cooldownMs: 30000,
   }),
   stopLossBehavior: z.enum(['pause', 'stop']).default('stop'),
+  profitHandling: z.object({
+    mode: z.enum(['send_to_owner', 'compound']).default('send_to_owner'),
+    payoutToken: z.enum(['SOL', 'USDC']).default('USDC'),
+  }).default({
+    mode: 'send_to_owner',
+    payoutToken: 'USDC',
+  }),
 });
 
 export const sessionActionRequestSchema = z.object({
@@ -343,6 +576,17 @@ export const swapExecutionSchema = z.object({
   confirmation: z.record(z.unknown()).nullable(),
   signatureStatus: z.record(z.unknown()).nullable(),
   lastError: z.record(z.unknown()).nullable(),
+  metadata: z.object({
+    scannerStrategy: strategyKeySchema.nullable().default(null),
+    entryStrategy: strategyKeySchema.nullable().default(null),
+    exitStrategy: strategyKeySchema.nullable().default(null),
+    exitReason: sessionPositionExitReasonSchema.nullable().default(null),
+  }).default({
+    scannerStrategy: null,
+    entryStrategy: null,
+    exitStrategy: null,
+    exitReason: null,
+  }),
   preparedAt: isoDatetimeSchema,
   submittedAt: isoDatetimeSchema.nullable(),
   confirmedAt: isoDatetimeSchema.nullable(),

@@ -1,0 +1,167 @@
+{
+  "createdAt": "2026-06-03",
+  "purpose": "Source-of-truth baseline for planned provider upgrades: Jupiter Pro (yearly) and Helius Business, plus RogueZero capacity implications.",
+  "sources": {
+    "jupiterProYearly": {
+      "sourceType": "user-provided screenshot",
+      "capturedAt": "2026-06-03",
+      "notes": "Portal pricing card shown in chat attachment."
+    },
+    "heliusBusiness": {
+      "sourceType": "helius pricing page",
+      "url": "https://www.helius.dev/pricing",
+      "capturedAt": "2026-06-03"
+    },
+    "roguezeroRuntime": {
+      "sourceFiles": [
+        "WORKFLOW.md",
+        "packages/runtime-config/src/index.ts",
+        "services/worker/src/index.ts",
+        "services/api/src/index.ts"
+      ]
+    }
+  },
+  "plannedUpgrades": {
+    "jupiter": {
+      "plan": "Pro",
+      "billing": "yearly",
+      "priceUsdPerYear": 5000,
+      "includedCreditsPerYear": 6000000000,
+      "additionalUsageUsdPerMillionCredits": 1,
+      "generalRequestsPerSecond": 150,
+      "support": "Priority support",
+      "extras": [
+        "Early access to new features"
+      ]
+    },
+    "helius": {
+      "plan": "Business",
+      "billing": "monthly",
+      "priceUsdPerMonth": 499,
+      "includedCreditsPerMonth": 100000000,
+      "rpcRequestsPerSecond": 200,
+      "sendTransactionPerSecond": 50,
+      "sendBundlePerSecond": 5,
+      "dasRequestsPerSecond": 50,
+      "stakedConnections": true,
+      "enhancedWebSockets": true,
+      "laserStreamGrpc": true,
+      "support": "Priority chat support"
+    }
+  },
+  "roguezeroCurrentDefaults": {
+    "sharedBucketAssumptions": {
+      "jupiterAccountApiKeysShareOneBucket": true,
+      "heliusAccountApiKeysShareOneBucket": true
+    },
+    "runtimeLimiterDefaults": {
+      "jupiterGeneralRps": 135,
+      "heliusRpcRps": 180,
+      "heliusSenderTps": 45,
+      "notes": "Code defaults now equal the real 90%-of-cap fleet ceilings (Jupiter 150->135, Helius RPC 200->180, Helius Sender 50->45). Buckets are DB-backed and shared fleet-wide across worker + API by key."
+    },
+    "runtimeSpeedProfiles": {
+      "workerBaseConcurrentCapacityDefault": 350,
+      "capacityModel": "concurrentCapacity = floor(base / capacityDivisor); glide /4, pulse /2, surge /1",
+      "glide": {
+        "capacityDivisor": 4,
+        "concurrentCapacity": 87,
+        "maxOpenPositions": 3,
+        "readyStartingCadenceMs": 6000,
+        "activeInPositionCadenceMs": 11000,
+        "activeFlatCadenceMs": 45000
+      },
+      "pulse": {
+        "capacityDivisor": 2,
+        "concurrentCapacity": 175,
+        "maxOpenPositions": 10,
+        "readyStartingCadenceMs": 3500,
+        "activeInPositionCadenceMs": 5500,
+        "activeFlatCadenceMs": 30000
+      },
+      "surge": {
+        "capacityDivisor": 1,
+        "concurrentCapacity": 350,
+        "maxOpenPositions": null,
+        "readyStartingCadenceMs": 2000,
+        "activeInPositionCadenceMs": 3000,
+        "activeFlatCadenceMs": 15000
+      }
+    }
+  },
+  "capacityImpact": {
+    "truth": [
+      "Code defaults now consume the real provider headroom: Jupiter 135 RPS and Helius 180 RPS (90% of plan caps), shared fleet-wide.",
+      "The worker auto-shift loop (Surge/Pulse/Glide) keeps combined fleet load under 90% of every lane by watching worst-lane pressure and shifting cadence/capacity.",
+      "Measured per-trade call accounting shows Helius RPC is the binding lane, not Jupiter (see callAccounting)."
+    ],
+    "safeTargetsUsing90PercentCapRule": {
+      "rule": "Fleet operates at 90% of documented provider ceiling (10% safety headroom).",
+      "jupiterGeneralRpsSafeTarget": 135,
+      "heliusRpcRpsSafeTarget": 180,
+      "heliusDasRpsSafeTarget": 45,
+      "heliusSendTransactionPerSecondSafeTarget": 45
+    },
+    "callAccounting": {
+      "measuredFrom": "traced from services/worker + services/api code",
+      "perEntryTradeBeforeOptimization": {
+        "jupiter": 1,
+        "heliusRpc": 7,
+        "ratio": "7:1 (helius:jupiter)",
+        "detail": "1 build : 2 ALT loads + 1 simulate + 1 priority-fee + 1 blockheight + 2 balance"
+      },
+      "perEntryTradeAfterOptimization": {
+        "jupiter": 1,
+        "heliusRpc": 3,
+        "levers": "ALT caching (-2 RPC), subscription-backed balance (-2 RPC)"
+      },
+      "fleetCeilingEntryTradesPerSec": {
+        "beforeOptimization": 25,
+        "afterOptimization": 60,
+        "bindingLane": "helius-rpc"
+      }
+    },
+    "upgradeOnlyWithoutEnvChanges": {
+      "effectiveJupiterGeneralRps": 135,
+      "effectiveHeliusRpcRps": 180,
+      "netCapacityChange": "code defaults now equal the 90% fleet caps; no env override required"
+    },
+    "upgradeWithEnvAlignment": {
+      "suggestedJupiterGeneralRps": 135,
+      "suggestedHeliusRpcRps": 180,
+      "configuredJupiterGeneralRps": 135,
+      "configuredJupiterGeneralBurst": 20,
+      "configuredHeliusRpcRps": 180,
+      "configuredHeliusRpcBurst": 20,
+      "configuredWorkerBaseConcurrentCapacity": 350,
+      "configuredWorkerSpeedProfile": "auto (worker-managed Surge/Pulse/Glide)",
+      "note": "These numbers reflect the real 90%-of-cap fleet ceilings and match the code defaults."
+    },
+    "sessionCeilingModel": {
+      "assumption": "Measured (not assumed): one entry trade costs ~1 Jupiter request and ~7 Helius RPC requests before optimization (~3 after ALT caching + subscription balance). Helius RPC, not Jupiter, is the binding lane. See capacityImpact.callAccounting.",
+      "jupiterSafeTargetEquivalentSessions": {
+        "glide": {
+          "readyStarting": 720,
+          "activeInPosition": 1080,
+          "activeFlat": 5400
+        },
+        "pulse": {
+          "readyStarting": 420,
+          "activeInPosition": 660,
+          "activeFlat": 3600
+        },
+        "surge": {
+          "readyStarting": 240,
+          "activeInPosition": 360,
+          "activeFlat": 1800
+        }
+      },
+      "practicalRead": "Provider-based ceilings sit above RogueZero's per-mode concurrency caps (glide 87, pulse 175, surge 350). The worker auto-shift loop keeps the fleet under 90% of the binding lane (Helius RPC) by stepping the mode down under pressure and back up on recovery."
+    }
+  },
+  "bottomLine": {
+    "jupiterProYearlyGivesYou": "150 general RPS and 6B included credits/year.",
+    "heliusBusinessGivesYou": "200 RPC RPS, 50 sendTransaction/sec, 5 sendBundle/sec, 50 DAS RPS, and 100M credits/month.",
+    "forRogueZeroRightNow": "Code defaults equal the real 90% fleet caps: Jupiter 135 RPS, Helius 180 RPS, Helius Sender 45 TPS, 350 base concurrent capacity. The worker auto-manages Surge/Pulse/Glide; admin can pin a mode or return to auto."
+  }
+}

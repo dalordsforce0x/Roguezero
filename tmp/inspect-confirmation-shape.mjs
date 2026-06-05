@@ -1,0 +1,10 @@
+﻿import "dotenv/config";
+import pg from "pg";
+const u = new URL(process.env.DATABASE_PRIVATE_URL.trim());
+u.searchParams.delete("sslmode");
+const pool = new pg.Pool({ connectionString: u.toString(), ssl: { rejectUnauthorized: false } });
+const sidWallet = "DFcBDWuR4jr8Z4LMH2j2UWs5axKpC3ja7WL4TrQMJxJb";
+const r = await pool.query(`select input_mint, output_mint, amount, signature, confirmation, build_response, metadata, created_at from swap_executions where taker=$1 and status='confirmed' order by created_at desc limit 1`, [sidWallet]);
+const x = r.rows[0];
+console.log(JSON.stringify({keys:Object.keys(x.confirmation||{}), confirmation:x.confirmation, buildKeys:Object.keys(x.build_response||{}), build:x.build_response}, null, 2).slice(0,12000));
+await pool.end();

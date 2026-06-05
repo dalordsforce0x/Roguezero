@@ -4,8 +4,9 @@ export type RuntimeSpeedProfileName = (typeof runtimeSpeedProfileValues)[number]
 export type RuntimeSpeedProfile = {
   name: RuntimeSpeedProfileName;
   label: string;
-  maxSolEntryUsd: number;
   concurrentCapacity: number;
+  // Max open positions per bot for this fleet mode. null = dynamic / bot-decided (Surge).
+  maxOpenPositions: number | null;
   cadenceMs: {
     readyStarting: number;
     activeInPosition: number;
@@ -16,16 +17,17 @@ export type RuntimeSpeedProfile = {
   };
 };
 
-const baseConcurrentCapacity = Number(process.env.WORKER_BASE_CONCURRENT_CAPACITY ?? 120);
+// Fleet-wide base capacity default aligned to the 350-bot target.
+const baseConcurrentCapacity = Number(process.env.WORKER_BASE_CONCURRENT_CAPACITY ?? 350);
 
 const profileDefinitions = {
   glide: {
     label: 'Glide',
-    maxSolEntryUsd: 1500,
     capacityDivisor: 1,
+    maxOpenPositions: 3,
     cadenceMs: {
       readyStarting: 6000,
-      activeInPosition: 9000,
+      activeInPosition: 11000,
       activeFlat: 45000,
       activeGuarded: 60000,
       stopping: 6000,
@@ -34,8 +36,8 @@ const profileDefinitions = {
   },
   pulse: {
     label: 'Pulse',
-    maxSolEntryUsd: 4500,
-    capacityDivisor: 2,
+    capacityDivisor: 1,
+    maxOpenPositions: 10,
     cadenceMs: {
       readyStarting: 3500,
       activeInPosition: 5500,
@@ -47,8 +49,8 @@ const profileDefinitions = {
   },
   surge: {
     label: 'Surge',
-    maxSolEntryUsd: 10000,
-    capacityDivisor: 3,
+    capacityDivisor: 1,
+    maxOpenPositions: null,
     cadenceMs: {
       readyStarting: 2000,
       activeInPosition: 3000,
@@ -75,8 +77,8 @@ export const getRuntimeSpeedProfile = (value: string | null | undefined): Runtim
   return {
     name,
     label: profile.label,
-    maxSolEntryUsd: profile.maxSolEntryUsd,
     concurrentCapacity: Math.max(1, Math.floor(baseConcurrentCapacity / profile.capacityDivisor)),
+    maxOpenPositions: profile.maxOpenPositions,
     cadenceMs: profile.cadenceMs,
   };
 };

@@ -61,9 +61,9 @@ const parseArgs = (argv) => {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-const databaseUrl = process.env.DATABASE_PRIVATE_URL || process.env.DATABASE_URL;
+const databaseUrl = process.env.DATABASE_PRIVATE_URL?.trim();
 if (!databaseUrl) {
-  throw new Error('DATABASE_PRIVATE_URL or DATABASE_URL is required');
+  throw new Error('DATABASE_PRIVATE_URL is required');
 }
 
 const dbUrl = new URL(databaseUrl);
@@ -94,10 +94,12 @@ const loadTargetUser = async (targetWallet) => {
   return result.rows[0] ?? null;
 };
 
+const RZ_INTERNAL_SECRET = process.env.RZ_INTERNAL_SECRET ?? '';
+
 const createSession = async (apiBase, user) => {
   const response = await fetch(`${apiBase}/sessions`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', 'x-rz-internal-secret': RZ_INTERNAL_SECRET },
     body: JSON.stringify({
       userId: user.id,
       keyAuthUserId: user.id,
@@ -186,7 +188,7 @@ const stopSessions = async (apiBase, sessionIds) => {
   for (const sessionId of sessionIds) {
     const response = await fetch(`${apiBase}/sessions/${sessionId}/action`, {
       method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'x-rz-internal-secret': RZ_INTERNAL_SECRET },
       body: JSON.stringify({ action: 'stop' }),
     });
     if (!response.ok) {

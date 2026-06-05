@@ -1,10 +1,10 @@
 // build: 20260530093932
 'use client';
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { useConnection, useWallet } from '@solana/wallet-adapter-react';
 import { useWalletModal } from '@solana/wallet-adapter-react-ui';
-import { PublicKey, SystemProgram, Transaction } from '@solana/web3.js';
+import { Transaction } from '@solana/web3.js';
 
 // ── Auth types ────────────────────────────────────────────────────────────────
 
@@ -12,7 +12,7 @@ type AuthState =
   | { status: 'disconnected' }
   | { status: 'connecting' }
   | { status: 'checking' }
-  | { status: 'unauthorized'; reason: 'not_registered' | 'access_disabled' | 'license_expired'; username?: string; expiryDate?: string }
+  | { status: 'unauthorized'; reason: 'not_registered' | 'access_disabled' | 'license_expired' | 'service_unavailable'; username?: string; expiryDate?: string }
   | { status: 'authorized'; user: AuthUser };
 
 type AuthUser = {
@@ -20,6 +20,7 @@ type AuthUser = {
   username: string;
   walletAddress: string;
   expiryDate: string | null;
+  maxWalletUsd?: number | null;
   duration: string | null;
   gatedAccessEnrolledAt?: string | null;
   licenseKeyRevealedAt?: string | null;
@@ -28,7 +29,7 @@ type AuthUser = {
 const isUnauthorizedReason = (
   value: string | undefined,
 ): value is Extract<AuthState, { status: 'unauthorized' }>['reason'] =>
-  value === 'not_registered' || value === 'access_disabled' || value === 'license_expired';
+  value === 'not_registered' || value === 'access_disabled' || value === 'license_expired' || value === 'service_unavailable';
 
 type UnauthorizedApiResponse = {
   authorized?: boolean;
@@ -39,6 +40,7 @@ type UnauthorizedApiResponse = {
     username?: string;
     walletAddress?: string;
     expiryDate?: string | null;
+    maxWalletUsd?: number | null;
     duration?: string | null;
     gatedAccessEnrolledAt?: string | null;
     licenseKeyRevealedAt?: string | null;
@@ -74,7 +76,10 @@ type SessionStatus =
   | 'paused' | 'stopping' | 'stopped' | 'settling' | 'error';
 
 type SessionPositionState = {
-  status: 'flat' | 'long_sol';
+  status: 'flat' | 'long' | 'long_sol';
+  positionMint?: string | null;
+  positionSymbol?: string | null;
+  entryStrategy?: string | null;
   entryPriceUsd: number | null;
   entryAt: string | null;
   quantityAtomic: string | null;
@@ -85,12 +90,19 @@ type SessionPositionState = {
   exitReason: string | null;
 };
 
+type SessionPositionsState = {
+  activePositionMint: string | null;
+  positions: Record<string, SessionPositionState>;
+};
+
 type SessionSignal = {
   at: string;
   status: string;
   regime: string | null;
   momentumBps: number | null;
   guardReason: string | null;
+  signal?: string | null;
+  strategy?: string | null;
 };
 
 type SessionTradeGate = {
@@ -102,13 +114,29 @@ type SessionTradeGate = {
   safetyBufferBps: number | null;
 };
 
+type SessionHealthState = {
+  state: 'active_trading' | 'waiting_market' | 'blocked' | 'exit_blocked' | 'gas_danger' | 'recovery_required' | 'stopping' | 'stopped' | 'error';
+  severity: 'info' | 'warn' | 'error';
+  reason: string | null;
+  detail: string | null;
+  updatedAt: string;
+  blockerCount: number;
+};
+
 type Session = {
   id: string;
   status: SessionStatus;
   sessionWallet: string;
   ownerWallet: string;
+  userControl: {
+    profitHandling?: {
+      mode: 'send_to_owner' | 'compound';
+      payoutToken: 'SOL' | 'USDC';
+    };
+  };
   funding: {
     fundingTokenSymbol: string;
+    requestedFundingLamports: string;
     startingBalanceAtomic: string;
     currentBalanceAtomic: string;
     realizedPnlUsd: number;
@@ -120,10 +148,30 @@ type Session = {
     maxDailyLossUsd: number;
   };
   serviceControl?: {
+    positionsState?: SessionPositionsState;
     positionState?: SessionPositionState;
     lastSignal?: SessionSignal;
     lastTradeGate?: SessionTradeGate;
+    healthState?: SessionHealthState;
+    residualRecovery?: {
+      state: string;
+      sessionWallet: string;
+      ownerWallet: string;
+      solBalance: number;
+      residualTokenAccounts: string[];
+      detectedAt: string;
+      note: string;
+    };
     rotationState?: { activeStrategy: string };
+    schedulingState?: {
+      lastDecisionOutcome?: string | null;
+      lastDecisionReason?: string | null;
+      lastBlockedAt?: string | null;
+      lastBlockedReason?: string | null;
+      blockedReasonCounts?: Record<string, number>;
+      lastProfitTransferAt?: string | null;
+      transferredProfitUsd?: number | null;
+    };
   };
   requestedAt: string;
   startedAt: string | null;
@@ -141,6 +189,18 @@ type CreateResponse = {
   error?: string;
 };
 
+type FundingQuoteResponse = {
+  unsignedTransactionBase64?: string;
+  blockhash?: string;
+  lastValidBlockHeight?: number;
+  requestedLamports?: number;
+  requestedUsd?: number;
+  requestedFundingPct?: number | null;
+  maxWalletUsd?: number;
+  error?: string;
+  details?: string;
+};
+
 type PerformanceSummary = {
   totalSessions: number;
   activeSessions: number;
@@ -153,6 +213,7 @@ type PerformanceSummary = {
   submittedExecutions: number;
   preparedExecutions: number;
   failedExecutions: number;
+  cancelledExecutions: number;
   totalRealizedPnlUsd: number;
   confirmedRealizedPnlUsd: number;
   confirmedRealizedPnlTodayUsd: number;
@@ -219,6 +280,7 @@ type PerformanceActivityItem = {
   executionId: string | null;
   signature: string | null;
   amount: string | null;
+  reason?: string | null;
 };
 
 type PerformanceSessionInsight = {
@@ -260,19 +322,17 @@ const API = '/api/rz';
 
 const DEFAULT_SESSION_REQUEST = {
   startingBalanceAtomic: '0',
-  targetDurationMinutes: 60,
+  targetDurationMinutes: 0,
   stopLossBehavior: 'stop' as const,
   riskLimits: {
     maxSessionLossUsd: 50,
     maxDailyLossUsd: 100,
-    maxPositionSizeUsd: 20,
-    maxOpenPositions: 1,
+    maxPositionSizeUsd: 1000,
+    maxOpenPositions: 10,
     maxSlippageBps: 50,
     cooldownMs: 30000,
   },
 };
-
-// ── Status badge ──────────────────────────────────────────────────────────────
 
 const STATUS_COLORS: Record<SessionStatus, string> = {
   awaiting_funding: 'text-yellow-400 bg-yellow-900/30',
@@ -286,19 +346,9 @@ const STATUS_COLORS: Record<SessionStatus, string> = {
   error:            'text-red-500    bg-red-900/40',
 };
 
-function StatusBadge({ status }: { status: SessionStatus }) {
-  const cls = STATUS_COLORS[status] ?? 'text-gray-400 bg-gray-800';
-  return (
-    <span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-xs font-medium ${cls}`}>
-      <span className="w-1.5 h-1.5 rounded-full bg-current" />
-      {status.replace(/_/g, ' ')}
-    </span>
-  );
-}
-
 type PanelView = 'activity' | 'performance';
 type DashboardView = 'overview' | 'historical';
-
+type TopInfoSection = 'user' | 'wallet' | 'monitoring';
 type SessionMarker = {
   title: string;
   detail: string;
@@ -308,6 +358,8 @@ type SessionMarker = {
 type InfoRow = {
   label: string;
   value: string;
+  href?: string;
+  title?: string;
 };
 
 type GateProps = {
@@ -316,13 +368,37 @@ type GateProps = {
 };
 
 const GATE_VIDEO_SRC = '/media/rz-gated-access-intro.mp4';
-const IDLE_BIRD_ALT_VIDEO_SRC = '/media/birds2-alpha.webm';
-const ACTIVE_BIRD_PRIMARY_VIDEO_SRC = '/media/rz-trading-bird-alpha.webm';
-const ACTIVE_BIRD_SECONDARY_VIDEO_SRC = '/media/birds2-alpha.webm';
-const IDLE_BIRD_STILL_DELAY_MS = 12000;
+const IDLE_MULTI_BIRDS_VIDEO_SRC = '/media/rz-idle-multi-birds.mp4';
+const IDLE_ROGUE_BIRD_VIDEO_SRC = '/media/rz-idle-rogue-bird.mp4';
+const IDLE_WHITE_DOVE_VIDEO_SRC = '/media/rz-trading-bird.mp4';
+const PROFIT_CELEBRATION_GIF_SRC = '/media/profit-made.gif';
+const IDLE_BIRD_VIDEO_SOURCES = [
+  {
+    src: IDLE_MULTI_BIRDS_VIDEO_SRC,
+    type: 'video/mp4',
+    wrapperClassName: 'absolute inset-0 flex items-center justify-center overflow-hidden bg-black',
+    className: 'h-full w-full scale-[1.12] translate-x-[4%] -translate-y-[8%] object-contain bg-black',
+  },
+  {
+    src: IDLE_ROGUE_BIRD_VIDEO_SRC,
+    type: 'video/mp4',
+    wrapperClassName: 'absolute inset-0 flex items-end justify-center bg-black',
+    className: 'w-full h-auto object-contain [filter:invert(1)_brightness(0.9)]',
+  },
+  {
+    src: IDLE_WHITE_DOVE_VIDEO_SRC,
+    type: 'video/mp4',
+    wrapperClassName: 'absolute inset-0 flex items-center justify-center bg-black',
+    className: 'h-[50%] w-[50%] object-contain [filter:invert(1)_brightness(0.85)]',
+  },
+] as const;
+const TRADING_CUBE_VIDEO_SOURCES = [
+  '/media/the-cube.mp4',
+  '/media/the-cube-v2.mp4',
+  '/media/the-cube-v3.mp4',
+] as const;
 const LICENSE_REVEAL_STORAGE_KEY = 'rz-pending-license-reveal';
-const FUNDING_FEE_CUSHION_LAMPORTS = 50_000;
-
+const FUNDING_PRESET_PCTS = [25, 50, 95] as const;
 const SESSION_PRIORITY: SessionStatus[] = [
   'active',
   'starting',
@@ -375,12 +451,6 @@ const formatExecutionAmountSol = (atomic: string | null) => {
   return `${(numeric / 1_000_000_000).toFixed(4)} SOL`;
 };
 
-const formatLamportsSol = (lamports: number) => (
-  Number.isFinite(lamports) && lamports > 0
-    ? `${(lamports / 1_000_000_000).toFixed(6)} SOL`
-    : '0.000000 SOL'
-);
-
 const formatWalletShort = (wallet: string) => `${wallet.slice(0, 6)}…${wallet.slice(-4)}`;
 
 const formatDuration = (startedAt: string | null, endedAt: string | null) => {
@@ -398,42 +468,52 @@ const formatDuration = (startedAt: string | null, endedAt: string | null) => {
   return `${hours}h ${minutes}m`;
 };
 
+const formatActivityReason = (reason: string) =>
+  reason
+    .replace(/_/g, ' ')
+    .replace(/\b\w/g, (char) => char.toUpperCase());
+
 const describeActivity = (item: PerformanceActivityItem) => {
   switch (item.kind) {
     case 'session_requested':
       return {
-        title: 'session requested',
-        detail: `${item.sessionWallet.slice(0, 6)}…${item.sessionWallet.slice(-4)} staged for funding.`,
+        title: 'Session requested',
+        detail: `Session wallet ${item.sessionWallet.slice(0, 6)}…${item.sessionWallet.slice(-4)} is ready for funding.`,
       };
     case 'session_started':
       return {
-        title: 'session started',
-        detail: `${item.sessionWallet.slice(0, 6)}…${item.sessionWallet.slice(-4)} moved into execution flow.`,
+        title: 'Session started',
+        detail: `Session ${item.sessionWallet.slice(0, 6)}…${item.sessionWallet.slice(-4)} is live and scanning.`,
       };
     case 'session_ended':
       return {
-        title: 'session ended',
-        detail: `Session ${item.sessionId.slice(0, 8)} closed with status ${item.status ?? 'unknown'}.`,
+        title: 'Session ended',
+        detail: `Session ${item.sessionId.slice(0, 8)} closed (${item.status ?? 'unknown'}). Performance is ready.`,
       };
     case 'swap_confirmed':
       return {
-        title: 'swap confirmed',
-        detail: `${formatExecutionAmountSol(item.amount)} submitted from ${item.sessionWallet.slice(0, 6)}…${item.sessionWallet.slice(-4)}.`,
+        title: 'Swap confirmed',
+        detail: `Confirmed ${formatExecutionAmountSol(item.amount)} from ${item.sessionWallet.slice(0, 6)}…${item.sessionWallet.slice(-4)}.`,
       };
     case 'swap_submitted':
       return {
-        title: 'swap submitted',
-        detail: `Execution is in flight${item.signature ? ` · ${item.signature.slice(0, 8)}…` : ''}.`,
+        title: 'Swap submitted',
+        detail: `Sent to chain${item.signature ? ` · ${item.signature.slice(0, 8)}…` : ''}. Waiting for confirmation.`,
       };
     case 'swap_prepared':
       return {
-        title: 'swap prepared',
-        detail: `${formatExecutionAmountSol(item.amount)} prepared and waiting on execution path.`,
+        title: 'Swap prepared',
+        detail: `Prepared ${formatExecutionAmountSol(item.amount)} and queued for signing.`,
+      };
+    case 'swap_skipped':
+      return {
+        title: 'Trade skipped',
+        detail: `No trade taken${item.reason ? ` · ${formatActivityReason(item.reason)}` : ''}. Gate declined entry; no funds moved.`,
       };
     default:
       return {
-        title: 'swap failed',
-        detail: `Execution failed${item.executionId ? ` · ${item.executionId.slice(0, 8)}…` : ''}.`,
+        title: 'Swap failed',
+        detail: `Execution failed${item.executionId ? ` · ${item.executionId.slice(0, 8)}…` : ''}. Review details below.`,
       };
   }
 };
@@ -441,6 +521,61 @@ const describeActivity = (item: PerformanceActivityItem) => {
 const getLatestActivityItem = (activity: PerformanceActivityItem[]) => (
   [...activity].sort((left, right) => new Date(right.at).getTime() - new Date(left.at).getTime())[0] ?? null
 );
+
+const getOpenSessionPositions = (session: Session | null): SessionPositionState[] => {
+  if (!session) return [];
+
+  const fromPositionsState = Object.values(session.serviceControl?.positionsState?.positions ?? {})
+    .filter((position) => position.status === 'long' || position.status === 'long_sol');
+
+  if (fromPositionsState.length > 0) {
+    return fromPositionsState;
+  }
+
+  const legacyPosition = session.serviceControl?.positionState;
+  if (legacyPosition?.status === 'long' || legacyPosition?.status === 'long_sol') {
+    return [legacyPosition];
+  }
+
+  return [];
+};
+
+const formatOpenPositionLabel = (position: SessionPositionState) => (
+  position.positionSymbol
+  ?? (position.positionMint ? `${position.positionMint.slice(0, 4)}…${position.positionMint.slice(-4)}` : 'POSITION')
+);
+
+const formatPositionDetail = (position: SessionPositionState) => {
+  const label = formatOpenPositionLabel(position);
+  const qty = position.quantityAtomic ? `qty ${position.quantityAtomic}` : 'qty —';
+  const entry = position.entryPriceUsd !== null ? `entry $${position.entryPriceUsd.toFixed(4)}` : 'entry —';
+  const mark = position.lastMarkedPriceUsd !== null ? `mark $${position.lastMarkedPriceUsd.toFixed(4)}` : 'mark —';
+  const strategy = position.entryStrategy ? `strategy ${position.entryStrategy.replace(/_/g, ' ')}` : 'strategy —';
+  const pendingExit = position.pendingExitReason ? ` · pending ${position.pendingExitReason.replace(/_/g, ' ')}` : '';
+  return `${label} · ${position.status} · ${strategy} · ${entry} · ${mark} · ${qty}${pendingExit}`;
+};
+
+const formatHealthLabel = (state: string) => state
+  .split('_')
+  .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+  .join(' ');
+
+const getHealthTone = (health: SessionHealthState): SessionMarker['tone'] => (
+  health.severity === 'error' ? 'warn' : health.severity === 'warn' ? 'warn' : 'neutral'
+);
+
+const pickNextRandomIndex = (length: number, currentIndex: number | null = null) => {
+  if (length <= 1) {
+    return 0;
+  }
+
+  let nextIndex = Math.floor(Math.random() * length);
+  while (nextIndex === currentIndex) {
+    nextIndex = Math.floor(Math.random() * length);
+  }
+
+  return nextIndex;
+};
 
 const getPhaseKeyword = (session: Session | null, activity: PerformanceActivityItem[]): string => {
   if (!session || session.status === 'stopped') return 'idle';
@@ -451,7 +586,7 @@ const getPhaseKeyword = (session: Session | null, activity: PerformanceActivityI
     case 'starting': return 'launching trader';
     case 'active':
       if (latestActivity?.kind === 'swap_submitted' || latestActivity?.kind === 'swap_prepared') return 'executing trade';
-      if (session.serviceControl?.positionState?.status === 'long_sol') return 'working';
+      if (getOpenSessionPositions(session).length > 0) return 'working';
       return 'scanning';
     case 'paused': return 'idle';
     case 'stopping':
@@ -487,8 +622,8 @@ const buildSessionMarkers = (session: Session | null, minimumFundingSol: number)
       tone: 'warn',
     });
     markers.push({
-      title: 'Recovery',
-      detail: 'You can stop this pending session at any time if you want a fresh wallet.',
+      title: 'Control',
+      detail: 'You can stop this pending session anytime and create a fresh wallet.',
       tone: 'neutral',
     });
   }
@@ -499,12 +634,27 @@ const buildSessionMarkers = (session: Session | null, minimumFundingSol: number)
 
   if (session.status === 'starting' || session.status === 'active') {
     const pos = session.serviceControl?.positionState;
+    const openPositions = getOpenSessionPositions(session);
     const sig = session.serviceControl?.lastSignal;
     const gate = session.serviceControl?.lastTradeGate;
-    const strategy = session.serviceControl?.rotationState?.activeStrategy ?? 'momentum';
+    const health = session.serviceControl?.healthState;
+    // Prefer the strategy that actually fired this cycle (lastSignal.strategy);
+    // fall back to the rotation pointer, then the legacy default.
+    const strategy = sig?.strategy
+      ?? sig?.signal
+      ?? session.serviceControl?.rotationState?.activeStrategy
+      ?? 'momentum';
 
     // Position state
-    if (pos) {
+    if (openPositions.length > 0) {
+      const preview = openPositions.slice(0, 2).map(formatOpenPositionLabel).join(', ');
+      const extra = openPositions.length > 2 ? ` +${openPositions.length - 2} more` : '';
+      markers.push({
+        title: `Positions: ${openPositions.length} open`,
+        detail: `${preview}${extra}`,
+        tone: 'good',
+      });
+    } else if (pos) {
       const posLabel = pos.status === 'long_sol' ? 'LONG SOL' : 'FLAT (USDC)';
       const entryDetail = pos.status === 'long_sol' && pos.entryPriceUsd
         ? `entry $${pos.entryPriceUsd.toFixed(2)} · mark $${(pos.lastMarkedPriceUsd ?? 0).toFixed(2)}`
@@ -537,8 +687,22 @@ const buildSessionMarkers = (session: Session | null, minimumFundingSol: number)
       });
     }
 
+    if (health && health.state !== 'active_trading') {
+      const reason = health.reason ? health.reason.replace(/_/g, ' ') : 'no reason recorded';
+      const count = health.blockerCount > 0 ? ` · count ${health.blockerCount}` : '';
+      markers.push({
+        title: `Health: ${formatHealthLabel(health.state)}`,
+        detail: `${reason}${count}${health.detail ? ` · ${health.detail}` : ''}`,
+        tone: getHealthTone(health),
+      });
+    }
+
     // Strategy
-    markers.push({ title: `Strategy: ${strategy}`, detail: `active strategy running`, tone: 'neutral' });
+    markers.push({
+      title: `Strategy: ${String(strategy).replace(/_/g, ' ')}`,
+      detail: sig?.strategy ? 'Strategy that triggered the latest signal.' : 'Current rotation strategy.',
+      tone: 'neutral',
+    });
 
     // PnL snapshot
     if (session.funding.realizedPnlUsd !== 0 || session.funding.capturedFeesUsd !== 0) {
@@ -551,19 +715,26 @@ const buildSessionMarkers = (session: Session | null, minimumFundingSol: number)
   }
 
   if (session.status === 'paused') {
-    markers.push({ title: 'Paused', detail: 'Trading is paused. Resume to continue.', tone: 'warn' });
+    markers.push({ title: 'Paused', detail: 'Trading is paused. Resume when you are ready.', tone: 'warn' });
+    const openPositions = getOpenSessionPositions(session);
     const pos = session.serviceControl?.positionState;
-    if (pos) {
+    if (openPositions.length > 0) {
       markers.push({
-        title: `Position: ${pos.status === 'long_sol' ? 'LONG SOL' : 'FLAT'}`,
-        detail: pos.status === 'long_sol' && pos.entryPriceUsd ? `entry $${pos.entryPriceUsd.toFixed(2)}` : 'no open position',
+        title: `Positions: ${openPositions.length} open`,
+        detail: openPositions.slice(0, 2).map(formatOpenPositionLabel).join(', '),
+        tone: 'neutral',
+      });
+    } else if (pos) {
+      markers.push({
+        title: `Position: ${pos.status === 'long_sol' || pos.status === 'long' ? 'OPEN' : 'FLAT'}`,
+        detail: pos.status === 'long_sol' || pos.status === 'long' ? `entry $${pos.entryPriceUsd?.toFixed(2) ?? '—'}` : 'no open position',
         tone: 'neutral',
       });
     }
   }
 
   if (session.status === 'stopping' || session.status === 'settling') {
-    markers.push({ title: 'Stop requested', detail: 'Sweeping funds back to owner wallet.', tone: 'warn' });
+    markers.push({ title: 'Stop requested', detail: 'Sweeping funds back to your owner wallet.', tone: 'warn' });
     if (session.funding.realizedPnlUsd !== 0) {
       markers.push({
         title: 'Final PnL',
@@ -574,7 +745,14 @@ const buildSessionMarkers = (session: Session | null, minimumFundingSol: number)
   }
 
   if (session.status === 'stopped') {
-    markers.push({ title: 'Stopped', detail: 'Session is closed and performance is ready to review.', tone: 'good' });
+    markers.push({ title: 'Stopped', detail: 'Session is closed. Performance summary is ready.', tone: 'good' });
+    if (session.serviceControl?.residualRecovery) {
+      markers.push({
+        title: 'Recovery required',
+        detail: `${session.serviceControl.residualRecovery.residualTokenAccounts.length} residual token account(s) required fee-sponsored recovery.`,
+        tone: 'warn',
+      });
+    }
     if (session.funding.realizedPnlUsd !== 0) {
       markers.push({
         title: 'Session result',
@@ -585,21 +763,17 @@ const buildSessionMarkers = (session: Session | null, minimumFundingSol: number)
   }
 
   if (session.status === 'error') {
-    markers.push({ title: 'Session error', detail: 'The session hit an error state and needs attention.', tone: 'warn' });
+    markers.push({ title: 'Session error', detail: 'Session hit an error and needs attention.', tone: 'warn' });
   }
 
   return markers;
 };
 
 function IntroGate({ mode, onUnlock }: GateProps) {
-  const [phase, setPhase] = useState<'checking' | 'video' | 'password'>('checking');
+  const [phase, setPhase] = useState<'checking' | 'video' | 'password'>('video');
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
-
-  useEffect(() => {
-    setPhase('video');
-  }, []);
 
   const submitPassword = useCallback(async () => {
     try {
@@ -688,49 +862,60 @@ export default function Home() {
   const [fundingSessionId, setFundingSessionId] = useState<string | null>(null);
   const [fundingError, setFundingError] = useState<string | null>(null);
   const [fundingSignature, setFundingSignature] = useState<string | null>(null);
-  const [fundingPercent, setFundingPercent] = useState<25 | 50 | 95>(95);
+  const [selectedFundingPresetPct, setSelectedFundingPresetPct] = useState<(typeof FUNDING_PRESET_PCTS)[number]>(50);
 
   // Session monitoring
   const [sessions,        setSessions]        = useState<Session[]>([]);
-  const [sessionsLoading,  setSessionsLoading]  = useState(false);
   const [actioning,        setActioning]        = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
   const [minimumFundingSol, setMinimumFundingSol] = useState<number>(0);
-  const [minimumFundingLamports, setMinimumFundingLamports] = useState<number>(0);
   const [panelView, setPanelView] = useState<PanelView>('activity');
+  const [topInfoSection, setTopInfoSection] = useState<TopInfoSection>('user');
   const [dashboardView, setDashboardView] = useState<DashboardView>('overview');
   const [performance, setPerformance] = useState<PerformanceResponse | null>(null);
-  const [performanceLoading, setPerformanceLoading] = useState(false);
   const [showOpenTrades, setShowOpenTrades] = useState(false);
+  const [showProfitModeModal, setShowProfitModeModal] = useState(false);
+  const [dismissedProfitModeSessionId, setDismissedProfitModeSessionId] = useState<string | null>(null);
+  const [startingWithProfitMode, setStartingWithProfitMode] = useState(false);
+  const [profitModeChoice, setProfitModeChoice] = useState<'send_to_owner' | 'compound'>('send_to_owner');
+  const [profitPayoutTokenChoice, setProfitPayoutTokenChoice] = useState<'SOL' | 'USDC'>('USDC');
+  const [showStopModal, setShowStopModal] = useState(false);
+  const [stoppingSession, setStoppingSession] = useState(false);
   const [selectedHistoricalSessionId, setSelectedHistoricalSessionId] = useState<string | null>(null);
   const [accessGateState, setAccessGateState] = useState<AccessGateState>('checking');
   const [accessTrustedUntil, setAccessTrustedUntil] = useState<string | null>(null);
   const [enrollingAccess, setEnrollingAccess] = useState(false);
-  const [licenseReveal, setLicenseReveal] = useState<{ userId: string; licenseKey: string } | null>(null);
-  const [idleBirdMode, setIdleBirdMode] = useState<'still' | 'alt-video'>('still');
-  const [activeBirdVideo, setActiveBirdVideo] = useState<'primary' | 'secondary'>('primary');
-
-  useEffect(() => {
+  const [licenseReveal, setLicenseReveal] = useState<{ userId: string; licenseKey: string } | null>(() => {
     if (typeof window === 'undefined') {
-      return;
+      return null;
     }
 
     const stored = window.sessionStorage.getItem(LICENSE_REVEAL_STORAGE_KEY);
     if (!stored) {
-      return;
+      return null;
     }
 
     try {
       const parsed = JSON.parse(stored) as { userId?: unknown; licenseKey?: unknown };
       if (typeof parsed.userId === 'string' && typeof parsed.licenseKey === 'string') {
-        setLicenseReveal({ userId: parsed.userId, licenseKey: parsed.licenseKey });
+        return { userId: parsed.userId, licenseKey: parsed.licenseKey };
       }
     } catch {
       window.sessionStorage.removeItem(LICENSE_REVEAL_STORAGE_KEY);
     }
-  }, []);
+
+    return null;
+  });
+  const [idleBirdVideoIndex, setIdleBirdVideoIndex] = useState(() => pickNextRandomIndex(IDLE_BIRD_VIDEO_SOURCES.length));
+  const [tradingCubeVideoIndex, setTradingCubeVideoIndex] = useState(() => pickNextRandomIndex(TRADING_CUBE_VIDEO_SOURCES.length));
+  const [profitCelebrationVisible, setProfitCelebrationVisible] = useState(false);
+  const [profitCelebrationKey, setProfitCelebrationKey] = useState(0);
+  const lastCelebratedTradeKeyRef = useRef<string | null>(null);
+  const lastCelebratedProfitTransferKeyRef = useRef<string | null>(null);
+  const celebrationInitializedRef = useRef(false);
+  const profitCelebrationTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const refreshAccessGate = useCallback(async () => {
-    setAccessGateState('checking');
     try {
       const response = await fetch('/api/access/boot', { cache: 'no-store' });
       const payload = await response.json() as AccessBootPayload;
@@ -743,7 +928,11 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    void refreshAccessGate();
+    const bootCheck = setTimeout(() => {
+      void refreshAccessGate();
+    }, 0);
+
+    return () => clearTimeout(bootCheck);
   }, [refreshAccessGate]);
 
   const unlockTemporaryGate = useCallback(async (password: string) => {
@@ -795,7 +984,7 @@ export default function Home() {
     setAuth({ status: 'checking' });
     try {
       const res = await fetch(`${API}/users/by-wallet/${encodeURIComponent(wallet)}`);
-      const data = await res.json() as {
+      const data = await res.json().catch(() => ({})) as {
         authorized?: boolean;
         reason?: string;
         user?: {
@@ -807,7 +996,14 @@ export default function Home() {
           gatedAccessEnrolledAt?: string | null;
           licenseKeyRevealedAt?: string | null;
         };
+        error?: string;
       };
+
+      if (res.status >= 500) {
+        setAuth({ status: 'unauthorized', reason: 'service_unavailable' });
+        return;
+      }
+
       if (res.ok && data.authorized && data.user) {
         setAuth({ status: 'authorized', user: data.user as AuthUser });
       } else {
@@ -819,7 +1015,7 @@ export default function Home() {
         });
       }
     } catch {
-      setAuth({ status: 'unauthorized', reason: 'not_registered' });
+      setAuth({ status: 'unauthorized', reason: 'service_unavailable' });
     }
   }, []);
 
@@ -930,26 +1126,25 @@ export default function Home() {
   // ── Sessions ──────────────────────────────────────────────────────────────
 
   const fetchSessions = useCallback(async (userId: string) => {
-    setSessionsLoading(true);
     try {
       const res = await fetch(`${API}/sessions?userId=${encodeURIComponent(userId)}`);
       if (res.status === 403) {
         const payload = await res.json() as UnauthorizedApiResponse;
         handleUnauthorized(payload);
-        return;
+        return null;
       }
-      if (!res.ok) return;
+      if (!res.ok) return null;
       const data = await res.json() as { sessions: Session[]; minimumFundingLamports?: number; minimumFundingSol?: number };
       setSessions(data.sessions ?? []);
-      setMinimumFundingLamports(data.minimumFundingLamports ?? 0);
       setMinimumFundingSol(data.minimumFundingSol ?? 0);
-    } finally {
-      setSessionsLoading(false);
+      return data.sessions ?? [];
+    } catch {
+      // Keep latest known UI state on transient polling failures.
+      return null;
     }
   }, [handleUnauthorized]);
 
   const fetchPerformance = useCallback(async (user: AuthUser) => {
-    setPerformanceLoading(true);
     try {
       const params = new URLSearchParams({ userId: user.id });
       if (user.walletAddress) {
@@ -964,8 +1159,8 @@ export default function Home() {
       if (!res.ok) return;
       const data = await res.json() as PerformanceResponse;
       setPerformance(data);
-    } finally {
-      setPerformanceLoading(false);
+    } catch {
+      // Keep latest known UI state on transient polling failures.
     }
   }, [handleUnauthorized]);
 
@@ -985,19 +1180,19 @@ export default function Home() {
     };
   }, [auth, fetchPerformance, fetchSessions]);
 
-  useEffect(() => {
-    const sessionHistory = performance?.sessionHistory ?? [];
-    if (sessionHistory.length === 0) {
+  const sessionHistoryForSelection = performance?.sessionHistory ?? [];
+  const [prevPerformanceSnapshot, setPrevPerformanceSnapshot] = useState(performance);
+  if (performance !== prevPerformanceSnapshot) {
+    setPrevPerformanceSnapshot(performance);
+    if (sessionHistoryForSelection.length === 0) {
       setSelectedHistoricalSessionId(null);
-      return;
+    } else if (
+      !selectedHistoricalSessionId
+      || !sessionHistoryForSelection.some((session) => session.sessionId === selectedHistoricalSessionId)
+    ) {
+      setSelectedHistoricalSessionId(sessionHistoryForSelection[0].sessionId);
     }
-
-    setSelectedHistoricalSessionId((current) => (
-      current && sessionHistory.some((session) => session.sessionId === current)
-        ? current
-        : sessionHistory[0].sessionId
-    ));
-  }, [performance]);
+  }
 
   // ── Create session ────────────────────────────────────────────────────────
 
@@ -1041,14 +1236,9 @@ export default function Home() {
     } finally {
       setCreating(false);
     }
-  }, [auth, fetchSessions]);
+  }, [auth, fetchSessions, handleUnauthorized]);
 
-  const handleCreate = async (e: React.FormEvent) => {
-    e.preventDefault();
-    await createSession();
-  };
-
-  const fundSession = useCallback(async (session: Session, percent: 25 | 50 | 95) => {
+  const fundSession = useCallback(async (session: Session) => {
     if (auth.status !== 'authorized' || !publicKey) return;
 
     setFundingSessionId(session.id);
@@ -1057,57 +1247,23 @@ export default function Home() {
     setCreateError(null);
 
     try {
-      const latestBlockhash = await connection.getLatestBlockhash('confirmed');
-      const balanceSnapshots = await Promise.all([
-        connection.getBalance(publicKey, 'processed').catch(() => 0),
-        connection.getBalance(publicKey, 'confirmed').catch(() => 0),
-        connection.getBalance(publicKey, 'finalized').catch(() => 0),
-        connection.getAccountInfo(publicKey, 'confirmed').then((account) => account?.lamports ?? 0).catch(() => 0),
-      ]);
-      const walletBalanceLamports = balanceSnapshots.reduce(
-        (highest, value) => (Number.isFinite(value) ? Math.max(highest, value) : highest),
-        0,
-      );
+      const quoteResponse = await fetch(`${API}/sessions/${session.id}/funding-quote`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ requestedFundingPct: selectedFundingPresetPct }),
+      });
+      const quote = await quoteResponse.json() as FundingQuoteResponse;
 
-      const feeProbeTransaction = new Transaction().add(
-        SystemProgram.transfer({
-          fromPubkey: publicKey,
-          toPubkey: new PublicKey(session.sessionWallet),
-          lamports: 1,
-        }),
-      );
+      if (!quoteResponse.ok || !quote.unsignedTransactionBase64 || !quote.blockhash || quote.lastValidBlockHeight === undefined) {
+        if (quoteResponse.status === 403) {
+          handleUnauthorized(quote as unknown as UnauthorizedApiResponse);
+          return;
+        }
 
-      feeProbeTransaction.feePayer = publicKey;
-      feeProbeTransaction.recentBlockhash = latestBlockhash.blockhash;
-
-      const estimatedFeeLamports = (await connection.getFeeForMessage(
-        feeProbeTransaction.compileMessage(),
-        'confirmed',
-      )).value ?? 5_000;
-      const reservedLamports = Math.max(
-        estimatedFeeLamports + FUNDING_FEE_CUSHION_LAMPORTS,
-        FUNDING_FEE_CUSHION_LAMPORTS,
-      );
-      const maxSpendable = Math.max(0, walletBalanceLamports - reservedLamports);
-      const desiredLamports = Math.floor((walletBalanceLamports * percent) / 100);
-      const transferLamports = Math.min(desiredLamports, maxSpendable);
-
-      if (transferLamports <= 0) {
-        throw new Error(
-          `Detected ${formatLamportsSol(walletBalanceLamports)} in wallet; need more than ${formatLamportsSol(reservedLamports)} to fund after fee buffer`,
-        );
+        throw new Error(quote.details ?? quote.error ?? `Funding quote failed (HTTP ${quoteResponse.status})`);
       }
 
-      const transaction = new Transaction().add(
-        SystemProgram.transfer({
-          fromPubkey: publicKey,
-          toPubkey: new PublicKey(session.sessionWallet),
-          lamports: transferLamports,
-        }),
-      );
-
-      transaction.feePayer = publicKey;
-      transaction.recentBlockhash = latestBlockhash.blockhash;
+      const transaction = Transaction.from(Buffer.from(quote.unsignedTransactionBase64, 'base64'));
 
       const signature = await sendTransaction(transaction, connection, {
         preflightCommitment: 'confirmed',
@@ -1115,40 +1271,76 @@ export default function Home() {
 
       await connection.confirmTransaction({
         signature,
-        blockhash: latestBlockhash.blockhash,
-        lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
+        blockhash: quote.blockhash,
+        lastValidBlockHeight: quote.lastValidBlockHeight,
       }, 'confirmed');
 
       setFundingSignature(signature);
-      void fetchSessions(auth.user.id);
+      for (let attempt = 0; attempt < 12; attempt += 1) {
+        const latestSessions = await fetchSessions(auth.user.id);
+        const fundedSession = latestSessions?.find((item) => item.id === session.id);
+        if (fundedSession?.status === 'ready') {
+          setDismissedProfitModeSessionId(null);
+          setProfitModeChoice(fundedSession.userControl?.profitHandling?.mode ?? 'send_to_owner');
+          setProfitPayoutTokenChoice(fundedSession.userControl?.profitHandling?.payoutToken ?? 'USDC');
+          setShowProfitModeModal(true);
+          break;
+        }
+
+        if (fundedSession && fundedSession.status !== 'awaiting_funding') {
+          break;
+        }
+
+        await new Promise<void>((resolve) => setTimeout(resolve, 1500));
+      }
     } catch (error) {
       setFundingError(error instanceof Error ? error.message : 'Funding transaction failed');
     } finally {
       setFundingSessionId(null);
     }
-  }, [auth, connection, fetchSessions, publicKey, sendTransaction]);
+  }, [auth, connection, fetchSessions, handleUnauthorized, publicKey, selectedFundingPresetPct, sendTransaction]);
 
   // ── Session action ────────────────────────────────────────────────────────
 
-  const handleAction = async (sessionId: string, action: 'start' | 'pause' | 'resume' | 'stop') => {
+  const handleAction = useCallback(async (
+    sessionId: string,
+    action: 'start' | 'pause' | 'resume' | 'stop',
+    options?: {
+      profitMode?: 'send_to_owner' | 'compound';
+      profitPayoutToken?: 'SOL' | 'USDC';
+      stopDisposition?: 'return_tokens' | 'liquidate';
+    },
+  ) => {
     if (auth.status !== 'authorized') return;
     setActioning(sessionId);
+    setActionError(null);
     try {
       const res = await fetch(`${API}/sessions/${sessionId}/action`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action }),
+        body: JSON.stringify({
+          action,
+          ...(options?.profitMode ? { profitMode: options.profitMode } : {}),
+          ...(options?.profitPayoutToken ? { profitPayoutToken: options.profitPayoutToken } : {}),
+          ...(options?.stopDisposition ? { stopDisposition: options.stopDisposition } : {}),
+        }),
       });
       if (res.status === 403) {
         const payload = await res.json() as UnauthorizedApiResponse;
         handleUnauthorized(payload);
         return;
       }
+      if (!res.ok) {
+        const payload = await res.json().catch(() => ({})) as { error?: string; details?: string };
+        throw new Error(payload.details ?? payload.error ?? `Session action failed (HTTP ${res.status})`);
+      }
       void fetchSessions(auth.user.id);
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : 'Session action failed');
     } finally {
       setActioning(null);
     }
-  };
+  }, [auth, fetchSessions, handleUnauthorized]);
 
   // ── Derived ───────────────────────────────────────────────────────────────
 
@@ -1161,32 +1353,82 @@ export default function Home() {
       return new Date(b.requestedAt).getTime() - new Date(a.requestedAt).getTime();
     })[0]
     : null;
+
+  useEffect(() => {
+    if (!primarySession || primarySession.status !== 'ready') {
+      if (showProfitModeModal) {
+        setShowProfitModeModal(false);
+      }
+      return;
+    }
+
+    if (dismissedProfitModeSessionId === primarySession.id || startingWithProfitMode) {
+      return;
+    }
+
+    setProfitModeChoice(primarySession.userControl?.profitHandling?.mode ?? 'send_to_owner');
+    setProfitPayoutTokenChoice(primarySession.userControl?.profitHandling?.payoutToken ?? 'USDC');
+    setShowProfitModeModal(true);
+  }, [dismissedProfitModeSessionId, primarySession, showProfitModeModal, startingWithProfitMode]);
+
   const showLogicVideo = primarySession
     ? ['starting', 'active', 'stopping', 'settling'].includes(primarySession.status)
     : false;
 
-  useEffect(() => {
+  const profitHandlingMode = primarySession?.userControl?.profitHandling?.mode;
+  const profitHandlingToken = primarySession?.userControl?.profitHandling?.payoutToken;
+  const profitSyncKey = `${primarySession?.id ?? ''}|${profitHandlingMode ?? ''}|${profitHandlingToken ?? ''}`;
+  const [prevProfitSyncKey, setPrevProfitSyncKey] = useState(profitSyncKey);
+  if (profitSyncKey !== prevProfitSyncKey) {
+    setPrevProfitSyncKey(profitSyncKey);
+    if (profitHandlingMode === 'send_to_owner' || profitHandlingMode === 'compound') {
+      setProfitModeChoice(profitHandlingMode);
+    }
+    if (profitHandlingToken === 'SOL' || profitHandlingToken === 'USDC') {
+      setProfitPayoutTokenChoice(profitHandlingToken);
+    }
+  }
+
+  const submitStartWithProfitChoice = useCallback(async () => {
+    if (!primarySession || primarySession.status !== 'ready') {
+      return;
+    }
+
+    try {
+      setStartingWithProfitMode(true);
+      await handleAction(primarySession.id, 'start', {
+        profitMode: profitModeChoice,
+        profitPayoutToken: profitPayoutTokenChoice,
+      });
+      setShowProfitModeModal(false);
+    } finally {
+      setStartingWithProfitMode(false);
+    }
+  }, [handleAction, primarySession, profitModeChoice, profitPayoutTokenChoice]);
+
+  const submitStopWithDisposition = useCallback(async (disposition: 'return_tokens' | 'liquidate') => {
+    if (!primarySession) {
+      return;
+    }
+
+    try {
+      setStoppingSession(true);
+      await handleAction(primarySession.id, 'stop', { stopDisposition: disposition });
+      setShowStopModal(false);
+    } finally {
+      setStoppingSession(false);
+    }
+  }, [handleAction, primarySession]);
+
+  const [prevShowLogicVideo, setPrevShowLogicVideo] = useState(showLogicVideo);
+  if (showLogicVideo !== prevShowLogicVideo) {
+    setPrevShowLogicVideo(showLogicVideo);
     if (showLogicVideo) {
-      setIdleBirdMode('still');
-      return;
+      setTradingCubeVideoIndex((currentIndex) => pickNextRandomIndex(TRADING_CUBE_VIDEO_SOURCES.length, currentIndex));
+    } else {
+      setIdleBirdVideoIndex((currentIndex) => pickNextRandomIndex(IDLE_BIRD_VIDEO_SOURCES.length, currentIndex));
     }
-
-    if (idleBirdMode !== 'still') {
-      return;
-    }
-
-    const toggle = window.setTimeout(() => {
-      setIdleBirdMode('alt-video');
-    }, IDLE_BIRD_STILL_DELAY_MS);
-
-    return () => window.clearTimeout(toggle);
-  }, [showLogicVideo, idleBirdMode]);
-
-  useEffect(() => {
-    if (!showLogicVideo) {
-      setActiveBirdVideo('primary');
-    }
-  }, [showLogicVideo]);
+  }
 
   const minimumFundingLabel = formatFundingRequirement(minimumFundingSol);
   const liveFundingBalance = primarySession ? formatFundingSol(primarySession.funding.currentBalanceAtomic) : '—';
@@ -1194,44 +1436,109 @@ export default function Home() {
     if (!primarySession) return 'create a session';
     switch (primarySession.status) {
       case 'awaiting_funding':
-        return `fund ${minimumFundingLabel}, then wait for ready`;
+        return 'fund bot wallet';
       case 'ready':
-        return 'press start to trade';
+        return 'choose profit mode';
       case 'starting':
-        return 'worker is launching';
+        return 'starting now';
       case 'active':
-        return 'monitor live trading';
+        return 'monitor control';
       case 'paused':
-        return 'resume or stop';
+        return 'resume stop';
       case 'stopping':
       case 'settling':
-        return 'waiting for fund recovery';
+        return 'recover funds';
       case 'error':
-        return 'stop and create a fresh session';
+        return 'reset session';
       default:
         return 'create a session';
     }
   })();
   const sessionMarkers = buildSessionMarkers(primarySession, minimumFundingSol);
   const controllerStatusLabel = primarySession ? primarySession.status.replace(/_/g, ' ') : '';
-  const solscanLink = primarySession ? `https://solscan.io/account/${primarySession.sessionWallet}` : null;
-  const controllerInfoRows: InfoRow[] = auth.status === 'authorized'
+  const userContextRows: InfoRow[] = auth.status === 'authorized'
     ? [
       { label: 'user', value: auth.user.username },
       { label: 'access', value: accessTrustedUntil ? `trusted until ${formatDateTime(accessTrustedUntil)}` : 'trusted device enrolled' },
-      { label: 'owner wallet', value: auth.user.walletAddress },
+      { label: 'owner wallet', value: formatWalletShort(auth.user.walletAddress) },
       { label: 'started', value: formatDateTime(primarySession?.startedAt ?? null) },
       { label: 'network', value: 'Solana' },
-      { label: 'minimum required', value: minimumFundingLabel },
-      { label: 'detected balance', value: liveFundingBalance },
-      { label: 'funded amount', value: primarySession ? formatFundingSol(primarySession.funding.startingBalanceAtomic) : '—' },
-      { label: 'realized pnl', value: primarySession ? formatUsd(primarySession.funding.realizedPnlUsd) : '—' },
-      { label: 'fees captured', value: primarySession ? `$${primarySession.funding.capturedFeesUsd.toFixed(4)}` : '—' },
-      { label: 'next step', value: nextStepLabel },
-      { label: 'session wallet', value: primarySession?.sessionWallet ?? 'awaiting session' },
-      { label: 'solscan', value: solscanLink ?? 'unavailable' },
     ]
     : [];
+
+  const walletFinancialRows: InfoRow[] = auth.status === 'authorized'
+    ? [
+      { label: 'minimum required', value: minimumFundingLabel },
+      { label: 'detected balance', value: liveFundingBalance },
+      { label: 'funding token', value: primarySession?.funding.fundingTokenSymbol ?? 'SOL' },
+      { label: 'funded amount', value: primarySession ? formatFundingSol(primarySession.funding.startingBalanceAtomic) : '—' },
+      { label: 'realized pnl', value: primarySession ? formatUsd(primarySession.funding.realizedPnlUsd) : '—' },
+      { label: 'unrealized pnl', value: primarySession ? formatUsd(primarySession.funding.unrealizedPnlUsd) : '—' },
+      { label: 'fees captured', value: primarySession ? `$${primarySession.funding.capturedFeesUsd.toFixed(4)}` : '—' },
+    ]
+    : [];
+
+  const openPositionsForPrimary = getOpenSessionPositions(primarySession);
+  const sessionWalletSolscanUrl = primarySession?.sessionWallet
+    ? `https://solscan.io/account/${primarySession.sessionWallet}`
+    : null;
+
+  const monitoringRows: InfoRow[] = auth.status === 'authorized'
+    ? [
+      { label: 'status', value: primarySession ? primarySession.status.replace(/_/g, ' ') : 'stopped' },
+      {
+        label: 'profit mode',
+        value: primarySession?.userControl?.profitHandling
+          ? `${primarySession.userControl.profitHandling.mode === 'send_to_owner' ? 'send to owner' : 'compound'} · ${primarySession.userControl.profitHandling.payoutToken}`
+          : 'send to owner · USDC',
+      },
+      {
+        label: 'session wallet',
+        value: primarySession?.sessionWallet ?? 'awaiting session',
+        title: primarySession?.sessionWallet ?? undefined,
+      },
+      {
+        label: 'solscan',
+        value: sessionWalletSolscanUrl ?? 'unavailable',
+        href: sessionWalletSolscanUrl ?? undefined,
+        title: sessionWalletSolscanUrl ?? undefined,
+      },
+      { label: 'open positions', value: `${openPositionsForPrimary.length}` },
+      ...openPositionsForPrimary.slice(0, 4).map((position, index): InfoRow => ({
+        label: `position ${index + 1}`,
+        value: formatPositionDetail(position),
+        title: position.positionMint ?? undefined,
+      })),
+      { label: 'next step', value: `${nextStepLabel} ...` },
+    ]
+    : [];
+
+  const topInfoSections: Array<{
+    key: TopInfoSection;
+    title: string;
+    rows: InfoRow[];
+    titleClassName: string;
+  }> = [
+    {
+      key: 'user',
+      title: 'User',
+      rows: userContextRows,
+      titleClassName: 'text-cyan-200/85',
+    },
+    {
+      key: 'wallet',
+      title: 'Wallet',
+      rows: walletFinancialRows,
+      titleClassName: 'text-emerald-200/85',
+    },
+    {
+      key: 'monitoring',
+      title: 'Monitoring',
+      rows: monitoringRows,
+      titleClassName: 'text-violet-200/85',
+    },
+  ];
+  const activeTopInfoSection = topInfoSections.find((section) => section.key === topInfoSection) ?? topInfoSections[0];
 
   const dashboardSummaryRows: InfoRow[] = auth.status === 'authorized'
     ? [
@@ -1252,9 +1559,154 @@ export default function Home() {
   const primarySessionActivity = primarySession
     ? performanceActivity.filter((item) => item.sessionId === primarySession.id).slice(0, 6)
     : [];
+
+  useEffect(() => {
+    const latestConfirmedSwap = primarySessionActivity.find((item) => item.kind === 'swap_confirmed') ?? null;
+    const latestTradeKey = latestConfirmedSwap
+      ? `${latestConfirmedSwap.sessionId}:${latestConfirmedSwap.executionId ?? latestConfirmedSwap.signature ?? latestConfirmedSwap.at}`
+      : null;
+    const transferredProfitUsd = primarySession?.serviceControl?.schedulingState?.transferredProfitUsd ?? 0;
+    const lastProfitTransferAt = primarySession?.serviceControl?.schedulingState?.lastProfitTransferAt ?? null;
+    const profitTransferKey = lastProfitTransferAt && transferredProfitUsd > 0
+      ? `${primarySession?.id ?? 'session'}:${lastProfitTransferAt}:${transferredProfitUsd}`
+      : null;
+
+    if (!celebrationInitializedRef.current) {
+      lastCelebratedTradeKeyRef.current = latestTradeKey;
+      lastCelebratedProfitTransferKeyRef.current = profitTransferKey;
+      celebrationInitializedRef.current = true;
+      return;
+    }
+
+    const hasNewTrade = Boolean(latestTradeKey && latestTradeKey !== lastCelebratedTradeKeyRef.current);
+    const hasNewProfitTransfer = Boolean(profitTransferKey && profitTransferKey !== lastCelebratedProfitTransferKeyRef.current);
+
+    if (!hasNewTrade && !hasNewProfitTransfer) {
+      return;
+    }
+
+    lastCelebratedTradeKeyRef.current = latestTradeKey;
+    lastCelebratedProfitTransferKeyRef.current = profitTransferKey;
+    setProfitCelebrationKey((value) => value + 1);
+    setProfitCelebrationVisible(true);
+
+    if (profitCelebrationTimeoutRef.current) {
+      clearTimeout(profitCelebrationTimeoutRef.current);
+    }
+
+    profitCelebrationTimeoutRef.current = setTimeout(() => {
+      setProfitCelebrationVisible(false);
+      profitCelebrationTimeoutRef.current = null;
+    }, 5200);
+  }, [primarySession?.id, primarySession?.serviceControl?.schedulingState?.lastProfitTransferAt, primarySession?.serviceControl?.schedulingState?.transferredProfitUsd, primarySessionActivity]);
+
+  useEffect(() => () => {
+    if (profitCelebrationTimeoutRef.current) {
+      clearTimeout(profitCelebrationTimeoutRef.current);
+    }
+  }, []);
+
+  const terminalActivityLines = (() => {
+    const lines: Array<{ key: string; tone: 'neutral' | 'good' | 'warn' | 'error' | 'accent'; text: string; at?: string }> = [];
+
+    lines.push({
+      key: 'next-step',
+      tone: 'accent',
+      text: `next step: ${nextStepLabel} ...`,
+    });
+
+    if (primarySession) {
+      lines.push({
+        key: 'status',
+        tone: 'neutral',
+        text: `session status: ${primarySession.status.replace(/_/g, ' ')}`,
+      });
+    }
+
+    if (primarySession?.status === 'awaiting_funding') {
+      lines.push({
+        key: 'funding-required',
+        tone: 'warn',
+        text: `awaiting funding (${minimumFundingLabel} required · detected ${formatFundingSol(primarySession.funding.currentBalanceAtomic)})`,
+      });
+    }
+
+    sessionMarkers.forEach((marker, index) => {
+      lines.push({
+        key: `marker-${index}-${marker.title}`,
+        tone: marker.tone === 'good' ? 'good' : marker.tone === 'warn' ? 'warn' : 'neutral',
+        text: `${marker.title.toLowerCase()}: ${marker.detail}`,
+      });
+    });
+
+    const activityLines = [...primarySessionActivity]
+      .sort((left, right) => new Date(right.at).getTime() - new Date(left.at).getTime())
+      .map((item) => {
+        const activity = describeActivity(item);
+        const tone: 'neutral' | 'good' | 'warn' | 'error' =
+          item.kind === 'swap_confirmed' || item.kind === 'session_started'
+            ? 'good'
+            : item.kind === 'swap_failed'
+              ? 'error'
+              : item.kind === 'session_ended'
+                ? 'warn'
+                : 'neutral';
+
+        return {
+          key: `${item.kind}-${item.at}-${item.executionId ?? item.sessionId}`,
+          tone,
+          at: item.at,
+          text: `${activity.title.toLowerCase()}: ${activity.detail}`,
+        };
+      });
+
+    lines.push(...activityLines);
+
+    if (createResult) {
+      lines.push({
+        key: 'created-session',
+        tone: 'good',
+        text: `session created: ${createResult.fundingInstructions.sendTo}`,
+      });
+    }
+
+    if (fundingSignature) {
+      lines.push({
+        key: 'funding-signature',
+        tone: 'good',
+        text: `funding submitted: ${fundingSignature}`,
+      });
+    }
+
+    if (fundingError) {
+      lines.push({
+        key: 'funding-error',
+        tone: 'error',
+        text: `funding failed: ${fundingError}`,
+      });
+    }
+
+    if (actionError) {
+      lines.push({
+        key: 'action-error',
+        tone: 'error',
+        text: `session action failed: ${actionError}`,
+      });
+    }
+
+    if (createError) {
+      lines.push({
+        key: 'create-error',
+        tone: 'error',
+        text: `session create failed: ${createError}`,
+      });
+    }
+
+    return lines;
+  })();
   const phaseKeyword = getPhaseKeyword(primarySession, primarySessionActivity);
   const sessionTakeProfit = primarySession?.funding.realizedPnlUsd ?? 0;
-  const openTradeSessions = sessions.filter((session) => session.status === 'active' && session.sessionWallet);
+  const openTradeSessions = sessions.filter((session) => session.status === 'active' && session.sessionWallet && getOpenSessionPositions(session).length > 0);
   const historicalSessions = performance?.sessionHistory ?? [];
   const selectedHistoricalSession = historicalSessions.find((session) => session.sessionId === selectedHistoricalSessionId)
     ?? historicalSessions[0]
@@ -1277,9 +1729,9 @@ export default function Home() {
 
     if (primarySession.status === 'awaiting_funding') {
       return {
-        label: fundingSessionId === primarySession.id ? 'Funding…' : `Fund Wallet (${fundingPercent}%)`,
+        label: fundingSessionId === primarySession.id ? 'Funding…' : 'Fund Wallet',
         disabled: fundingSessionId === primarySession.id,
-        onClick: () => void fundSession(primarySession, fundingPercent),
+        onClick: () => void fundSession(primarySession),
       };
     }
 
@@ -1287,7 +1739,12 @@ export default function Home() {
       return {
         label: actioning === primarySession.id ? 'Starting…' : 'Start',
         disabled: actioning === primarySession.id,
-        onClick: () => void handleAction(primarySession.id, 'start'),
+        onClick: () => {
+          setDismissedProfitModeSessionId(null);
+          setProfitModeChoice(primarySession.userControl?.profitHandling?.mode ?? 'send_to_owner');
+          setProfitPayoutTokenChoice(primarySession.userControl?.profitHandling?.payoutToken ?? 'USDC');
+          setShowProfitModeModal(true);
+        },
       };
     }
 
@@ -1382,29 +1839,46 @@ export default function Home() {
           <section className="relative w-full">
             <div className="relative mx-auto w-full overflow-hidden rounded-[28px] border border-cyan-100/35 bg-slate-950/38 shadow-[0_18px_60px_rgba(0,0,0,0.52)] backdrop-blur-[7px]">
               <div className="grid h-[560px] max-h-[80vh] grid-cols-[34%_minmax(0,1fr)] items-stretch gap-[3.6%] px-[3.4%] py-[3.2%]">
-              <div className="relative h-full w-full overflow-hidden rounded-[18px] border border-white/15 bg-transparent">
-                <div className="absolute inset-0">
+              <div className="relative h-full w-full overflow-hidden rounded-[18px] border border-white/15 bg-black">
+                <div className={showLogicVideo
+                  ? 'absolute inset-0 flex items-center justify-center p-[9%]'
+                  : IDLE_BIRD_VIDEO_SOURCES[idleBirdVideoIndex]?.wrapperClassName ?? 'absolute inset-0 flex items-center justify-center p-[9%]'}>
                   {showLogicVideo ? (
                     <video
-                      key="active-bird"
+                      key={`trading-cube-${tradingCubeVideoIndex}`}
                       autoPlay
                       muted
-                      loop
                       playsInline
-                      className="h-full w-full object-contain bg-transparent"
+                      onEnded={() => setTradingCubeVideoIndex((currentIndex) => pickNextRandomIndex(TRADING_CUBE_VIDEO_SOURCES.length, currentIndex))}
+                      className="h-full w-full object-contain bg-black"
                     >
-                      <source src={ACTIVE_BIRD_SECONDARY_VIDEO_SRC} type="video/webm" />
+                      <source src={TRADING_CUBE_VIDEO_SOURCES[tradingCubeVideoIndex]} type="video/mp4" />
                     </video>
                   ) : (
-                    // eslint-disable-next-line @next/next/no-img-element
-                    <img
-                      key="idle-bird-0"
-                      src="/media/roguebird-alpha.webp"
-                      alt="Idle bird"
-                      className="h-full w-full object-contain"
-                      style={{ objectPosition: 'left bottom' }}
-                    />
+                    <video
+                      key={`idle-bird-${idleBirdVideoIndex}`}
+                      autoPlay
+                      muted
+                      playsInline
+                      onEnded={() => setIdleBirdVideoIndex((currentIndex) => pickNextRandomIndex(IDLE_BIRD_VIDEO_SOURCES.length, currentIndex))}
+                      aria-label="Idle bird"
+                      className={`${IDLE_BIRD_VIDEO_SOURCES[idleBirdVideoIndex].className} transition-transform duration-300`}
+                    >
+                      <source src={IDLE_BIRD_VIDEO_SOURCES[idleBirdVideoIndex].src} type={IDLE_BIRD_VIDEO_SOURCES[idleBirdVideoIndex].type} />
+                    </video>
                   )}
+                </div>
+                <div
+                  className={`pointer-events-none absolute inset-0 z-10 flex items-center justify-center bg-black/35 transition-opacity duration-700 ${profitCelebrationVisible ? 'opacity-100' : 'opacity-0'}`}
+                  aria-hidden="true"
+                >
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img
+                    key={`profit-made-${profitCelebrationKey}`}
+                    src={PROFIT_CELEBRATION_GIF_SRC}
+                    alt="Profit made"
+                    className="h-full w-full object-contain drop-shadow-[0_0_28px_rgba(34,197,94,0.35)]"
+                  />
                 </div>
                 <div className="pointer-events-none absolute bottom-[3.5%] left-[5.5%] flex items-end gap-3 font-mono text-[clamp(8px,0.72vw,9px)]">
                   <span className="text-cyan-200">&gt; {phaseKeyword}</span>
@@ -1418,40 +1892,57 @@ export default function Home() {
 
               <div className="flex h-full min-h-0 flex-col self-stretch overflow-hidden rounded-[18px] border border-cyan-300/12 bg-slate-950/42 px-[4.6%] py-[4.2%] font-mono text-[clamp(8px,0.72vw,9px)] leading-[1.38] text-gray-200 shadow-[inset_0_1px_0_rgba(255,255,255,0.04),0_0_30px_rgba(8,145,178,0.06)]">
                 <div className="mb-[2.5%] flex items-start justify-between gap-2">
-                  <div className="text-[clamp(8px,0.85vw,10px)] uppercase tracking-[0.22em] text-gray-500">
-                    {controllerStatusLabel}
-                  </div>
-
-                  <div className="flex flex-wrap items-center justify-end gap-1.5 text-[clamp(9px,0.72vw,10px)]">
+                  <div className="flex flex-wrap items-center gap-1.5 text-[clamp(9px,0.72vw,10px)]">
+                    <div className="text-[clamp(8px,0.85vw,10px)] uppercase tracking-[0.22em] text-gray-500">
+                      {controllerStatusLabel}
+                    </div>
                     <button
                       type="button"
                       onClick={primaryAction.onClick}
                       disabled={primaryAction.disabled}
-                      className="rounded border border-emerald-300/30 bg-emerald-500/10 px-2 py-0.5 text-emerald-100 transition hover:bg-emerald-500/20 disabled:cursor-not-allowed disabled:opacity-40"
+                      className="rounded border border-slate-300/35 bg-gradient-to-b from-slate-200/15 to-slate-500/10 px-2 py-0.5 text-slate-100 transition hover:from-slate-200/25 hover:to-slate-500/20 disabled:cursor-not-allowed disabled:opacity-40"
                     >
                       {primaryAction.label.toLowerCase()}
                     </button>
                     {primarySession?.status === 'awaiting_funding' && (
-                      <select
-                        value={fundingPercent}
-                        onChange={(e) => setFundingPercent(Number(e.target.value) as 25 | 50 | 95)}
-                        disabled={fundingSessionId === primarySession.id}
-                        className="rounded border border-emerald-300/30 bg-emerald-500/10 px-1 py-0.5 text-emerald-100 outline-none transition hover:bg-emerald-500/20 disabled:cursor-not-allowed disabled:opacity-40"
-                        aria-label="Funding percent"
-                      >
-                        <option value={25}>25%</option>
-                        <option value={50}>50%</option>
-                        <option value={95}>95%</option>
-                      </select>
+                      <div className="flex items-center gap-1">
+                        {FUNDING_PRESET_PCTS.map((pct) => {
+                          const active = selectedFundingPresetPct === pct;
+                          return (
+                            <button
+                              key={pct}
+                              type="button"
+                              onClick={() => setSelectedFundingPresetPct(pct)}
+                              disabled={fundingSessionId === primarySession.id}
+                              className={`rounded border px-1.5 py-0.5 transition ${active
+                                ? 'border-cyan-300/35 bg-cyan-500/12 text-cyan-100'
+                                : 'border-slate-300/35 bg-slate-500/10 text-slate-200 hover:bg-slate-500/20'} disabled:cursor-not-allowed disabled:opacity-40`}
+                              aria-label={`Use ${pct}% funding preset`}
+                            >
+                              {pct}%
+                            </button>
+                          );
+                        })}
+                      </div>
                     )}
                     <button
                       type="button"
-                      onClick={() => primarySession && void handleAction(primarySession.id, 'stop')}
+                      onClick={() => {
+                        if (!primarySession) return;
+                        if (getOpenSessionPositions(primarySession).length > 0) {
+                          setShowStopModal(true);
+                        } else {
+                          void handleAction(primarySession.id, 'stop', { stopDisposition: 'return_tokens' });
+                        }
+                      }}
                       disabled={!canStop || actioning === primarySession?.id}
-                      className="rounded border border-red-400/30 bg-red-500/10 px-2 py-0.5 text-red-100 transition hover:bg-red-500/20 disabled:cursor-not-allowed disabled:opacity-40"
+                      className="rounded border border-zinc-300/35 bg-gradient-to-b from-zinc-200/15 to-zinc-500/10 px-2 py-0.5 text-zinc-100 transition hover:from-zinc-200/25 hover:to-zinc-500/20 disabled:cursor-not-allowed disabled:opacity-40"
                     >
                       {(actioning === primarySession?.id && canStop ? 'Stopping…' : 'Stop').toLowerCase()}
                     </button>
+                  </div>
+
+                  <div className="flex flex-wrap items-center justify-end gap-1.5 text-[clamp(9px,0.72vw,10px)]">
                     <button type="button" onClick={() => setPanelView('activity')} className={`px-0.5 transition ${panelView === 'activity' ? 'text-white' : 'text-gray-500 hover:text-gray-300'}`}>
                       activity
                     </button>
@@ -1471,13 +1962,44 @@ export default function Home() {
                         </div>
                       )}
                       {panelView === 'activity' ? (
-                        <div className="space-y-1.5">
-                          {controllerInfoRows.map((row) => (
-                            <div key={row.label} className="flex items-start justify-between gap-3">
-                              <span className="min-w-[88px] text-gray-500">{row.label}</span>
-                              <span className="flex-1 break-all text-right text-cyan-100">{row.value}</span>
-                            </div>
-                          ))}
+                        <div className="px-1">
+                          <div className="mb-2 flex items-center gap-4 border-b border-white/10 px-1">
+                            {topInfoSections.map((section) => {
+                              const active = topInfoSection === section.key;
+                              return (
+                                <button
+                                  key={section.key}
+                                  type="button"
+                                  onClick={() => setTopInfoSection(section.key)}
+                                  className={`border-b pb-1 text-[9px] uppercase tracking-[0.16em] transition ${active
+                                    ? 'border-cyan-300 text-cyan-100'
+                                    : 'border-transparent text-gray-500 hover:text-cyan-100'}`}
+                                >
+                                  {section.title}
+                                </button>
+                              );
+                            })}
+                          </div>
+                          <div className="space-y-1 px-1">
+                            {activeTopInfoSection.rows.map((row) => (
+                              <div key={row.label} className="flex items-start justify-between gap-2">
+                                <span className="min-w-16 text-gray-500">{row.label}</span>
+                                {row.href ? (
+                                  <a
+                                    href={row.href}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    title={row.title ?? row.value}
+                                    className="flex-1 break-all text-right text-cyan-100 underline decoration-cyan-300/30 underline-offset-2 hover:text-cyan-50"
+                                  >
+                                    {row.value}
+                                  </a>
+                                ) : (
+                                  <span title={row.title ?? row.value} className="flex-1 break-all text-right text-cyan-100">{row.value}</span>
+                                )}
+                              </div>
+                            ))}
+                          </div>
                         </div>
                       ) : (
                         <div className="grid grid-cols-2 gap-x-4 gap-y-1">
@@ -1501,72 +2023,40 @@ export default function Home() {
                       )}
                     </div>
 
-                    <div className="my-[2.5%] flex flex-none items-center gap-2 text-[9px] uppercase tracking-[0.18em] text-gray-500">
+                    <div className="my-[1.2%] flex flex-none items-center justify-between gap-2 text-[9px] uppercase tracking-[0.18em] text-gray-500">
+                      <div className="flex items-center gap-2">
                       <span className="inline-flex h-1.5 w-1.5 rounded-full bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.8)]" />
-                      <span>activity monitor</span>
+                      <span>live activity monitor</span>
+                      </div>
+                      <span className="text-cyan-100">next step: {nextStepLabel} ...</span>
                     </div>
 
-                    <div className="my-[2.5%] h-px flex-none bg-gradient-to-r from-cyan-400/30 via-white/10 to-transparent" />
+                    <div className="my-[1.2%] h-px flex-none bg-gradient-to-r from-cyan-400/30 via-white/10 to-transparent" />
 
                     <div className="min-h-0 flex flex-1 flex-col whitespace-pre-wrap pr-1 text-[clamp(8px,0.72vw,9px)] text-gray-300">
                       {panelView === 'activity' ? (
                         <div className="rz-scroll min-h-0 flex-1 overflow-y-auto rounded border border-cyan-300/10 bg-black/18 px-2 py-2 shadow-[inset_0_0_0_1px_rgba(255,255,255,0.02)]">
-                          {sessionMarkers.map((marker, index) => (
-                            <div key={`${marker.title}-${index}`} className="mb-2 last:mb-0">
-                              <span className={`${marker.tone === 'good' ? 'text-emerald-300' : marker.tone === 'warn' ? 'text-yellow-300' : 'text-cyan-200'}`}>
-                                &gt; {marker.title.toLowerCase()}
-                              </span>
-                              <div className="text-gray-400">{marker.detail}</div>
-                            </div>
-                          ))}
-
-                          {(primarySession || primarySessionActivity.length > 0) && (
-                            <div className="mt-3 rounded border border-cyan-300/12 bg-cyan-500/[0.04] p-2">
-                              <div className="mb-2 flex items-center justify-between gap-2 text-cyan-200">
-                                <span>&gt; live session log</span>
-                                <span className="text-[9px] uppercase tracking-[0.16em] text-gray-500">stream</span>
+                          {terminalActivityLines.length === 0 ? (
+                            <div className="text-gray-500">&gt; waiting for activity ...</div>
+                          ) : (
+                            terminalActivityLines.map((line) => (
+                              <div key={line.key} className="mb-1 flex items-start gap-2 last:mb-0">
+                                <span className="w-[68px] shrink-0 text-gray-600">
+                                  {line.at ? new Date(line.at).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }) : 'live'}
+                                </span>
+                                <span className={`${line.tone === 'good'
+                                  ? 'text-emerald-300'
+                                  : line.tone === 'warn'
+                                    ? 'text-yellow-300'
+                                    : line.tone === 'error'
+                                      ? 'text-rose-300'
+                                      : line.tone === 'accent'
+                                        ? 'text-cyan-200'
+                                        : 'text-gray-300'}`}>
+                                  &gt; {line.text}
+                                </span>
                               </div>
-                              {primarySessionActivity.map((item) => {
-                                const activity = describeActivity(item);
-                                return (
-                                  <div key={`${item.kind}-${item.at}-${item.executionId ?? item.sessionId}`} className="mb-2 border-l border-cyan-300/15 pl-2 last:mb-0">
-                                    <div className="text-emerald-300">&gt; {activity.title}</div>
-                                    <div className="text-gray-400">{activity.detail}</div>
-                                    <div className="text-gray-500">{formatDateTime(item.at)}</div>
-                                  </div>
-                                );
-                              })}
-                            </div>
-                          )}
-
-                          {primarySession?.status === 'awaiting_funding' && (
-                            <div className="mt-3 text-yellow-200">
-                              &gt; fund wallet {primarySession.sessionWallet}
-                              <div className="text-yellow-300/80">minimum funding {minimumFundingLabel}</div>
-                              <div className="text-yellow-300/80">detected on-chain balance {formatFundingSol(primarySession.funding.currentBalanceAtomic)}</div>
-                              <div className="text-yellow-300/70">stop is available if this wallet gets abandoned and you want to recreate the session.</div>
-                            </div>
-                          )}
-
-                          {createResult && (
-                            <div className="mt-3 text-emerald-200">
-                              &gt; session created
-                              <div className="text-emerald-300/80 break-all">{createResult.fundingInstructions.sendTo}</div>
-                            </div>
-                          )}
-
-                          {fundingSignature && (
-                            <div className="mt-3 text-emerald-200">
-                              &gt; funding submitted
-                              <div className="break-all text-emerald-300/80">{fundingSignature}</div>
-                            </div>
-                          )}
-
-                          {fundingError && (
-                            <div className="mt-3 text-red-300">
-                              &gt; funding failed
-                              <div className="text-red-200/80">{fundingError}</div>
-                            </div>
+                            ))
                           )}
                         </div>
                       ) : (
@@ -1608,12 +2098,18 @@ export default function Home() {
                                   {openTradeSessions.length === 0 ? (
                                     <div className="text-gray-500">No open trades right now.</div>
                                   ) : (
-                                    openTradeSessions.map((session) => (
+                                    openTradeSessions.map((session) => {
+                                      const openPositions = getOpenSessionPositions(session);
+                                      const symbols = openPositions.slice(0, 3).map(formatOpenPositionLabel).join(', ');
+                                      const extra = openPositions.length > 3 ? ` +${openPositions.length - 3} more` : '';
+
+                                      return (
                                       <div key={session.id} className="mb-2 last:mb-0">
                                         <div className="text-cyan-100">{session.sessionWallet.slice(0, 6)}…{session.sessionWallet.slice(-4)}</div>
-                                        <div className="text-gray-500">status {session.status.replace(/_/g, ' ')}</div>
+                                        <div className="text-gray-500">{openPositions.length} open · {symbols}{extra}</div>
                                       </div>
-                                    ))
+                                      );
+                                    })
                                   )}
                                 </div>
                               )}
@@ -1817,9 +2313,11 @@ export default function Home() {
                       : auth.status === 'unauthorized'
                         ? auth.reason === 'not_registered'
                           ? 'wallet not registered\ncontact administrator for access.'
-                          : auth.reason === 'access_disabled'
+                            : auth.reason === 'access_disabled'
                             ? 'access denied\nplease see admin'
-                            : `license expired${auth.expiryDate ? `\nexpired ${new Date(auth.expiryDate).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}` : ''}`
+                              : auth.reason === 'license_expired'
+                                ? `license expired${auth.expiryDate ? `\nexpired ${new Date(auth.expiryDate).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}` : ''}`
+                                : 'auth backend unavailable\nretry in a few seconds.'
                         : 'connect wallet to initialize controller.'}
                   </div>
                 )}
@@ -1872,6 +2370,129 @@ export default function Home() {
                 className="rounded-xl border border-cyan-300/25 bg-cyan-500/10 px-4 py-2 text-sm text-cyan-100 transition hover:bg-cyan-500/18"
               >
                 i saved it
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showProfitModeModal && primarySession?.status === 'ready' && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/72 p-6 backdrop-blur-sm">
+          <div className="w-full max-w-xl rounded-2xl border border-cyan-300/20 bg-slate-950/95 p-5 shadow-[0_0_35px_rgba(34,211,238,0.12)]">
+            <div className="text-[10px] uppercase tracking-[0.28em] text-cyan-300">profit handling</div>
+            <h3 className="mt-2 text-lg text-white">Choose how profits should be handled before start</h3>
+            <p className="mt-2 text-sm text-cyan-50/80">
+              You can either send profits back to your owner wallet as trades complete, or keep profits in the bot wallet to compound position sizing.
+            </p>
+
+            <div className="mt-4 grid gap-2">
+              <button
+                type="button"
+                onClick={() => setProfitModeChoice('send_to_owner')}
+                className={`rounded border px-3 py-2 text-left transition ${profitModeChoice === 'send_to_owner'
+                  ? 'border-cyan-300/35 bg-cyan-500/12 text-cyan-100'
+                  : 'border-white/10 bg-white/3 text-gray-300 hover:border-cyan-300/20 hover:text-cyan-100'}`}
+              >
+                <div className="text-xs uppercase tracking-[0.16em]">Send to owner</div>
+                <div className="mt-1 text-xs text-gray-300">Skims realized profit back to your main wallet in the selected payout token when possible.</div>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setProfitModeChoice('compound')}
+                className={`rounded border px-3 py-2 text-left transition ${profitModeChoice === 'compound'
+                  ? 'border-cyan-300/35 bg-cyan-500/12 text-cyan-100'
+                  : 'border-white/10 bg-white/3 text-gray-300 hover:border-cyan-300/20 hover:text-cyan-100'}`}
+              >
+                <div className="text-xs uppercase tracking-[0.16em]">Compound</div>
+                <div className="mt-1 text-xs text-gray-300">Leaves realized profits in the bot wallet so the strategy can continue trading with a larger balance.</div>
+              </button>
+            </div>
+
+            <div className="mt-4">
+              <div className="text-[10px] uppercase tracking-[0.2em] text-gray-400">profit payout token</div>
+              <div className="mt-2 flex gap-2">
+                {(['USDC', 'SOL'] as const).map((token) => (
+                  <button
+                    key={token}
+                    type="button"
+                    onClick={() => setProfitPayoutTokenChoice(token)}
+                    className={`rounded border px-3 py-1.5 text-xs transition ${profitPayoutTokenChoice === token
+                      ? 'border-cyan-300/35 bg-cyan-500/12 text-cyan-100'
+                      : 'border-white/10 bg-white/3 text-gray-300 hover:border-cyan-300/20 hover:text-cyan-100'}`}
+                  >
+                    {token}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setDismissedProfitModeSessionId(primarySession.id);
+                  setShowProfitModeModal(false);
+                }}
+                className="rounded border border-white/15 bg-white/3 px-3 py-1.5 text-xs text-gray-200 transition hover:bg-white/8"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => void submitStartWithProfitChoice()}
+                disabled={startingWithProfitMode}
+                className="rounded border border-cyan-300/25 bg-cyan-500/12 px-3 py-1.5 text-xs text-cyan-100 transition hover:bg-cyan-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {startingWithProfitMode ? 'Starting…' : 'Save and Start'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showStopModal && primarySession && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/72 p-6 backdrop-blur-sm">
+          <div className="w-full max-w-xl rounded-2xl border border-red-300/20 bg-slate-950/95 p-5 shadow-[0_0_35px_rgba(248,113,113,0.12)]">
+            <div className="text-[10px] uppercase tracking-[0.28em] text-red-300">stop session</div>
+            <h3 className="mt-2 text-lg text-white">You still have open positions</h3>
+            <p className="mt-2 text-sm text-red-50/80">
+              This session has {getOpenSessionPositions(primarySession).length} open position
+              {getOpenSessionPositions(primarySession).length === 1 ? '' : 's'} (
+              {getOpenSessionPositions(primarySession).map(formatOpenPositionLabel).join(', ')}
+              ). The session wallet is destroyed after stopping for your privacy, so choose how these positions come home.
+            </p>
+
+            <div className="mt-4 grid gap-2">
+              <button
+                type="button"
+                onClick={() => void submitStopWithDisposition('return_tokens')}
+                disabled={stoppingSession}
+                className="rounded border border-cyan-300/25 bg-cyan-500/10 px-3 py-2 text-left transition hover:bg-cyan-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <div className="text-xs uppercase tracking-[0.16em] text-cyan-100">Keep positions — send tokens to my wallet</div>
+                <div className="mt-1 text-xs text-gray-300">Leaves your positions open and transfers the tokens directly to your owner wallet. Recommended.</div>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => void submitStopWithDisposition('liquidate')}
+                disabled={stoppingSession}
+                className="rounded border border-red-300/30 bg-red-500/10 px-3 py-2 text-left transition hover:bg-red-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <div className="text-xs uppercase tracking-[0.16em] text-red-100">Close positions now — sell to SOL</div>
+                <div className="mt-1 text-xs text-gray-300">Prematurely sells every open position back to SOL before sweeping the proceeds to your owner wallet.</div>
+              </button>
+            </div>
+
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setShowStopModal(false)}
+                disabled={stoppingSession}
+                className="rounded border border-white/15 bg-white/3 px-3 py-1.5 text-xs text-gray-200 transition hover:bg-white/8 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                Cancel
               </button>
             </div>
           </div>

@@ -54,6 +54,27 @@ type SessionHealthRow = {
     amountAtomic: string | null;
     riskAdjustedAmountAtomic: string | null;
   } | null;
+  risk_state: {
+    dayKey: string;
+    dailyRealizedPnlUsd: number;
+    consecutiveLosses: number;
+    badFillStreak: number;
+    lastLossAt: string | null;
+    lastBadFillAt: string | null;
+  } | null;
+  last_execution_audit: {
+    at: string;
+    executionId: string;
+    direction: 'enter_long' | 'exit_long' | 'other';
+    inputMint: string;
+    outputMint: string;
+    inputAmountAtomic: string;
+    expectedOutputAtomic: string | null;
+    actualOutputAtomic: string | null;
+    outputDeltaBps: number | null;
+    priceImpactBps: number | null;
+    badFill: boolean;
+  } | null;
 };
 
 type SessionHealthIssue = {
@@ -108,12 +129,97 @@ type LiveNoTradeSession = {
   lastSubmitAgeMinutes: number | null;
 };
 
+type ExecutionQueueSummaryRow = {
+  total: string | number;
+  queued: string | number;
+  running: string | number;
+  claimable: string | number;
+  stale_running: string | number;
+  oldest_queued_age_seconds: string | number | null;
+  newest_updated_at: Date | string | null;
+};
+
+type ExecutionQueueReasonRow = {
+  reason: string;
+  status: string;
+  count: string | number;
+};
+
+type ExecutionQueueHealth = {
+  total: number;
+  queued: number;
+  running: number;
+  claimable: number;
+  staleRunning: number;
+  oldestQueuedAgeSeconds: number | null;
+  newestUpdatedAt: string | null;
+  topReasons: Array<{ reason: string; status: string; count: number }>;
+};
+
+type RiskProofAudit = {
+  sessionId: string;
+  username: string;
+  status: string;
+  at: string;
+  direction: 'enter_long' | 'exit_long' | 'other';
+  outputDeltaBps: number | null;
+  priceImpactBps: number | null;
+  badFill: boolean;
+  expectedOutputAtomic: string | null;
+  actualOutputAtomic: string | null;
+};
+
+type RiskProofHealth = {
+  dailyLossSessions: number;
+  consecutiveLossSessions: number;
+  badFillStreakSessions: number;
+  recentBadFills: number;
+  maxDailyLossUsd: number;
+  maxConsecutiveLosses: number;
+  maxBadFillStreak: number;
+  recentAudits: RiskProofAudit[];
+};
+
+type RecentTradeRow = {
+  session_id: string;
+  username: string;
+  session_status: string;
+  execution_id: string;
+  execution_status: string;
+  swap_path: string;
+  input_mint: string;
+  output_mint: string;
+  amount: string;
+  signature: string | null;
+  confirmation_status: string | null;
+  last_error: unknown;
+  prepared_at: Date | string | null;
+  submitted_at: Date | string | null;
+  confirmed_at: Date | string | null;
+  created_at: Date | string;
+  updated_at: Date | string;
+  metadata: Record<string, unknown> | null;
+};
+
 const ACTIVE_STALE_MINUTES = 5;
 const STOPPING_STALE_MINUTES = 3;
 const AWAITING_FUNDING_WARN_MINUTES = 15;
 const ISSUE_LIMIT = 8;
 const SIZING_LIMIT = 10;
 const LIVE_NO_TRADE_LIMIT = 25;
+const RISK_AUDIT_LIMIT = 10;
+const RECENT_TRADE_LIMIT = 25;
+
+const emptyExecutionQueueHealth = (): ExecutionQueueHealth => ({
+  total: 0,
+  queued: 0,
+  running: 0,
+  claimable: 0,
+  staleRunning: 0,
+  oldestQueuedAgeSeconds: null,
+  newestUpdatedAt: null,
+  topReasons: [],
+});
 
 const parseTimestamp = (value: Date | string | null | undefined) => {
   if (!value) return null;
@@ -137,6 +243,17 @@ const getMostRecentTimestamp = (...values: Array<Date | string | null | undefine
   }
 
   return new Date(Math.max(...timestamps)).toISOString();
+};
+
+const toCount = (value: string | number | null | undefined) => {
+  const parsed = Number(value ?? 0);
+  return Number.isFinite(parsed) ? parsed : 0;
+};
+
+const toIsoOrNull = (value: Date | string | null | undefined) => {
+  if (!value) return null;
+  const timestamp = value instanceof Date ? value.getTime() : Date.parse(value);
+  return Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : null;
 };
 
 const sortIssues = (issues: SessionHealthIssue[]) =>
@@ -173,6 +290,115 @@ const classifyLiveNoTradeBlocker = (row: SessionHealthRow): string | null => {
 export async function GET() {
   try {
     const pool = getPool();
+    const executionQueuePromise = Promise.all([
+      pool.query<ExecutionQueueSummaryRow>(
+        `SELECT
+           COUNT(*) AS total,
+           COUNT(*) FILTER (WHERE status = 'queued') AS queued,
+           COUNT(*) FILTER (WHERE status = 'running') AS running,
+           COUNT(*) FILTER (WHERE status = 'queued' AND available_at <= NOW()) AS claimable,
+           COUNT(*) FILTER (WHERE status = 'running' AND locked_until IS NOT NULL AND locked_until < NOW()) AS stale_running,
+           MAX(EXTRACT(EPOCH FROM (NOW() - created_at))) FILTER (WHERE status = 'queued') AS oldest_queued_age_seconds,
+           MAX(updated_at) AS newest_updated_at
+         FROM execution_queue`,
+      ),
+      pool.query<ExecutionQueueReasonRow>(
+        `SELECT reason, status, COUNT(*) AS count
+           FROM execution_queue
+          GROUP BY reason, status
+          ORDER BY COUNT(*) DESC, reason ASC
+          LIMIT 8`,
+      ),
+    ]).then(([summaryResult, reasonResult]) => {
+      const summary = summaryResult.rows[0] ?? null;
+      return {
+        total: toCount(summary?.total),
+        queued: toCount(summary?.queued),
+        running: toCount(summary?.running),
+        claimable: toCount(summary?.claimable),
+        staleRunning: toCount(summary?.stale_running),
+        oldestQueuedAgeSeconds: summary?.oldest_queued_age_seconds == null ? null : toCount(summary.oldest_queued_age_seconds),
+        newestUpdatedAt: toIsoOrNull(summary?.newest_updated_at),
+        topReasons: reasonResult.rows.map((row) => ({
+          reason: row.reason,
+          status: row.status,
+          count: toCount(row.count),
+        })),
+      } satisfies ExecutionQueueHealth;
+    }).catch((error: unknown) => {
+      const code = typeof error === 'object' && error !== null && 'code' in error
+        ? (error as { code?: unknown }).code
+        : null;
+      if (code === '42P01') {
+        return emptyExecutionQueueHealth();
+      }
+      throw error;
+    });
+
+    const recentTradesPromise = pool.query<RecentTradeRow>(
+      `SELECT
+         s.id AS session_id,
+         COALESCE(u.username, s.user_id) AS username,
+         s.status AS session_status,
+         e.id AS execution_id,
+         CASE
+           WHEN e.status = 'failed' AND e.last_error->>'stage' = 'worker_cancel' THEN 'skipped'
+           ELSE e.status
+         END AS execution_status,
+         e.swap_path,
+         e.input_mint,
+         e.output_mint,
+         e.amount,
+         e.signature,
+         e.confirmation_status,
+         e.last_error,
+         e.prepared_at,
+         e.submitted_at,
+         e.confirmed_at,
+         e.created_at,
+         e.updated_at,
+         e.metadata
+       FROM swap_executions e
+       JOIN sessions s ON s.session_wallet = e.taker
+       LEFT JOIN rz_users u ON u.id::text = s.user_id
+       ORDER BY e.created_at DESC
+       LIMIT $1`,
+      [RECENT_TRADE_LIMIT],
+    ).then((tradeResult) => tradeResult.rows.map((row) => {
+      const metadata = row.metadata && typeof row.metadata === 'object' ? row.metadata : {};
+      return {
+        sessionId: row.session_id,
+        username: row.username,
+        sessionStatus: row.session_status,
+        executionId: row.execution_id,
+        status: row.execution_status,
+        swapPath: row.swap_path,
+        inputMint: row.input_mint,
+        outputMint: row.output_mint,
+        amount: row.amount,
+        signature: row.signature,
+        confirmationStatus: row.confirmation_status,
+        lastError: row.last_error,
+        preparedAt: toIsoOrNull(row.prepared_at),
+        submittedAt: toIsoOrNull(row.submitted_at),
+        confirmedAt: toIsoOrNull(row.confirmed_at),
+        createdAt: toIsoOrNull(row.created_at) ?? new Date().toISOString(),
+        updatedAt: toIsoOrNull(row.updated_at) ?? new Date().toISOString(),
+        entryStrategy: typeof metadata.entryStrategy === 'string' ? metadata.entryStrategy : null,
+        exitStrategy: typeof metadata.exitStrategy === 'string' ? metadata.exitStrategy : null,
+        exitReason: typeof metadata.exitReason === 'string' ? metadata.exitReason : null,
+        scannerStrategy: typeof metadata.scannerStrategy === 'string' ? metadata.scannerStrategy : null,
+      };
+    })).catch((error: unknown) => {
+      const code = typeof error === 'object' && error !== null && 'code' in error
+        ? (error as { code?: unknown }).code
+        : null;
+      if (code === '42P01' || code === '42703') {
+        return [];
+      }
+      throw error;
+    });
+
     const result = await pool.query<SessionHealthRow>(
       `SELECT
          s.id,
@@ -213,12 +439,15 @@ export async function GET() {
          s.service_control -> 'lastSizing' ->> 'riskAdjustedAmountLamports' AS last_sizing_risk_adjusted_amount_lamports,
          (s.funding ->> 'realizedPnlUsd')::double precision AS realized_pnl_usd,
          (s.funding ->> 'unrealizedPnlUsd')::double precision AS unrealized_pnl_usd,
-         s.service_control -> 'lastSizing' -> 'tradeContext' AS last_sizing_trade_context
+         s.service_control -> 'lastSizing' -> 'tradeContext' AS last_sizing_trade_context,
+         s.service_control -> 'riskState' AS risk_state,
+         s.service_control -> 'lastExecutionAudit' AS last_execution_audit
        FROM sessions s
        LEFT JOIN rz_users u ON u.id::text = s.user_id
        ORDER BY s.requested_at DESC
        LIMIT 500`,
     );
+    const [executionQueue, recentTrades] = await Promise.all([executionQueuePromise, recentTradesPromise]);
 
     const countsByStatus: Record<string, number> = {
       awaiting_funding: 0,
@@ -238,6 +467,7 @@ export async function GET() {
     const errors: SessionHealthIssue[] = [];
     const recentSizing: SessionSizingSnapshot[] = [];
     const liveNoTradeSessions: LiveNoTradeSession[] = [];
+    const recentAudits: RiskProofAudit[] = [];
     const liveUserIds = new Set<string>();
     const decisionOutcomes: Record<string, number> = {
       attempted: 0,
@@ -249,6 +479,13 @@ export async function GET() {
     };
     const blockedReasonTotals = new Map<string, number>();
     const liveNoTradeBlockerCounts = new Map<string, number>();
+    let dailyLossSessions = 0;
+    let consecutiveLossSessions = 0;
+    let badFillStreakSessions = 0;
+    let recentBadFills = 0;
+    let maxDailyLossUsd = 0;
+    let maxConsecutiveLosses = 0;
+    let maxBadFillStreak = 0;
 
     for (const row of result.rows) {
       countsByStatus[row.status] = (countsByStatus[row.status] ?? 0) + 1;
@@ -402,6 +639,36 @@ export async function GET() {
           tradeContext: row.last_sizing_trade_context,
         });
       }
+
+      if (row.risk_state) {
+        const dailyLossUsd = Math.abs(Math.min(0, Number(row.risk_state.dailyRealizedPnlUsd ?? 0)));
+        const consecutiveLosses = Number(row.risk_state.consecutiveLosses ?? 0);
+        const badFillStreak = Number(row.risk_state.badFillStreak ?? 0);
+
+        if (dailyLossUsd > 0) dailyLossSessions += 1;
+        if (consecutiveLosses > 0) consecutiveLossSessions += 1;
+        if (badFillStreak > 0) badFillStreakSessions += 1;
+
+        maxDailyLossUsd = Math.max(maxDailyLossUsd, dailyLossUsd);
+        maxConsecutiveLosses = Math.max(maxConsecutiveLosses, consecutiveLosses);
+        maxBadFillStreak = Math.max(maxBadFillStreak, badFillStreak);
+      }
+
+      if (row.last_execution_audit) {
+        if (row.last_execution_audit.badFill) recentBadFills += 1;
+        recentAudits.push({
+          sessionId: row.id,
+          username: row.username,
+          status: row.status,
+          at: row.last_execution_audit.at,
+          direction: row.last_execution_audit.direction,
+          outputDeltaBps: row.last_execution_audit.outputDeltaBps,
+          priceImpactBps: row.last_execution_audit.priceImpactBps,
+          badFill: row.last_execution_audit.badFill,
+          expectedOutputAtomic: row.last_execution_audit.expectedOutputAtomic,
+          actualOutputAtomic: row.last_execution_audit.actualOutputAtomic,
+        });
+      }
     }
 
     const staleActiveIssues = sortIssues(staleActive);
@@ -426,6 +693,18 @@ export async function GET() {
         return bAge - aAge;
       })
       .slice(0, LIVE_NO_TRADE_LIMIT);
+    const riskProof: RiskProofHealth = {
+      dailyLossSessions,
+      consecutiveLossSessions,
+      badFillStreakSessions,
+      recentBadFills,
+      maxDailyLossUsd,
+      maxConsecutiveLosses,
+      maxBadFillStreak,
+      recentAudits: [...recentAudits]
+        .sort((a, b) => Date.parse(b.at) - Date.parse(a.at))
+        .slice(0, RISK_AUDIT_LIMIT),
+    };
 
     return NextResponse.json({
       generatedAt: new Date().toISOString(),
@@ -442,6 +721,7 @@ export async function GET() {
         stoppingSessions: countsByStatus.stopping,
         attentionCount: staleActive.length + staleStopping.length + errors.length,
       },
+      executionQueue,
       tradeDecisions: {
         outcomes: decisionOutcomes,
         topBlockedReasons,
@@ -450,6 +730,8 @@ export async function GET() {
         sessions: liveNoTradeSnapshot,
         topBlockers: topLiveNoTradeBlockers,
       },
+      riskProof,
+      recentTrades,
       countsByStatus,
       issues: {
         staleActive: staleActiveIssues,
@@ -475,6 +757,7 @@ export async function GET() {
         stoppingSessions: 0,
         attentionCount: 0,
       },
+      executionQueue: emptyExecutionQueueHealth(),
       tradeDecisions: {
         outcomes: {
           attempted: 0,
@@ -490,6 +773,17 @@ export async function GET() {
         sessions: [],
         topBlockers: [],
       },
+      riskProof: {
+        dailyLossSessions: 0,
+        consecutiveLossSessions: 0,
+        badFillStreakSessions: 0,
+        recentBadFills: 0,
+        maxDailyLossUsd: 0,
+        maxConsecutiveLosses: 0,
+        maxBadFillStreak: 0,
+        recentAudits: [],
+      },
+      recentTrades: [],
       countsByStatus: {
         awaiting_funding: 0,
         ready: 0,

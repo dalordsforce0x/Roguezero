@@ -23,6 +23,20 @@ export async function GET() {
   }
 
   const start = Date.now();
+  const providerCap = {
+    rpcRps: 200,
+    dasRps: 50,
+    sendTransactionTps: 50,
+  } as const;
+  const fleetTarget = {
+    rpcRps: Number(process.env.HELIUS_RPC_RPS ?? 180),
+    rpcBurst: Number(process.env.HELIUS_RPC_BURST ?? Math.min(20, Number(process.env.HELIUS_RPC_RPS ?? 180))),
+    dasRps: Number(process.env.HELIUS_DAS_RPS ?? 45),
+    senderTps: Number(process.env.HELIUS_SENDER_TPS ?? 45),
+  } as const;
+  const monthlyCredits = Number(process.env.HELIUS_MONTHLY_CREDIT_LIMIT ?? 100_000_000);
+  const monthlyBudgetEnforced = process.env.HELIUS_MONTHLY_BUDGET_ENFORCE !== 'false';
+
   try {
     const res = await fetch(rpcUrl, {
       method:  'POST',
@@ -53,13 +67,11 @@ export async function GET() {
       latencyMs,
       blockHeight,
       plan: {
-        name:              'Developer',
-        rpcRateLimit:      '50 req/s',
-        dasRateLimit:      '10 req/s',
-        monthlyCredits:    '10M',
-        sendTransaction:   '5 / sec',
-        wsConcurrent:      '150 connections',
-        wsSubscriptions:   '1,000 / conn',
+        name: 'Business',
+        providerCap,
+        fleetTarget,
+        monthlyCredits,
+        monthlyBudgetEnforced,
       },
     });
   } catch (err) {

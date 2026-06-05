@@ -7,6 +7,7 @@ type AccessUserRow = {
   license_key: string | null;
   expiry_date: string | null;
   access_enabled: boolean;
+  max_wallet_usd: number;
   duration: string | null;
   gated_access_enrolled_at: string | null;
   license_key_revealed_at: string | null;
@@ -35,6 +36,7 @@ export type AccessUser = {
   walletAddress: string;
   expiryDate: string | null;
   accessEnabled: boolean;
+  maxWalletUsd: number;
   duration: string | null;
   gatedAccessEnrolledAt: string | null;
   licenseKeyRevealedAt: string | null;
@@ -65,6 +67,7 @@ const mapAccessUser = (row: AccessUserRow): AccessUser => ({
   walletAddress: row.wallet_address,
   expiryDate: row.expiry_date,
   accessEnabled: row.access_enabled,
+  maxWalletUsd: row.max_wallet_usd,
   duration: row.duration,
   gatedAccessEnrolledAt: row.gated_access_enrolled_at,
   licenseKeyRevealedAt: row.license_key_revealed_at,
@@ -118,6 +121,7 @@ export const accessTablesReady = async () => {
       ALTER TABLE rz_users
         ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        ADD COLUMN IF NOT EXISTS max_wallet_usd INTEGER NOT NULL DEFAULT 10000,
         ADD COLUMN IF NOT EXISTS gated_access_enrolled_at TIMESTAMPTZ,
         ADD COLUMN IF NOT EXISTS license_key_revealed_at TIMESTAMPTZ;
     `)
@@ -168,7 +172,9 @@ export const getAccessUserByWallet = async (walletAddress: string) => {
   await accessTablesReady();
   const dbPool = getPool();
   const result = await dbPool.query<AccessUserRow>(
-    `SELECT id, username, wallet_address, license_key, expiry_date, access_enabled, duration,
+      `SELECT id, username, wallet_address, license_key, expiry_date, access_enabled,
+        COALESCE(max_wallet_usd, 10000)::integer AS max_wallet_usd,
+        duration,
             gated_access_enrolled_at, license_key_revealed_at
        FROM rz_users
       WHERE wallet_address = $1
@@ -183,7 +189,9 @@ export const getAccessUserByLicenseKey = async (licenseKey: string) => {
   await accessTablesReady();
   const dbPool = getPool();
   const result = await dbPool.query<AccessUserRow>(
-    `SELECT id, username, wallet_address, license_key, expiry_date, access_enabled, duration,
+      `SELECT id, username, wallet_address, license_key, expiry_date, access_enabled,
+        COALESCE(max_wallet_usd, 10000)::integer AS max_wallet_usd,
+        duration,
             gated_access_enrolled_at, license_key_revealed_at
        FROM rz_users
       WHERE license_key = $1
@@ -231,7 +239,9 @@ export const enrollTrustedDeviceForWallet = async (walletAddress: string, device
     await client.query('BEGIN');
 
     const userResult = await client.query<AccessUserRow>(
-      `SELECT id, username, wallet_address, license_key, expiry_date, access_enabled, duration,
+          `SELECT id, username, wallet_address, license_key, expiry_date, access_enabled,
+            COALESCE(max_wallet_usd, 10000)::integer AS max_wallet_usd,
+            duration,
               gated_access_enrolled_at, license_key_revealed_at
          FROM rz_users
         WHERE wallet_address = $1
@@ -249,7 +259,9 @@ export const enrollTrustedDeviceForWallet = async (walletAddress: string, device
           SET gated_access_enrolled_at = COALESCE(gated_access_enrolled_at, $2::timestamptz),
               updated_at = NOW()
         WHERE id = $1
-        RETURNING id, username, wallet_address, license_key, expiry_date, access_enabled, duration,
+        RETURNING id, username, wallet_address, license_key, expiry_date, access_enabled,
+                  COALESCE(max_wallet_usd, 10000)::integer AS max_wallet_usd,
+                  duration,
                   gated_access_enrolled_at, license_key_revealed_at`,
       [user.id, now],
     );
@@ -290,7 +302,9 @@ export const acknowledgeLicenseKeyReveal = async (userId: string) => {
         SET license_key_revealed_at = COALESCE(license_key_revealed_at, NOW()),
             updated_at = NOW()
       WHERE id = $1
-      RETURNING id, username, wallet_address, license_key, expiry_date, access_enabled, duration,
+      RETURNING id, username, wallet_address, license_key, expiry_date, access_enabled,
+                COALESCE(max_wallet_usd, 10000)::integer AS max_wallet_usd,
+                duration,
                 gated_access_enrolled_at, license_key_revealed_at`,
     [userId],
   );
@@ -307,7 +321,9 @@ export const verifyTrustedDeviceLicense = async (licenseKey: string, deviceIdHas
   }
 
   const result = await dbPool.query<AccessUserRow>(
-    `SELECT id, username, wallet_address, license_key, expiry_date, access_enabled, duration,
+      `SELECT id, username, wallet_address, license_key, expiry_date, access_enabled,
+        COALESCE(max_wallet_usd, 10000)::integer AS max_wallet_usd,
+        duration,
             gated_access_enrolled_at, license_key_revealed_at
        FROM rz_users
       WHERE license_key = $1

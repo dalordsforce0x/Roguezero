@@ -2,19 +2,36 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 
+const DEFAULT_ROTATION_INTERVAL_MINUTES = 15;
+const DEFAULT_ENABLED_STRATEGIES: StrategyKey[] = ['momentum', 'mean_reversion', 'supertrend'];
+
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 interface User {
   id: string;
   username: string;
   wallet_address: string;
+  group_id: string | null;
+  group_name: string | null;
+  group_bot_limit: number | null;
   license_key: string | null;
   expiry_date: string | null;
   access_enabled: boolean;
+  max_wallet_usd: number;
   duration: string | null;
   gated_access_enrolled_at: string | null;
   license_key_revealed_at: string | null;
   created_at: string;
+}
+
+interface UserGroup {
+  id: string;
+  name: string;
+  bot_limit: number;
+  member_count: number;
+  active_member_count: number;
+  created_at: string;
+  updated_at: string;
 }
 
 interface SessionHealthIssue {
@@ -85,6 +102,33 @@ interface SessionHealthData {
     stoppingSessions: number;
     attentionCount: number;
   };
+  executionQueue: {
+    total: number;
+    queued: number;
+    running: number;
+    claimable: number;
+    staleRunning: number;
+    oldestQueuedAgeSeconds: number | null;
+    newestUpdatedAt: string | null;
+    topReasons: Array<{ reason: string; status: string; count: number }>;
+  };
+  tradeDecisions: {
+    outcomes: Record<string, number>;
+    topBlockedReasons: Array<{ reason: string; count: number }>;
+  };
+  liveNoTrade: {
+    sessions: Array<{
+      sessionId: string;
+      username: string;
+      status: string;
+      blocker: string;
+      lastDecisionOutcome: 'attempted' | 'blocked' | 'submitted' | 'stopped' | 'error' | null;
+      lastDecisionReason: string | null;
+      lastDecisionAgeMinutes: number | null;
+      lastSubmitAgeMinutes: number | null;
+    }>;
+    topBlockers: Array<{ reason: string; count: number }>;
+  };
   countsByStatus: Record<string, number>;
   issues: {
     staleActive: SessionHealthIssue[];
@@ -92,6 +136,50 @@ interface SessionHealthData {
     errors: SessionHealthIssue[];
     awaitingFunding: SessionHealthIssue[];
   };
+  riskProof: {
+    dailyLossSessions: number;
+    consecutiveLossSessions: number;
+    badFillStreakSessions: number;
+    recentBadFills: number;
+    maxDailyLossUsd: number;
+    maxConsecutiveLosses: number;
+    maxBadFillStreak: number;
+    recentAudits: Array<{
+      sessionId: string;
+      username: string;
+      status: string;
+      at: string;
+      direction: 'enter_long' | 'exit_long' | 'other';
+      outputDeltaBps: number | null;
+      priceImpactBps: number | null;
+      badFill: boolean;
+      expectedOutputAtomic: string | null;
+      actualOutputAtomic: string | null;
+    }>;
+  };
+  recentTrades: Array<{
+    sessionId: string;
+    username: string;
+    sessionStatus: string;
+    executionId: string;
+    status: string;
+    swapPath: string;
+    inputMint: string;
+    outputMint: string;
+    amount: string;
+    signature: string | null;
+    confirmationStatus: string | null;
+    lastError: unknown;
+    preparedAt: string | null;
+    submittedAt: string | null;
+    confirmedAt: string | null;
+    createdAt: string;
+    updatedAt: string;
+    entryStrategy: string | null;
+    exitStrategy: string | null;
+    exitReason: string | null;
+    scannerStrategy: string | null;
+  }>;
   recentSizing: SessionSizingSnapshot[];
 }
 
@@ -109,11 +197,40 @@ interface AdminSession {
   service_control: Record<string, unknown>;
 }
 
+type StrategyKey = 'momentum' | 'mean_reversion' | 'supertrend';
+
+type SessionStrategyForm = {
+  enabledStrategies: StrategyKey[];
+  activeStrategy: StrategyKey;
+  queuedStrategy: StrategyKey;
+  rotationIntervalMinutes: number;
+  autoRotationEnabled: boolean;
+  momentumLookbackSamples: number;
+  momentumThresholdBps: number;
+  momentumEdgeSafetyBufferBps: number;
+};
+
 interface HeliusRateLimitData {
   connected?: boolean;
   latencyMs?: number;
   blockHeight?: number;
   error?: string;
+  plan?: {
+    name?: string;
+    providerCap?: {
+      rpcRps?: number;
+      dasRps?: number;
+      sendTransactionTps?: number;
+    };
+    fleetTarget?: {
+      rpcRps?: number;
+      rpcBurst?: number;
+      dasRps?: number;
+      senderTps?: number;
+    };
+    monthlyCredits?: number;
+    monthlyBudgetEnforced?: boolean;
+  };
 }
 
 interface JupiterRateLimitData {
@@ -123,6 +240,21 @@ interface JupiterRateLimitData {
   priceImpactPct?: string;
   router?: string;
   error?: string;
+  plan?: {
+    name?: string;
+    providerCap?: {
+      generalRps?: number;
+      executeRps?: number;
+      txSubmitRps?: number;
+    };
+    fleetTarget?: {
+      generalRps?: number;
+      generalBurst?: number;
+    };
+    includedCreditsPerYear?: number;
+    monthlyRequestsBudget?: number;
+    monthlyBudgetEnforced?: boolean;
+  };
 }
 
 interface TigerDataRateLimitData {
@@ -139,17 +271,54 @@ interface TigerDataRateLimitData {
   tables?: { name: string; rows: number }[];
 }
 
+interface ProviderBudgetSnapshot {
+  key: string;
+  pressure: 'normal' | 'watch' | 'throttle' | 'halt' | 'unknown' | string;
+  usedUnits: number;
+  monthlyLimitUnits: number;
+  remainingUnits: number;
+  usageRatio: number;
+  elapsedRatio: number;
+  projectedUsageRatio: number;
+  periodStart: string | null;
+  periodEnd: string | null;
+  updatedAt: string | null;
+}
+
+interface ProviderBudgetData {
+  generatedAt: string;
+  budgets: Record<string, ProviderBudgetSnapshot>;
+  error?: string;
+}
+
 interface RateLimitData {
   helius: HeliusRateLimitData;
   jupiter: JupiterRateLimitData;
   tigerdata: TigerDataRateLimitData;
+  providerBudgets: ProviderBudgetData;
 }
 
 interface RuntimeControlData {
   speedProfile: 'glide' | 'pulse' | 'surge';
   label: string;
-  maxSolEntryUsd: number;
   concurrentCapacity: number;
+  maxOpenPositions: number | null;
+  modeSource: 'auto' | 'manual';
+  recommendedProfile: 'glide' | 'pulse' | 'surge';
+  recommendedLabel: string;
+  transitionReason: string | null;
+  lastTransitionAt: string | null;
+  entriesEnabled: boolean;
+  maintenanceReason: string | null;
+  pressure: {
+    heliusBudget?: string;
+    heliusUsageRatio?: number;
+    jupiterBudget?: string;
+    jupiterUsageRatio?: number;
+    queueDepth?: number;
+    queueOldestMs?: number;
+    worstLane?: string;
+  } | null;
   cadenceMs: {
     readyStarting: number;
     activeInPosition: number;
@@ -204,6 +373,14 @@ function formatSignedUsd(value: number | null) {
   const sign = value > 0 ? '+' : '';
   return `${sign}$${value.toFixed(4)}`;
 }
+function formatPercent(value: number | null | undefined) {
+  if (value === null || value === undefined || !Number.isFinite(value)) return '—';
+  return `${(value * 100).toFixed(1)}%`;
+}
+function formatCompactNumber(value: number | null | undefined) {
+  if (value === null || value === undefined || !Number.isFinite(value)) return '—';
+  return Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 }).format(value);
+}
 function formatAtomicAmount(amount: string | null, symbol: 'SOL' | 'USDC' | 'USDT') {
   if (!amount) return '—';
   const numeric = Number(amount);
@@ -215,11 +392,165 @@ function formatAtomicAmount(amount: string | null, symbol: 'SOL' | 'USDC' | 'USD
     ? `$${(numeric / 1_000_000).toFixed(4)} ${symbol}`
     : amount;
 }
+const SOL_MINT = 'So11111111111111111111111111111111111111112';
+const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+const USDT_MINT = 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB';
+
+function symbolForMint(mint: string) {
+  if (mint === SOL_MINT) return 'SOL' as const;
+  if (mint === USDC_MINT) return 'USDC' as const;
+  if (mint === USDT_MINT) return 'USDT' as const;
+  return 'TOKEN';
+}
+
+function formatMintAmount(amount: string | null, mint: string) {
+  const symbol = symbolForMint(mint);
+  if (symbol === 'SOL' || symbol === 'USDC' || symbol === 'USDT') return formatAtomicAmount(amount, symbol);
+  if (!amount) return '—';
+  return `${amount} raw`;
+}
+
+function formatReasonLabel(value: string | null | undefined) {
+  return value ? value.replace(/_/g, ' ') : '—';
+}
+
+function formatErrorSummary(value: unknown) {
+  if (!value) return null;
+  if (typeof value === 'string') return value;
+  if (typeof value === 'object') {
+    const record = value as { reason?: unknown; stage?: unknown };
+    const reason = typeof record.reason === 'string' ? record.reason : null;
+    const stage = typeof record.stage === 'string' ? record.stage : null;
+    if (stage || reason) return [stage, reason].filter(Boolean).join(': ');
+  }
+  try {
+    return JSON.stringify(value).slice(0, 180);
+  } catch {
+    return 'unreadable error';
+  }
+}
 function isExpired(iso: string | null) {
   return !!iso && new Date(iso) < new Date();
 }
 
-type Tab = 'users' | 'overview' | 'rate-limits' | 'session-health';
+type TokenUniverseOverview = {
+  generatedAt: string;
+  summary: {
+    configuredTokens: number;
+    enabledTokens: number;
+    activelyHeldTokens: number;
+    tradedTokens7d: number;
+  };
+  bestToken: {
+    mint: string;
+    symbol: string;
+    tradeCount7d: number;
+    confirmedTradeCount7d: number;
+    currentlyActive: boolean;
+  } | null;
+  activeTokens: Array<{
+    mint: string;
+    symbol: string;
+    activeSessionCount: number;
+  }>;
+  autoSort: {
+    status: 'applied' | 'skipped' | 'unknown';
+    reason: string | null;
+    sourceTable: string | null;
+    candidateCount: number;
+    enabledCount: number;
+    lastRunAt: string | null;
+    top: Array<{
+      rank: number;
+      mint: string;
+      symbol: string;
+      score: number;
+      momentumBps: number;
+      priceImpactBps: number | null;
+      routeFound: boolean;
+    }>;
+  };
+  scanner: {
+    latestRun: {
+      id: string;
+      status: string;
+      reason: string | null;
+      candidateCount: number;
+      acceptedCount: number;
+      rejectedCount: number;
+      providerCostEstimate: number;
+      finishedAt: string;
+    } | null;
+    activeCandidates: Array<{
+      mint: string;
+      symbol: string;
+      status: string;
+      signalScore: number | null;
+      routeQuality: number | null;
+      slippageBps: number | null;
+      validUntil: string;
+      riskFlags: string[];
+    }>;
+  };
+  admission: {
+    summary: {
+      total: number;
+      admitted: number;
+      rejected: number;
+      latestObservedAt: string | null;
+    };
+    candidates: Array<{
+      mint: string;
+      symbol: string;
+      bucket: string;
+      status: string;
+      priority: number;
+      successfulQuoteCount: number;
+      maxImpactBps: number;
+      riskFlags: string[];
+      observedAt: string;
+    }>;
+  };
+  health: {
+    trackedMints: number;
+    activeDeadCandidates: number;
+    topDead: Array<{
+      mint: string;
+      symbol: string;
+      deadRuns: number;
+      lastReason: string | null;
+      lastSeenAt: string;
+    }>;
+  };
+  deadletter: {
+    openCount: number;
+    recoveredCount: number;
+    recent: Array<{
+      mint: string;
+      symbol: string;
+      reason: string;
+      deadRuns: number;
+      dumpedAt: string;
+      recoveredAt: string | null;
+      score: number | null;
+      momentumBps: number | null;
+      priceImpactBps: number | null;
+    }>;
+  };
+  tokens: Array<{
+    mint: string;
+    symbol: string;
+    enabled: boolean;
+    priority: number;
+    notes: string | null;
+    tradeCount7d: number;
+    confirmedTradeCount7d: number;
+    lastTradedAt: string | null;
+    currentlyActive: boolean;
+  }>;
+};
+
+type Tab = 'users' | 'user-groups' | 'overview' | 'rate-limits' | 'session-health' | 'token-universe';
 
 type GateProps = {
   storageKey: string;
@@ -237,6 +568,45 @@ function RlRow({ label, value, warn }: { label: string; value: string; warn?: bo
     <div className="flex items-center justify-between gap-2">
       <span className="text-[10px] text-gray-600">{label}</span>
       <span className={['text-[10px] font-mono font-medium', warn ? 'text-yellow-400' : 'text-gray-300'].join(' ')}>{value}</span>
+    </div>
+  );
+}
+
+function BudgetPressureCard({ title, budget }: { title: string; budget: ProviderBudgetSnapshot | undefined }) {
+  const pressure = budget?.pressure ?? 'unknown';
+  const color =
+    pressure === 'halt' ? 'text-red-300 border-red-900/50 bg-red-950/30' :
+    pressure === 'throttle' ? 'text-orange-300 border-orange-900/50 bg-orange-950/25' :
+    pressure === 'watch' ? 'text-yellow-300 border-yellow-900/50 bg-yellow-950/20' :
+    pressure === 'normal' ? 'text-emerald-300 border-emerald-900/40 bg-emerald-950/15' :
+    'text-gray-400 border-gray-800 bg-gray-950/60';
+
+  return (
+    <div className={["rounded-xl border p-4", color].join(' ')}>
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <p className="text-sm font-semibold text-white">{title}</p>
+          <p className="text-[10px] text-gray-500 mt-0.5">{budget?.key ?? 'budget not initialized'}</p>
+        </div>
+        <span className="rounded-full border border-current/30 px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.18em]">
+          {pressure}
+        </span>
+      </div>
+      <div className="mt-4 grid grid-cols-2 gap-2">
+        <SizingMetric label="used" value={`${formatCompactNumber(budget?.usedUnits)} / ${formatCompactNumber(budget?.monthlyLimitUnits)}`} />
+        <SizingMetric label="remaining" value={formatCompactNumber(budget?.remainingUnits)} />
+        <SizingMetric label="usage" value={formatPercent(budget?.usageRatio)} />
+        <SizingMetric label="projected" value={formatPercent(budget?.projectedUsageRatio)} />
+      </div>
+      <div className="mt-3 h-1 rounded-full bg-gray-800 overflow-hidden">
+        <div
+          className="h-full rounded-full bg-current transition-all duration-700"
+          style={{ width: `${Math.min(Math.max((budget?.usageRatio ?? 0) * 100, 0), 100)}%` }}
+        />
+      </div>
+      <p className="mt-2 text-[10px] text-gray-600">
+        updated {budget?.updatedAt ? formatDateTime(budget.updatedAt) : '—'}
+      </p>
     </div>
   );
 }
@@ -325,102 +695,73 @@ function CapacityPanel({
 
   return (
     <div
-      className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden"
+      className="bg-gray-900 border border-gray-800 rounded-xl p-5 space-y-4"
       style={{ boxShadow: `0 0 0 1px rgba(255,255,255,0.03), inset 0 1px 0 rgba(255,255,255,0.04)` }}
     >
-      {/* ── Top accent bar ── */}
-      <div className="h-[2px] w-full" style={{ background: `linear-gradient(90deg, transparent, ${fillColor}88, transparent)` }} />
+      <div className="flex items-center justify-between gap-3">
+        <span className="text-[10px] font-semibold uppercase tracking-widest text-gray-500">Bot Capacity</span>
+        <span
+          className="text-[9px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded"
+          style={{
+            color: fillColor,
+            background: glowColor,
+            border: `1px solid ${fillColor}33`,
+          }}
+        >
+          {active === 0 ? 'IDLE' : pct >= 0.8 ? 'NEAR FULL' : 'ACTIVE'}
+        </span>
+      </div>
 
-      <div className="flex divide-x divide-gray-800">
+      <div className="grid grid-cols-2 xl:grid-cols-4 gap-3 text-[11px]">
+        <SizingMetric label="active sessions" value={String(active)} />
+        <SizingMetric label="bot capacity" value={String(capacity)} />
+        <SizingMetric label="reserved slots" value={String(reserved)} />
+        <SizingMetric label="available slots" value={String(Math.max(capacity - reserved, 0))} />
+      </div>
 
-        {/* ── Left: capacity meter ── */}
-        <div className="px-6 py-5 flex flex-col gap-4 min-w-[200px]">
-          <div className="flex items-center justify-between">
-            <span className="text-[10px] font-semibold uppercase tracking-widest text-gray-500">Bot Capacity</span>
-            <span
-              className="text-[9px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded"
-              style={{
-                color: fillColor,
-                background: glowColor,
-                border: `1px solid ${fillColor}33`,
-              }}
-            >
-              {active === 0 ? 'IDLE' : pct >= 0.8 ? 'NEAR FULL' : 'ACTIVE'}
-            </span>
-          </div>
+      <div className="flex flex-wrap gap-1.5">
+        {Array.from({ length: Math.max(capacity, 1) }).map((_, i) => (
+          <span
+            key={i}
+            className="block w-2.5 h-2.5 rounded-full transition-all duration-500"
+            style={
+              i < active
+                ? { background: fillColor, boxShadow: `0 0 6px ${fillColor}99` }
+                : { background: '#1f2937', border: '1px solid #374151' }
+            }
+          />
+        ))}
+      </div>
 
-          {/* Big number */}
-          <div className="flex items-end gap-2">
-            <span
-              className="text-5xl font-bold tabular-nums leading-none"
-              style={{ color: fillColor, filter: `drop-shadow(0 0 12px ${fillColor}66)` }}
-            >
-              {active}
-            </span>
-            <span className="text-gray-600 text-lg font-medium mb-1">/ {capacity}</span>
-          </div>
+      <div className="h-1.5 rounded-full bg-gray-800 overflow-hidden">
+        <div
+          className="h-full rounded-full transition-all duration-700"
+          style={{
+            width: `${Math.max(pct * 100, capacity === 0 ? 0 : 2)}%`,
+            background: `linear-gradient(90deg, ${fillColor}99, ${fillColor})`,
+            boxShadow: active > 0 ? `0 0 8px ${fillColor}66` : 'none',
+          }}
+        />
+      </div>
 
-          {/* Slot dots */}
-          <div className="flex flex-wrap gap-1.5">
-            {Array.from({ length: Math.max(capacity, 1) }).map((_, i) => (
-              <span
-                key={i}
-                className="block w-3 h-3 rounded-full transition-all duration-500"
-                style={
-                  i < active
-                    ? { background: fillColor, boxShadow: `0 0 6px ${fillColor}99` }
-                    : { background: '#1f2937', border: '1px solid #374151' }
-                }
-              />
+      <div className="space-y-2">
+        <span className="text-[10px] font-semibold uppercase tracking-widest text-gray-500">Currently Trading</span>
+        {traders.length === 0 ? (
+          <p className="text-xs text-gray-600">No bots running</p>
+        ) : (
+          <div className="flex flex-wrap gap-2">
+            {traders.slice(0, 8).map((t) => (
+              <span key={t.id} className="rounded-full border border-gray-700 bg-gray-800/60 px-2.5 py-1 text-[11px] text-gray-200">
+                {t.username}
+              </span>
             ))}
+            {traders.length > 8 && (
+              <span className="rounded-full border border-gray-700 bg-gray-800/60 px-2.5 py-1 text-[11px] text-gray-400">
+                +{traders.length - 8} more
+              </span>
+            )}
           </div>
-
-          {/* Progress bar */}
-          <div className="h-1 rounded-full bg-gray-800 overflow-hidden">
-            <div
-              className="h-full rounded-full transition-all duration-700"
-              style={{
-                width: `${Math.max(pct * 100, capacity === 0 ? 0 : 2)}%`,
-                background: `linear-gradient(90deg, ${fillColor}99, ${fillColor})`,
-                boxShadow: active > 0 ? `0 0 8px ${fillColor}66` : 'none',
-              }}
-            />
-          </div>
-          <div className="text-[10px] text-gray-500">
-            reserved slots {reserved} · available {Math.max(capacity - reserved, 0)}
-          </div>
-        </div>
-
-        {/* ── Right: who's trading ── */}
-        <div className="flex-1 px-6 py-5 flex flex-col gap-3">
-          <span className="text-[10px] font-semibold uppercase tracking-widest text-gray-500">Currently Trading</span>
-
-          {traders.length === 0 ? (
-            <div className="flex-1 flex flex-col items-center justify-center py-4 gap-2">
-              <div className="w-8 h-8 rounded-full bg-gray-800 border border-gray-700 flex items-center justify-center">
-                <span className="text-gray-600 text-xs">—</span>
-              </div>
-              <p className="text-xs text-gray-600">No bots running</p>
-            </div>
-          ) : (
-            <div className="space-y-2">
-              {traders.map((t) => (
-                <div
-                  key={t.id}
-                  className="flex items-center gap-3 px-3 py-2.5 rounded-lg bg-gray-800/50 border border-gray-700/50"
-                >
-                  <span
-                    className="w-2 h-2 rounded-full shrink-0"
-                    style={{ background: '#10b981', boxShadow: '0 0 6px rgba(16,185,129,0.7)', animation: 'livePulse 1.8s ease-in-out infinite' }}
-                  />
-                  <span className="text-sm font-semibold text-white flex-1">{t.username}</span>
-                  <span className="trading-live-badge shrink-0">● LIVE</span>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-
+        )}
       </div>
     </div>
   );
@@ -430,23 +771,38 @@ function RuntimeControlPanel({
   control,
   updating,
   onSelect,
+  onAuto,
+  onToggleEntries,
 }: {
   control: RuntimeControlData | null;
   updating: boolean;
   onSelect: (profile: 'glide' | 'pulse' | 'surge') => void;
+  onAuto: () => void;
+  onToggleEntries: (enabled: boolean) => void;
 }) {
   const profiles = [
-    { id: 'glide', label: 'Glide', detail: '$1.5k SOL max · highest capacity' },
-    { id: 'pulse', label: 'Pulse', detail: '$4.5k SOL max · balanced flow' },
-    { id: 'surge', label: 'Surge', detail: '$10k SOL max · hardest bite' },
+    { id: 'glide', label: 'Glide', detail: 'most conservative cadence · full fleet capacity preserved' },
+    { id: 'pulse', label: 'Pulse', detail: 'balanced cadence · full fleet capacity preserved' },
+    { id: 'surge', label: 'Surge', detail: 'fastest cadence · full fleet capacity preserved' },
   ] as const;
+
+  const isManual = control?.modeSource === 'manual';
+  const pressure = control?.pressure ?? null;
+  const fmtAge = (ms?: number) => (ms == null ? '—' : ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms)}ms`);
+  const fmtRatio = (r?: number) => (r == null ? '—' : `${Math.round(r * 100)}%`);
+  const pressureTone = (level?: string) =>
+    level === 'halt' || level === 'throttle'
+      ? 'text-rose-300'
+      : level === 'watch'
+        ? 'text-amber-300'
+        : 'text-emerald-300';
 
   return (
     <div className="bg-gray-900 border border-gray-800 rounded-xl p-5 space-y-4">
       <div className="flex items-center justify-between gap-3">
         <div>
           <p className="text-sm font-semibold text-white">Global Flow Control</p>
-          <p className="text-xs text-gray-600 mt-0.5">Switches cadence, SOL entry cap, and concurrent bot capacity across the whole stack.</p>
+          <p className="text-xs text-gray-600 mt-0.5">Fleet-wide Surge/Pulse/Glide throttle — keeps all bots under 90% of every provider lane.</p>
         </div>
         {control && (
           <div className="text-right text-[10px] uppercase tracking-[0.18em] text-cyan-200">
@@ -456,9 +812,76 @@ function RuntimeControlPanel({
         )}
       </div>
 
+      {control && (
+        <div className="flex flex-wrap items-center gap-2 text-[11px]">
+          <span
+            className={[
+              'rounded-full px-2.5 py-1 font-semibold uppercase tracking-[0.16em]',
+              isManual ? 'bg-amber-500/15 text-amber-200' : 'bg-emerald-500/15 text-emerald-200',
+            ].join(' ')}
+          >
+            {isManual ? 'Manual pin' : 'Auto'}
+          </span>
+          <span className="text-gray-500">
+            recommended <span className="text-cyan-200">{control.recommendedLabel}</span>
+          </span>
+          {isManual && control.recommendedProfile !== control.speedProfile && (
+            <span className="text-amber-300/80">· auto would switch to {control.recommendedLabel}</span>
+          )}
+          {isManual && (
+            <button
+              type="button"
+              disabled={updating}
+              onClick={onAuto}
+              className={[
+                'ml-auto rounded-lg border border-emerald-400/30 bg-emerald-500/10 px-3 py-1.5 text-xs font-semibold text-emerald-200 transition-colors hover:bg-emerald-500/20',
+                updating ? 'opacity-60 cursor-not-allowed' : '',
+              ].join(' ')}
+            >
+              Return to Auto
+            </button>
+          )}
+        </div>
+      )}
+
+      {control && (
+        <div className={[
+          'rounded-xl border p-4',
+          control.entriesEnabled
+            ? 'border-emerald-500/25 bg-emerald-500/5'
+            : 'border-amber-400/35 bg-amber-500/10',
+        ].join(' ')}>
+          <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+            <div>
+              <p className="text-sm font-semibold text-white">Deployment entry lock</p>
+              <p className="mt-1 text-xs text-gray-500">
+                {control.entriesEnabled
+                  ? 'New entries are allowed. Exits, stops, and reconciliation always stay enabled.'
+                  : `New entries are blocked${control.maintenanceReason ? `: ${control.maintenanceReason}` : ''}. Exits, stops, and reconciliation still run.`}
+              </p>
+            </div>
+            <button
+              type="button"
+              disabled={updating}
+              onClick={() => onToggleEntries(!control.entriesEnabled)}
+              className={[
+                'rounded-lg border px-3 py-2 text-xs font-semibold transition-colors',
+                control.entriesEnabled
+                  ? 'border-amber-400/30 bg-amber-500/10 text-amber-200 hover:bg-amber-500/20'
+                  : 'border-emerald-400/30 bg-emerald-500/10 text-emerald-200 hover:bg-emerald-500/20',
+                updating ? 'opacity-60 cursor-not-allowed' : '',
+              ].join(' ')}
+            >
+              {control.entriesEnabled ? 'Block New Entries' : 'Allow New Entries'}
+            </button>
+          </div>
+        </div>
+      )}
+
       <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
         {profiles.map((profile) => {
           const active = control?.speedProfile === profile.id;
+          const recommended = control?.recommendedProfile === profile.id;
           return (
             <button
               key={profile.id}
@@ -475,7 +898,8 @@ function RuntimeControlPanel({
             >
               <div className="flex items-center justify-between gap-2">
                 <span className="text-sm font-semibold">{profile.label}</span>
-                {active && <span className="text-[10px] uppercase tracking-[0.18em] text-cyan-200">live</span>}
+                {active && <span className="text-[10px] uppercase tracking-[0.18em] text-cyan-200">active</span>}
+                {!active && recommended && <span className="text-[10px] uppercase tracking-[0.18em] text-emerald-300/80">rec</span>}
               </div>
               <div className="mt-2 text-xs text-gray-500">{profile.detail}</div>
             </button>
@@ -485,12 +909,33 @@ function RuntimeControlPanel({
 
       {control && (
         <div className="grid grid-cols-2 xl:grid-cols-6 gap-3 text-[11px]">
-          <SizingMetric label="SOL entry max" value={`$${control.maxSolEntryUsd.toLocaleString()}`} />
           <SizingMetric label="bot capacity" value={String(control.concurrentCapacity)} />
+          <SizingMetric label="max positions / bot" value={control.maxOpenPositions == null ? 'bot-decided' : String(control.maxOpenPositions)} />
           <SizingMetric label="ready / starting" value={`${control.cadenceMs.readyStarting} ms`} />
           <SizingMetric label="active in position" value={`${control.cadenceMs.activeInPosition} ms`} />
           <SizingMetric label="active flat" value={`${control.cadenceMs.activeFlat} ms`} />
           <SizingMetric label="guarded / post-submit" value={`${control.cadenceMs.activeGuarded} / ${control.cadenceMs.postSubmitFast} ms`} />
+        </div>
+      )}
+
+      {control && pressure && (
+        <div className="rounded-xl border border-gray-800 bg-gray-950/60 p-3 space-y-2">
+          <div className="flex items-center justify-between">
+            <p className="text-[10px] uppercase tracking-[0.18em] text-gray-500">Provider pressure (worst lane wins)</p>
+            {pressure.worstLane && <p className="text-[11px] text-gray-400">binding: {pressure.worstLane}</p>}
+          </div>
+          <div className="grid grid-cols-2 xl:grid-cols-4 gap-3 text-[11px]">
+            <SizingMetric label={`helius budget · ${fmtRatio(pressure.heliusUsageRatio)}`} value={<span className={pressureTone(pressure.heliusBudget)}>{pressure.heliusBudget ?? '—'}</span>} />
+            <SizingMetric label={`jupiter budget · ${fmtRatio(pressure.jupiterUsageRatio)}`} value={<span className={pressureTone(pressure.jupiterBudget)}>{pressure.jupiterBudget ?? '—'}</span>} />
+            <SizingMetric label="exec queue depth" value={String(pressure.queueDepth ?? 0)} />
+            <SizingMetric label="queue oldest" value={fmtAge(pressure.queueOldestMs)} />
+          </div>
+          {control.transitionReason && (
+            <p className="text-[11px] text-gray-500">
+              last shift: {control.transitionReason}
+              {control.lastTransitionAt ? ` · ${formatDateTime(control.lastTransitionAt)}` : ''}
+            </p>
+          )}
         </div>
       )}
     </div>
@@ -509,7 +954,7 @@ function StatCard({ label, value, sub }: { label: string; value: number | string
   );
 }
 
-function SizingMetric({ label, value }: { label: string; value: string }) {
+function SizingMetric({ label, value }: { label: string; value: React.ReactNode }) {
   return (
     <div className="rounded-md border border-gray-800 bg-gray-900/60 px-3 py-2">
       <p className="text-[10px] uppercase tracking-wider text-gray-600">{label}</p>
@@ -599,6 +1044,153 @@ function SizingTable({ snapshots }: { snapshots: SessionSizingSnapshot[] }) {
   );
 }
 
+function TradeDecisionPanel({ health }: { health: SessionHealthData }) {
+  const outcomes = Object.entries(health.tradeDecisions.outcomes ?? {}).filter(([, count]) => count > 0);
+
+  return (
+    <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
+      <div className="bg-gray-900 border border-gray-800 rounded-xl p-5 space-y-4">
+        <div>
+          <p className="text-sm font-semibold text-white">Live Trade Decisions</p>
+          <p className="text-xs text-gray-600 mt-0.5">What active/starting sessions are deciding right now: submitted, blocked, attempted, or errored.</p>
+        </div>
+        <div className="grid grid-cols-2 gap-3 md:grid-cols-3">
+          {(outcomes.length > 0 ? outcomes : [['unknown', 0] as [string, number]]).map(([outcome, count]) => (
+            <SizingMetric key={outcome} label={outcome.replace(/_/g, ' ')} value={count} />
+          ))}
+        </div>
+        {health.tradeDecisions.topBlockedReasons.length > 0 ? (
+          <div className="space-y-2">
+            <p className="text-[10px] uppercase tracking-wider text-gray-600">Top blocked reasons</p>
+            {health.tradeDecisions.topBlockedReasons.slice(0, 8).map((item) => (
+              <div key={item.reason} className="flex items-center justify-between gap-3 rounded-lg border border-gray-800 bg-gray-950/70 px-3 py-2">
+                <span className="truncate text-xs text-gray-300">{formatReasonLabel(item.reason)}</span>
+                <span className="font-mono text-sm text-white">{item.count}</span>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="rounded-lg border border-emerald-900/30 bg-emerald-950/20 px-3 py-3 text-xs text-emerald-300">
+            No live blockers currently recorded.
+          </div>
+        )}
+      </div>
+
+      <div className="bg-gray-900 border border-gray-800 rounded-xl p-5 space-y-4">
+        <div>
+          <p className="text-sm font-semibold text-white">Live No-Trade Reasons</p>
+          <p className="text-xs text-gray-600 mt-0.5">Sessions that are alive but did not submit because the worker intentionally blocked or deferred.</p>
+        </div>
+        {health.liveNoTrade.sessions.length === 0 ? (
+          <div className="rounded-lg border border-emerald-900/30 bg-emerald-950/20 px-3 py-3 text-xs text-emerald-300">
+            No live no-trade sessions in the current snapshot.
+          </div>
+        ) : (
+          <div className="max-h-80 overflow-auto space-y-2 pr-1">
+            {health.liveNoTrade.sessions.map((session) => (
+              <div key={session.sessionId} className="rounded-lg border border-gray-800 bg-gray-950/70 px-3 py-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <p className="truncate text-sm font-medium text-white">{session.username}</p>
+                    <p className="font-mono text-[10px] text-gray-600">{session.sessionId.slice(0, 8)}… · {session.status.replace(/_/g, ' ')}</p>
+                  </div>
+                  <span className="rounded-full border border-yellow-900/50 bg-yellow-950/20 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.14em] text-yellow-300">
+                    {session.lastDecisionOutcome ?? 'unknown'}
+                  </span>
+                </div>
+                <p className="mt-2 text-xs text-gray-300">{formatReasonLabel(session.blocker)}</p>
+                <p className="mt-1 text-[10px] text-gray-600">
+                  decision age {session.lastDecisionAgeMinutes === null ? '—' : formatAgeMinutes(session.lastDecisionAgeMinutes)} · last submit {session.lastSubmitAgeMinutes === null ? '—' : formatAgeMinutes(session.lastSubmitAgeMinutes)}
+                </p>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function RecentTradesTable({ trades }: { trades: SessionHealthData['recentTrades'] }) {
+  return (
+    <div className="bg-gray-900 border border-gray-800 rounded-xl p-5 space-y-4">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <p className="text-sm font-semibold text-white">Recent Trade Ledger</p>
+          <p className="text-xs text-gray-600 mt-0.5">Confirmed, submitted, failed, and canceled swaps joined by session wallet. This is the live trading receipt tape.</p>
+        </div>
+        <span className="rounded-full border border-cyan-900/40 bg-cyan-950/20 px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.18em] text-cyan-200">
+          {trades.length} rows
+        </span>
+      </div>
+
+      {trades.length === 0 ? (
+        <div className="rounded-lg border border-gray-800 bg-gray-950/70 px-4 py-4 text-xs text-gray-500">
+          No swap executions found yet.
+        </div>
+      ) : (
+        <div className="max-h-120 overflow-auto rounded-lg border border-gray-800">
+          <table className="w-full text-[11px]">
+            <thead className="sticky top-0 z-10 bg-gray-950">
+              <tr className="border-b border-gray-800 text-left text-[10px] uppercase tracking-wider text-gray-600">
+                <th className="py-2 pr-3">User</th>
+                <th className="py-2 pr-3">Status</th>
+                <th className="py-2 pr-3">Route</th>
+                <th className="py-2 pr-3">Amount</th>
+                <th className="py-2 pr-3">Strategy / Exit</th>
+                <th className="py-2 pr-3">Signature</th>
+                <th className="py-2 pr-3">Error</th>
+                <th className="py-2 pr-3">Time</th>
+              </tr>
+            </thead>
+            <tbody>
+              {trades.map((trade) => {
+                const errorSummary = formatErrorSummary(trade.lastError);
+                const statusTone = trade.status === 'confirmed'
+                  ? 'text-emerald-300'
+                  : trade.status === 'failed'
+                    ? 'text-rose-300'
+                    : trade.status === 'submitted'
+                      ? 'text-cyan-300'
+                      : 'text-yellow-300';
+
+                return (
+                  <tr key={trade.executionId} className="border-b border-gray-800/50 align-top">
+                    <td className="py-2 pr-3">
+                      <p className="font-medium text-white">{trade.username}</p>
+                      <p className="font-mono text-[10px] text-gray-600">{trade.sessionId.slice(0, 8)} · {trade.sessionStatus.replace(/_/g, ' ')}</p>
+                    </td>
+                    <td className={`py-2 pr-3 font-semibold ${statusTone}`}>
+                      {trade.status}
+                      {trade.confirmationStatus && <p className="font-normal text-[10px] text-gray-600">{trade.confirmationStatus}</p>}
+                    </td>
+                    <td className="py-2 pr-3 text-gray-300">
+                      {symbolForMint(trade.inputMint)} → {symbolForMint(trade.outputMint)}
+                      <p className="font-mono text-[10px] text-gray-600">{trade.swapPath}</p>
+                    </td>
+                    <td className="py-2 pr-3 font-mono text-gray-300">{formatMintAmount(trade.amount, trade.inputMint)}</td>
+                    <td className="py-2 pr-3 text-gray-300">
+                      <p>{trade.exitReason ? `exit · ${formatReasonLabel(trade.exitReason)}` : trade.entryStrategy ? `entry · ${formatReasonLabel(trade.entryStrategy)}` : 'wallet / reconcile'}</p>
+                      <p className="text-[10px] text-gray-600">scan {formatReasonLabel(trade.scannerStrategy)}{trade.exitStrategy ? ` · exit ${formatReasonLabel(trade.exitStrategy)}` : ''}</p>
+                    </td>
+                    <td className="py-2 pr-3 font-mono text-gray-400">
+                      {trade.signature ? `${trade.signature.slice(0, 8)}…${trade.signature.slice(-6)}` : '—'}
+                    </td>
+                    <td className="py-2 pr-3 text-rose-300 max-w-xs">
+                      {errorSummary ? <span title={errorSummary}>{errorSummary}</span> : <span className="text-gray-600">—</span>}
+                    </td>
+                    <td className="py-2 pr-3 text-gray-500">{formatDateTime(trade.confirmedAt ?? trade.submittedAt ?? trade.createdAt)}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function getSizingDisplay(snapshot: SessionSizingSnapshot) {
   const ctx = snapshot.tradeContext;
   if (!ctx) {
@@ -675,13 +1267,113 @@ function getAdminSessionRealizedPnl(session: AdminSession) {
 }
 
 function getAdminSessionPositionLabel(session: AdminSession) {
-  const positionState = (session.service_control as { positionState?: { status?: unknown; exitReason?: unknown } })?.positionState;
+  const serviceControl = (session.service_control as {
+    positionsState?: {
+      positions?: Record<string, { status?: unknown; positionSymbol?: unknown; pendingExitReason?: unknown; exitReason?: unknown }>;
+    };
+    positionState?: { status?: unknown; exitReason?: unknown; positionSymbol?: unknown };
+  }) ?? {};
+  const positions = Object.values(serviceControl.positionsState?.positions ?? {}).filter((position) => position?.status === 'long' || position?.status === 'long_sol');
+
+  if (positions.length > 0) {
+    const symbols = positions
+      .map((position) => typeof position.positionSymbol === 'string' ? position.positionSymbol : null)
+      .filter((symbol): symbol is string => Boolean(symbol))
+      .slice(0, 2);
+    const pendingReasons = positions
+      .map((position) => typeof position.pendingExitReason === 'string' ? position.pendingExitReason : null)
+      .filter((reason): reason is string => Boolean(reason));
+    const suffix = symbols.length > 0 ? ` · ${symbols.join(', ')}` : '';
+    const pending = pendingReasons.length > 0 ? ` · EXIT ${pendingReasons[0].replace(/_/g, ' ')}` : '';
+    return `${positions.length} OPEN${suffix}${pending}`;
+  }
+
+  const positionState = serviceControl.positionState;
   const status = positionState?.status;
   const exitReason = typeof positionState?.exitReason === 'string' ? positionState.exitReason : null;
 
-  if (status === 'long_sol') return 'LONG SOL';
+  if (status === 'long_sol' || status === 'long') {
+    const symbol = typeof positionState?.positionSymbol === 'string' ? positionState.positionSymbol : 'POSITION';
+    return `1 OPEN · ${symbol}`;
+  }
   if (exitReason) return `FLAT · ${exitReason.replace(/_/g, ' ')}`;
   return 'FLAT';
+}
+
+function getAdminSessionHealthLabel(session: AdminSession) {
+  const serviceControl = (session.service_control as {
+    healthState?: { state?: unknown; severity?: unknown; reason?: unknown; blockerCount?: unknown };
+    schedulingState?: { lastBlockedReason?: unknown; blockedReasonCounts?: unknown };
+    residualRecovery?: unknown;
+  }) ?? {};
+  const health = serviceControl.healthState;
+  const state = typeof health?.state === 'string' ? health.state : null;
+  const reason = typeof health?.reason === 'string'
+    ? health.reason
+    : typeof serviceControl.schedulingState?.lastBlockedReason === 'string'
+      ? serviceControl.schedulingState.lastBlockedReason
+      : null;
+  const count = typeof health?.blockerCount === 'number' && health.blockerCount > 0 ? ` ×${health.blockerCount}` : '';
+
+  if (state) return `${state.replace(/_/g, ' ')}${reason ? ` · ${reason.replace(/_/g, ' ')}${count}` : ''}`;
+  if (serviceControl.residualRecovery) return 'recovery required · residual tokens';
+  if (reason) return `blocked · ${reason.replace(/_/g, ' ')}`;
+  return '—';
+}
+
+const strategyLabel = (strategy: StrategyKey) => (
+  strategy === 'mean_reversion'
+    ? 'mean reversion'
+    : strategy === 'supertrend'
+      ? 'supertrend'
+      : 'momentum'
+);
+
+function getSessionStrategyForm(session: AdminSession): SessionStrategyForm {
+  const sc = session.service_control as {
+    strategyUniverse?: Array<{ key?: unknown; enabled?: unknown }>;
+    rotationState?: {
+      activeStrategy?: unknown;
+      queuedStrategy?: unknown;
+      rotationIntervalMinutes?: unknown;
+    };
+    strategyConfig?: {
+      autoRotationEnabled?: unknown;
+      momentum?: {
+        lookbackSamples?: unknown;
+        thresholdBps?: unknown;
+        edgeSafetyBufferBps?: unknown;
+      };
+    };
+  };
+
+  const enabledStrategies = (sc.strategyUniverse ?? [])
+    .filter((entry) => entry?.enabled === true)
+    .map((entry) => entry.key)
+    .filter((key): key is StrategyKey => key === 'momentum' || key === 'mean_reversion' || key === 'supertrend');
+
+  const activeStrategy = (sc.rotationState?.activeStrategy === 'momentum'
+    || sc.rotationState?.activeStrategy === 'mean_reversion'
+    || sc.rotationState?.activeStrategy === 'supertrend')
+    ? sc.rotationState.activeStrategy
+    : 'momentum';
+
+  const queuedStrategy = (sc.rotationState?.queuedStrategy === 'momentum'
+    || sc.rotationState?.queuedStrategy === 'mean_reversion'
+    || sc.rotationState?.queuedStrategy === 'supertrend')
+    ? sc.rotationState.queuedStrategy
+    : activeStrategy;
+
+  return {
+    enabledStrategies: enabledStrategies.length > 0 ? enabledStrategies : DEFAULT_ENABLED_STRATEGIES,
+    activeStrategy,
+    queuedStrategy,
+    rotationIntervalMinutes: Number(sc.rotationState?.rotationIntervalMinutes ?? DEFAULT_ROTATION_INTERVAL_MINUTES),
+    autoRotationEnabled: sc.strategyConfig?.autoRotationEnabled !== false,
+    momentumLookbackSamples: Number(sc.strategyConfig?.momentum?.lookbackSamples ?? 5),
+    momentumThresholdBps: Number(sc.strategyConfig?.momentum?.thresholdBps ?? 8),
+    momentumEdgeSafetyBufferBps: Number(sc.strategyConfig?.momentum?.edgeSafetyBufferBps ?? 5),
+  };
 }
 
 function SessionIssuePanel({
@@ -744,7 +1436,8 @@ function IntroGate({ storageKey, onUnlock }: GateProps) {
       return;
     }
 
-    setPhase('video');
+    const timer = window.setTimeout(() => setPhase('video'), 0);
+    return () => window.clearTimeout(timer);
   }, [onUnlock, storageKey]);
 
   const submitPassword = useCallback(() => {
@@ -836,12 +1529,13 @@ interface UserCardProps {
   isLive: boolean;
   onToggle: (id: string, current: boolean) => void;
   onAssign: (id: string) => void;
+  onEdit: (user: User) => void;
   onDelete: (id: string) => void;
   assigning: string | null;
   toggling:  string | null;
 }
 
-function UserCard({ user: u, isLive, onToggle, onAssign, onDelete, assigning, toggling }: UserCardProps) {
+function UserCard({ user: u, isLive, onToggle, onAssign, onEdit, onDelete, assigning, toggling }: UserCardProps) {
   const [copiedKey,    setCopiedKey]    = useState(false);
   const [copiedWallet, setCopiedWallet] = useState(false);
 
@@ -876,7 +1570,7 @@ function UserCard({ user: u, isLive, onToggle, onAssign, onDelete, assigning, to
       'relative bg-gray-900 rounded-lg border overflow-hidden transition-all duration-300',
       isActive ? 'border-blue-500/25 shadow-md shadow-blue-950/20' : 'border-gray-800/80',
     ].join(' ')}>
-      <div className={['absolute left-0 top-0 bottom-0 w-[2px]', isActive ? 'trading-accent-bar' : 'bg-gray-800'].join(' ')} />
+      <div className={['absolute left-0 top-0 bottom-0 w-0.5', isActive ? 'trading-accent-bar' : 'bg-gray-800'].join(' ')} />
 
       <div className="pl-3.5 pr-3 py-3 flex flex-col gap-2">
 
@@ -895,6 +1589,11 @@ function UserCard({ user: u, isLive, onToggle, onAssign, onDelete, assigning, to
             {u.access_enabled && isExpired(u.expiry_date) && (
               <span className="text-[9px] text-red-500 font-medium shrink-0">● EXP</span>
             )}
+            {u.group_name && (
+              <span className="text-[9px] text-violet-300 bg-violet-500/10 border border-violet-400/20 px-1.5 py-0.5 rounded-full shrink-0">
+                {u.group_name}
+              </span>
+            )}
           </div>
           <button
             onClick={() => void onToggle(u.id, u.access_enabled)}
@@ -907,8 +1606,8 @@ function UserCard({ user: u, isLive, onToggle, onAssign, onDelete, assigning, to
             ].join(' ')}
           >
             <span className={[
-              'inline-block h-3.5 w-3.5 mt-[3px] rounded-full bg-white shadow transition-transform duration-200',
-              u.access_enabled ? 'translate-x-[18px]' : 'translate-x-[2px]',
+              'inline-block h-3.5 w-3.5 mt-0.75 rounded-full bg-white shadow transition-transform duration-200',
+              u.access_enabled ? 'translate-x-4.5' : 'translate-x-0.5',
             ].join(' ')} />
           </button>
         </div>
@@ -962,6 +1661,12 @@ function UserCard({ user: u, isLive, onToggle, onAssign, onDelete, assigning, to
             </button>
           )}
           <button
+            onClick={() => onEdit(u)}
+            className="text-gray-500 hover:text-emerald-300 text-[10px] px-2 py-1.5 rounded hover:bg-emerald-900/20 transition-colors"
+          >
+            Edit
+          </button>
+          <button
             onClick={() => void onDelete(u.id)}
             className="text-gray-700 hover:text-red-400 text-[10px] px-2 py-1.5 rounded hover:bg-red-900/20 transition-colors"
           >
@@ -979,13 +1684,20 @@ function UserCard({ user: u, isLive, onToggle, onAssign, onDelete, assigning, to
 export default function Home() {
   const [tab, setTab]             = useState<Tab>('users');
   const [users, setUsers]         = useState<User[]>([]);
+  const [groups, setGroups]       = useState<UserGroup[]>([]);
   const [loading, setLoading]     = useState(true);
   const [activeSessions, setActiveSessions] = useState<Set<string>>(new Set());
   const [adminSessions, setAdminSessions] = useState<AdminSession[]>([]);
   const [adminSessionsLoading, setAdminSessionsLoading] = useState(false);
   const [forceStoppingSessionId, setForceStoppingSessionId] = useState<string | null>(null);
+  const [strategyFormBySession, setStrategyFormBySession] = useState<Record<string, SessionStrategyForm>>({});
+  const [savingStrategySessionId, setSavingStrategySessionId] = useState<string | null>(null);
   const [showModal, setShowModal] = useState(false);
-  const [form, setForm]           = useState({ username: '', walletAddress: '', duration: '1month' });
+  const [showGroupModal, setShowGroupModal] = useState(false);
+  const [editingUser, setEditingUser] = useState<User | null>(null);
+  const [editingGroup, setEditingGroup] = useState<UserGroup | null>(null);
+  const [form, setForm]           = useState({ username: '', walletAddress: '', duration: '1month', maxWalletUsd: '10000', groupId: '' });
+  const [groupForm, setGroupForm] = useState({ name: '', botLimit: '1', existingUserId: '', newUsername: '', newWalletAddress: '', newDuration: '1month', newMaxWalletUsd: '10000' });
   const [formBusy, setFormBusy]   = useState(false);
   const [assigning, setAssigning] = useState<string | null>(null);
   const [toggling, setToggling]   = useState<string | null>(null);
@@ -997,6 +1709,8 @@ export default function Home() {
   const [rlLoading, setRlLoading] = useState(false);
   const [sessionHealth, setSessionHealth] = useState<SessionHealthData | null>(null);
   const [sessionHealthLoading, setSessionHealthLoading] = useState(false);
+  const [tokenUniverse, setTokenUniverse] = useState<TokenUniverseOverview | null>(null);
+  const [tokenUniverseLoading, setTokenUniverseLoading] = useState(false);
   const [runtimeControl, setRuntimeControl] = useState<RuntimeControlData | null>(null);
   const [runtimeControlLoading, setRuntimeControlLoading] = useState(false);
   const [runtimeControlUpdating, setRuntimeControlUpdating] = useState(false);
@@ -1007,9 +1721,11 @@ export default function Home() {
   const loadUsers = useCallback(async () => {
     setLoading(true);
     try {
-      const res  = await fetch('/api/users');
+      const [res, groupsRes] = await Promise.all([fetch('/api/users'), fetch('/api/user-groups')]);
       const data = await res.json() as { success: boolean; users: User[] };
+      const groupsData = await groupsRes.json() as { success: boolean; groups: UserGroup[] };
       setUsers(data.users ?? []);
+      setGroups(groupsData.groups ?? []);
     } finally {
       setLoading(false);
     }
@@ -1071,15 +1787,51 @@ export default function Home() {
     }
   }, []);
 
+  const resumeRuntimeAuto = useCallback(async () => {
+    setRuntimeControlUpdating(true);
+    try {
+      const res = await fetch('/api/runtime-control', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ modeSource: 'auto' }),
+      });
+      if (!res.ok) return;
+      const data = await res.json() as RuntimeControlData;
+      setRuntimeControl(data);
+    } finally {
+      setRuntimeControlUpdating(false);
+    }
+  }, []);
+
+  const toggleRuntimeEntries = useCallback(async (entriesEnabled: boolean) => {
+    setRuntimeControlUpdating(true);
+    try {
+      const res = await fetch('/api/runtime-control', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          entriesEnabled,
+          maintenanceReason: entriesEnabled ? null : 'deployment',
+        }),
+      });
+      if (!res.ok) return;
+      const data = await res.json() as RuntimeControlData;
+      setRuntimeControl(data);
+    } finally {
+      setRuntimeControlUpdating(false);
+    }
+  }, []);
+
   const fetchRateLimits = useCallback(async () => {
     setRlLoading(true);
     try {
-      const [h, j, t] = await Promise.all([
+      const [h, j, t, b] = await Promise.all([
         fetch('/api/rate-limits/helius').then(r   => r.json()),
         fetch('/api/rate-limits/jupiter').then(r   => r.json()),
         fetch('/api/rate-limits/tigerdata').then(r => r.json()),
+        fetch('/api/provider/budgets').then(r => r.json()),
       ]);
-      setRlData({ helius: h, jupiter: j, tigerdata: t });
+      setRlData({ helius: h, jupiter: j, tigerdata: t, providerBudgets: b });
     } finally {
       setRlLoading(false);
     }
@@ -1097,17 +1849,92 @@ export default function Home() {
     }
   }, []);
 
+  const fetchTokenUniverse = useCallback(async () => {
+    setTokenUniverseLoading(true);
+    try {
+      const res = await fetch('/api/token-universe');
+      if (!res.ok) return;
+      const data = await res.json() as TokenUniverseOverview;
+      setTokenUniverse(data);
+    } finally {
+      setTokenUniverseLoading(false);
+    }
+  }, []);
+
   const loadAdminSessions = useCallback(async () => {
     setAdminSessionsLoading(true);
     try {
       const res = await fetch('/api/sessions');
       if (!res.ok) return;
       const data = await res.json() as { sessions: AdminSession[] };
-      setAdminSessions(data.sessions ?? []);
+      const sessions = data.sessions ?? [];
+      setAdminSessions(sessions);
+      setStrategyFormBySession((prev) => {
+        const next = { ...prev };
+        for (const session of sessions) {
+          if (!next[session.id]) {
+            next[session.id] = getSessionStrategyForm(session);
+          }
+        }
+        return next;
+      });
     } finally {
       setAdminSessionsLoading(false);
     }
   }, []);
+
+  const updateSessionStrategyForm = useCallback((sessionId: string, updater: (current: SessionStrategyForm) => SessionStrategyForm) => {
+    setStrategyFormBySession((prev) => {
+      const fallbackSession = adminSessions.find((session) => session.id === sessionId);
+      const current = prev[sessionId]
+        ?? (fallbackSession ? getSessionStrategyForm(fallbackSession) : {
+          enabledStrategies: DEFAULT_ENABLED_STRATEGIES,
+          activeStrategy: 'momentum',
+          queuedStrategy: 'momentum',
+          rotationIntervalMinutes: DEFAULT_ROTATION_INTERVAL_MINUTES,
+          autoRotationEnabled: true,
+          momentumLookbackSamples: 5,
+          momentumThresholdBps: 8,
+          momentumEdgeSafetyBufferBps: 5,
+        });
+      return {
+        ...prev,
+        [sessionId]: updater(current),
+      };
+    });
+  }, [adminSessions]);
+
+  const saveSessionStrategyControls = useCallback(async (sessionId: string) => {
+    const form = strategyFormBySession[sessionId];
+    if (!form) return;
+
+    setSavingStrategySessionId(sessionId);
+    try {
+      await fetch(`/api/sessions/${sessionId}/strategy-controls`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          enabledStrategies: form.enabledStrategies,
+          activeStrategy: form.activeStrategy,
+          queuedStrategy: form.queuedStrategy,
+          rotationIntervalMinutes: form.rotationIntervalMinutes,
+          autoRotationEnabled: form.autoRotationEnabled,
+          momentum: {
+            lookbackSamples: form.momentumLookbackSamples,
+            thresholdBps: form.momentumThresholdBps,
+            edgeSafetyBufferBps: form.momentumEdgeSafetyBufferBps,
+          },
+        }),
+      });
+
+      await Promise.all([
+        loadAdminSessions(),
+        fetchSessionHealth(),
+      ]);
+    } finally {
+      setSavingStrategySessionId(null);
+    }
+  }, [fetchSessionHealth, loadAdminSessions, strategyFormBySession]);
 
   useEffect(() => {
     if (tab !== 'rate-limits') return;
@@ -1133,6 +1960,20 @@ export default function Home() {
     };
   }, [tab, fetchSessionHealth, loadAdminSessions]);
 
+  useEffect(() => {
+    if (!gateUnlocked) return;
+    const refresh = setTimeout(() => {
+      void fetchTokenUniverse();
+    }, 0);
+    const t = setInterval(() => {
+      void fetchTokenUniverse();
+    }, 10000);
+    return () => {
+      clearTimeout(refresh);
+      clearInterval(t);
+    };
+  }, [gateUnlocked, fetchTokenUniverse]);
+
   const handleForceStopSession = useCallback(async (sessionId: string) => {
     setForceStoppingSessionId(sessionId);
     try {
@@ -1152,19 +1993,98 @@ export default function Home() {
     const days = (new Date(u.expiry_date).getTime() - nowMs) / 86400000;
     return days >= 0 && days <= 30;
   });
+  const licensedUsersCount = users.filter(u => u.access_enabled && !isExpired(u.expiry_date)).length;
+  const activelyTradingCount = activeSessions.size;
+  const idleUsersCount = Math.max(0, users.length - activelyTradingCount);
+
+  const heliusFleetRps = rlData?.helius?.plan?.fleetTarget?.rpcRps ?? 180;
+  const heliusFleetDas = rlData?.helius?.plan?.fleetTarget?.dasRps ?? 45;
+  const heliusProviderRps = rlData?.helius?.plan?.providerCap?.rpcRps ?? 200;
+  const heliusProviderDas = rlData?.helius?.plan?.providerCap?.dasRps ?? 50;
+  const heliusSenderTps = rlData?.helius?.plan?.fleetTarget?.senderTps ?? 45;
+  const heliusMonthlyCredits = rlData?.helius?.plan?.monthlyCredits ?? 100_000_000;
+
+  const jupiterFleetRps = rlData?.jupiter?.plan?.fleetTarget?.generalRps ?? 135;
+  const jupiterProviderRps = rlData?.jupiter?.plan?.providerCap?.generalRps ?? 150;
+  const jupiterExecuteRps = rlData?.jupiter?.plan?.providerCap?.executeRps ?? 100;
+  const jupiterMonthlyBudget = rlData?.jupiter?.plan?.monthlyRequestsBudget ?? 500_000_000;
 
   async function handleCreateUser(e: React.FormEvent) {
     e.preventDefault();
     setFormBusy(true);
-    await fetch('/api/users', {
-      method: 'POST',
+    const editing = editingUser !== null;
+    await fetch(editing ? `/api/users/${editingUser.id}` : '/api/users', {
+      method: editing ? 'PATCH' : 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(form),
+      body: JSON.stringify({
+        ...form,
+        maxWalletUsd: Number(form.maxWalletUsd),
+        groupId: form.groupId || null,
+        refreshExpiry: editing,
+      }),
     });
     setShowModal(false);
-    setForm({ username: '', walletAddress: '', duration: '1month' });
+    setEditingUser(null);
+    setForm({ username: '', walletAddress: '', duration: '1month', maxWalletUsd: '10000', groupId: '' });
     setFormBusy(false);
     void loadUsers();
+  }
+
+  async function handleCreateOrUpdateGroup(e: React.FormEvent) {
+    e.preventDefault();
+    setFormBusy(true);
+    const existingUserIds = groupForm.existingUserId ? [groupForm.existingUserId] : [];
+    const newUsers = groupForm.newUsername && groupForm.newWalletAddress ? [{
+      username: groupForm.newUsername,
+      walletAddress: groupForm.newWalletAddress,
+      duration: groupForm.newDuration,
+      maxWalletUsd: Number(groupForm.newMaxWalletUsd),
+    }] : [];
+    await fetch(editingGroup ? `/api/user-groups/${editingGroup.id}` : '/api/user-groups', {
+      method: editingGroup ? 'PATCH' : 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(editingGroup ? {
+        name: groupForm.name,
+        botLimit: Number(groupForm.botLimit),
+        addUserIds: existingUserIds,
+      } : {
+        name: groupForm.name,
+        botLimit: Number(groupForm.botLimit),
+        existingUserIds,
+        newUsers,
+      }),
+    });
+    setShowGroupModal(false);
+    setEditingGroup(null);
+    setGroupForm({ name: '', botLimit: '1', existingUserId: '', newUsername: '', newWalletAddress: '', newDuration: '1month', newMaxWalletUsd: '10000' });
+    setFormBusy(false);
+    void loadUsers();
+  }
+
+  function openEditUser(user: User) {
+    setEditingUser(user);
+    setForm({
+      username: user.username,
+      walletAddress: user.wallet_address,
+      duration: user.duration ?? '1month',
+      maxWalletUsd: String(user.max_wallet_usd ?? 10000),
+      groupId: user.group_id ?? '',
+    });
+    setShowModal(true);
+  }
+
+  function openGroupModal(group?: UserGroup) {
+    setEditingGroup(group ?? null);
+    setGroupForm({
+      name: group?.name ?? '',
+      botLimit: String(group?.bot_limit ?? 1),
+      existingUserId: '',
+      newUsername: '',
+      newWalletAddress: '',
+      newDuration: '1month',
+      newMaxWalletUsd: '10000',
+    });
+    setShowGroupModal(true);
   }
 
   async function handleAssignLicense(id: string) {
@@ -1234,6 +2154,12 @@ export default function Home() {
           >
             + Add User
           </button>
+          <button
+            onClick={() => openGroupModal()}
+            className="bg-violet-600 hover:bg-violet-500 text-white text-sm font-medium px-4 py-2 rounded-lg transition-colors"
+          >
+            + Add to Group
+          </button>
         </div>
       </header>
 
@@ -1243,7 +2169,9 @@ export default function Home() {
           {([
             { id: 'overview',    label: 'Overview' },
             { id: 'users',       label: 'Users' },
+            { id: 'user-groups', label: 'Groups' },
             { id: 'session-health', label: 'Session Health' },
+            { id: 'token-universe', label: 'Token Universe' },
             { id: 'rate-limits', label: 'Rate Limits' },
           ] as { id: Tab; label: string }[]).map(t => (
             <button
@@ -1272,12 +2200,14 @@ export default function Home() {
               control={runtimeControl}
               updating={runtimeControlUpdating || runtimeControlLoading}
               onSelect={updateRuntimeControl}
+              onAuto={resumeRuntimeAuto}
+              onToggleEntries={toggleRuntimeEntries}
             />
 
             <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
               <StatCard label="Total Users"      value={users.length} />
-              <StatCard label="Active Licenses"  value={users.filter(u => u.access_enabled && !isExpired(u.expiry_date)).length} sub="trading enabled" />
-              <StatCard label="Disabled"         value={users.filter(u => !u.access_enabled).length} sub="view-only access" />
+              <StatCard label="Licensed"         value={licensedUsersCount} sub="entitled users" />
+              <StatCard label="Idle"             value={idleUsersCount} sub="not currently trading" />
               <StatCard label="Expiring Soon"    value={expiringSoonUsers.length} sub="within 30 days" />
             </div>
 
@@ -1319,8 +2249,8 @@ export default function Home() {
               <>
                 <div className="flex items-center gap-4 mb-4">
                   <span className="text-xs text-gray-600">{users.length} users</span>
-                  <span className="text-xs text-emerald-500 font-medium">{users.filter(u => u.access_enabled && !isExpired(u.expiry_date)).length} live</span>
-                  <span className="text-xs text-gray-700">{users.filter(u => !u.access_enabled).length} idle</span>
+                  <span className="text-xs text-emerald-500 font-medium">{licensedUsersCount} licensed</span>
+                  <span className="text-xs text-gray-700">{idleUsersCount} idle</span>
                 </div>
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
                   {users.map((u) => (
@@ -1330,6 +2260,7 @@ export default function Home() {
                       isLive={activeSessions.has(u.id)}
                       onToggle={handleToggleAccess}
                       onAssign={handleAssignLicense}
+                      onEdit={openEditUser}
                       onDelete={handleDelete}
                       assigning={assigning}
                       toggling={toggling}
@@ -1337,6 +2268,64 @@ export default function Home() {
                   ))}
                 </div>
               </>
+            )}
+          </div>
+        )}
+
+        {/* User Groups Tab */}
+        {tab === 'user-groups' && (
+          <div className="space-y-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm font-medium text-white">User groups</p>
+                <p className="text-xs text-gray-600 mt-0.5">Segment customers by group name and bot allocation.</p>
+              </div>
+              <button
+                onClick={() => openGroupModal()}
+                className="bg-violet-600 hover:bg-violet-500 text-white text-sm font-medium px-4 py-2 rounded-lg transition-colors"
+              >
+                + Add to Group
+              </button>
+            </div>
+            {groups.length === 0 ? (
+              <div className="py-20 text-center text-gray-600 text-sm">No groups yet — create one to organize users.</div>
+            ) : (
+              <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4">
+                {groups.map(group => {
+                  const members = users.filter(u => u.group_id === group.id);
+                  return (
+                    <div key={group.id} className="bg-gray-900/80 border border-gray-800 rounded-xl p-4">
+                      <div className="flex items-start justify-between gap-3">
+                        <div>
+                          <h3 className="text-white font-semibold">{group.name}</h3>
+                          <p className="text-xs text-gray-600 mt-1">{group.member_count} users · {group.bot_limit} bots allocated</p>
+                        </div>
+                        <button
+                          onClick={() => openGroupModal(group)}
+                          className="text-xs border border-gray-700 hover:border-violet-400 text-gray-400 hover:text-violet-200 px-3 py-1.5 rounded-md transition-colors"
+                        >
+                          Edit
+                        </button>
+                      </div>
+                      <div className="mt-4 space-y-2">
+                        {members.length === 0 ? (
+                          <p className="text-xs text-gray-700 italic">No users assigned yet.</p>
+                        ) : members.map(member => (
+                          <div key={member.id} className="flex items-center justify-between rounded-lg bg-gray-950/60 border border-gray-800/70 px-3 py-2">
+                            <div>
+                              <p className="text-sm text-white">{member.username}</p>
+                              <p className="text-[10px] text-gray-600 font-mono">{shortWallet(member.wallet_address)}</p>
+                            </div>
+                            <span className={member.access_enabled && !isExpired(member.expiry_date) ? 'text-[10px] text-emerald-400' : 'text-[10px] text-gray-600'}>
+                              {member.access_enabled && !isExpired(member.expiry_date) ? 'licensed' : 'idle'}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
             )}
           </div>
         )}
@@ -1361,6 +2350,7 @@ export default function Home() {
             {rlLoading && !rlData ? (
               <div className="py-16 text-center text-gray-600 text-sm">Running connection tests…</div>
             ) : (
+              <>
               <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
 
                 {/* ─ Helius ─ */}
@@ -1368,7 +2358,7 @@ export default function Home() {
                   <div className="flex items-center justify-between mb-1">
                     <div>
                       <p className="text-sm font-semibold text-white">Helius</p>
-                      <p className="text-[10px] text-gray-600">Solana RPC · 50 req/s</p>
+                      <p className="text-[10px] text-gray-600">Solana RPC · target {heliusFleetRps} rps (cap {heliusProviderRps} rps)</p>
                     </div>
                     <span className={`w-2 h-2 rounded-full shrink-0 ${rlData?.helius?.connected ? 'bg-emerald-500' : rlData ? 'bg-red-500' : 'bg-gray-700'}`} />
                   </div>
@@ -1378,7 +2368,7 @@ export default function Home() {
                         value={rlData?.helius?.latencyMs ?? null}
                         max={500}
                         centerLabel={`${rlData?.helius?.latencyMs}ms`}
-                        limitLabel="50 req/s RPC · 10 DAS"
+                        limitLabel={`${heliusFleetRps} rps target · ${heliusFleetDas} DAS`}
                         ok={rlData?.helius ? (rlData.helius.connected ?? null) : null}
                       />
                     </div>
@@ -1386,9 +2376,9 @@ export default function Home() {
                   {rlData?.helius?.error && <p className="text-xs text-red-400 mb-2">{String(rlData.helius.error)}</p>}
                   <div className="space-y-1.5 border-t border-gray-800 pt-3">
                     {rlData?.helius?.blockHeight != null && <RlRow label="Block Height" value={Number(rlData.helius.blockHeight).toLocaleString()} />}
-                    <RlRow label="sendTransaction" value="5 / sec" />
-                    <RlRow label="WebSocket"       value="150 conns · 1,000 subs" />
-                    <RlRow label="Monthly Credits" value="10M" />
+                    <RlRow label="sendTransaction target" value={`${heliusSenderTps} / sec`} />
+                    <RlRow label="Provider cap (RPC / DAS)" value={`${heliusProviderRps} / ${heliusProviderDas}`} />
+                    <RlRow label="Monthly Credits" value={Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 }).format(heliusMonthlyCredits)} />
                   </div>
                 </div>
 
@@ -1397,7 +2387,7 @@ export default function Home() {
                   <div className="flex items-center justify-between mb-1">
                     <div>
                       <p className="text-sm font-semibold text-white">Jupiter</p>
-                      <p className="text-[10px] text-gray-600">Swap API v2 · 10 req/s</p>
+                      <p className="text-[10px] text-gray-600">Swap API v2 · target {jupiterFleetRps} rps (cap {jupiterProviderRps} rps)</p>
                     </div>
                     <span className={`w-2 h-2 rounded-full shrink-0 ${rlData?.jupiter?.connected ? 'bg-emerald-500' : rlData ? 'bg-red-500' : 'bg-gray-700'}`} />
                   </div>
@@ -1407,7 +2397,7 @@ export default function Home() {
                         value={rlData?.jupiter?.latencyMs ?? null}
                         max={1000}
                         centerLabel={`${rlData?.jupiter?.latencyMs}ms`}
-                        limitLabel="10 req/s · Developer"
+                        limitLabel={`${jupiterFleetRps} rps target · ${jupiterProviderRps} cap`}
                         ok={rlData?.jupiter ? (rlData.jupiter.connected ?? null) : null}
                       />
                     </div>
@@ -1417,7 +2407,8 @@ export default function Home() {
                     {rlData?.jupiter?.outUsdc        != null && <RlRow label="SOL→USDC (0.001)" value={`${rlData.jupiter.outUsdc} USDC`} />}
                     {rlData?.jupiter?.priceImpactPct != null && <RlRow label="Price Impact"    value={`${rlData.jupiter.priceImpactPct}%`} />}
                     {rlData?.jupiter?.router         != null && <RlRow label="Router"          value={String(rlData.jupiter.router)} />}
-                    <RlRow label="/execute limit" value="100 RPS" />
+                    <RlRow label="/execute cap" value={`${jupiterExecuteRps} RPS`} />
+                    <RlRow label="Monthly Budget" value={Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 }).format(jupiterMonthlyBudget)} />
                   </div>
                 </div>
 
@@ -1453,6 +2444,12 @@ export default function Home() {
                 </div>
 
               </div>
+
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                <BudgetPressureCard title="Helius Monthly Credits" budget={rlData?.providerBudgets?.budgets?.['helius-credits']} />
+                <BudgetPressureCard title="Jupiter Monthly Requests" budget={rlData?.providerBudgets?.budgets?.['jupiter-requests']} />
+              </div>
+              </>
             )}
           </div>
         )}
@@ -1479,13 +2476,50 @@ export default function Home() {
             ) : sessionHealth && (
               <>
                 <div className="grid grid-cols-2 gap-4 xl:grid-cols-6">
-                  <StatCard label="Live Users" value={sessionHealth.summary.liveUsers} sub="active or starting" />
+                  <StatCard label="Trading Users" value={sessionHealth.summary.liveUsers} sub="active or starting" />
                   <StatCard label="Active Sessions" value={sessionHealth.summary.activeSessions} sub="currently trading" />
                   <StatCard label="Ready / Starting" value={sessionHealth.summary.readyOrStartingSessions} sub="queued to run" />
                   <StatCard label="Stopping" value={sessionHealth.summary.stoppingSessions} sub="return flow pending" />
                   <StatCard label="Needs Attention" value={sessionHealth.summary.attentionCount} sub="stale active + stopping + errors" />
                   <StatCard label="Total Sessions" value={sessionHealth.summary.totalSessions} sub={new Date(sessionHealth.generatedAt).toLocaleTimeString('en-US')} />
                 </div>
+
+                <div className="bg-gray-900 border border-gray-800 rounded-xl p-5 space-y-4">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <p className="text-sm font-semibold text-white">Execution Queue</p>
+                      <p className="text-xs text-gray-600 mt-0.5">Durable worker queue pressure for throttled 350-bot execution claims.</p>
+                    </div>
+                    <span className={`rounded-full border px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.18em] ${sessionHealth.executionQueue.staleRunning > 0 ? 'border-red-900/60 bg-red-950/30 text-red-300' : sessionHealth.executionQueue.claimable > 25 ? 'border-yellow-900/60 bg-yellow-950/20 text-yellow-300' : 'border-emerald-900/40 bg-emerald-950/15 text-emerald-300'}`}>
+                      {sessionHealth.executionQueue.staleRunning > 0 ? 'stale locks' : sessionHealth.executionQueue.claimable > 25 ? 'backlog' : 'normal'}
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
+                    <StatCard label="Total Items" value={sessionHealth.executionQueue.total} sub="queued + running" />
+                    <StatCard label="Queued" value={sessionHealth.executionQueue.queued} sub="waiting for claim" />
+                    <StatCard label="Claimable" value={sessionHealth.executionQueue.claimable} sub="ready now" />
+                    <StatCard label="Running" value={sessionHealth.executionQueue.running} sub="worker locked" />
+                    <StatCard label="Stale Locks" value={sessionHealth.executionQueue.staleRunning} sub="will be reclaimed" />
+                    <StatCard label="Oldest Queue" value={sessionHealth.executionQueue.oldestQueuedAgeSeconds == null ? '—' : `${Math.floor(sessionHealth.executionQueue.oldestQueuedAgeSeconds)}s`} sub={sessionHealth.executionQueue.newestUpdatedAt ? `updated ${new Date(sessionHealth.executionQueue.newestUpdatedAt).toLocaleTimeString('en-US')}` : 'not initialized'} />
+                  </div>
+                  {sessionHealth.executionQueue.topReasons.length > 0 && (
+                    <div className="grid grid-cols-1 gap-2 md:grid-cols-2 xl:grid-cols-4">
+                      {sessionHealth.executionQueue.topReasons.map((item) => (
+                        <div key={`${item.status}:${item.reason}`} className="rounded-lg border border-gray-800 bg-gray-950/70 px-3 py-2">
+                          <div className="flex items-center justify-between gap-2">
+                            <p className="truncate text-[11px] font-medium text-gray-300">{item.reason}</p>
+                            <span className="text-sm font-semibold text-white">{item.count}</span>
+                          </div>
+                          <p className="mt-0.5 text-[10px] uppercase tracking-wider text-gray-600">{item.status}</p>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                <TradeDecisionPanel health={sessionHealth} />
+
+                <RecentTradesTable trades={sessionHealth.recentTrades} />
 
                 <div className="bg-gray-900 border border-gray-800 rounded-xl p-5 space-y-4">
                   <div>
@@ -1502,13 +2536,68 @@ export default function Home() {
                   </div>
                 </div>
 
+                <div className="bg-gray-900 border border-gray-800 rounded-xl p-5 space-y-4">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <p className="text-sm font-semibold text-white">Launch Risk Proof</p>
+                      <p className="text-xs text-gray-600 mt-0.5">Confirms the dynamic circuit breakers and fill-quality audit are visible before starting a frontend session.</p>
+                    </div>
+                    <span className={`rounded-full border px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.18em] ${sessionHealth.riskProof.recentBadFills > 0 || sessionHealth.riskProof.badFillStreakSessions > 0 || sessionHealth.riskProof.consecutiveLossSessions > 0 ? 'border-yellow-900/60 bg-yellow-950/20 text-yellow-300' : 'border-emerald-900/40 bg-emerald-950/15 text-emerald-300'}`}>
+                      {sessionHealth.riskProof.recentBadFills > 0 ? 'bad fills seen' : sessionHealth.riskProof.consecutiveLossSessions > 0 ? 'loss streaks seen' : 'risk clear'}
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
+                    <StatCard label="Daily Loss Sessions" value={sessionHealth.riskProof.dailyLossSessions} sub={`max ${formatSignedUsd(-sessionHealth.riskProof.maxDailyLossUsd)}`} />
+                    <StatCard label="Loss Streaks" value={sessionHealth.riskProof.consecutiveLossSessions} sub={`max ${sessionHealth.riskProof.maxConsecutiveLosses}`} />
+                    <StatCard label="Bad-Fill Streaks" value={sessionHealth.riskProof.badFillStreakSessions} sub={`max ${sessionHealth.riskProof.maxBadFillStreak}`} />
+                    <StatCard label="Recent Bad Fills" value={sessionHealth.riskProof.recentBadFills} sub="from latest audits" />
+                    <StatCard label="Audit Rows" value={sessionHealth.riskProof.recentAudits.length} sub="last execution audit" />
+                    <StatCard label="Launch Gate" value={sessionHealth.summary.attentionCount === 0 && sessionHealth.executionQueue.staleRunning === 0 && sessionHealth.riskProof.recentBadFills === 0 ? 'PASS' : 'CHECK'} sub="admin proof view" />
+                  </div>
+
+                  {sessionHealth.riskProof.recentAudits.length === 0 ? (
+                    <div className="rounded-lg border border-gray-800 bg-gray-950/70 px-4 py-4 text-xs text-gray-500">
+                      No confirmed execution audit rows yet. After the next confirmed swap, this panel will show expected vs actual output and bad-fill status.
+                    </div>
+                  ) : (
+                    <div className="max-h-72 overflow-auto rounded-lg border border-gray-800">
+                      <table className="w-full text-[11px]">
+                        <thead className="sticky top-0 z-10 bg-gray-950">
+                          <tr className="border-b border-gray-800 text-left text-[10px] uppercase tracking-wider text-gray-600">
+                            <th className="py-2 pr-3">User</th>
+                            <th className="py-2 pr-3">Session</th>
+                            <th className="py-2 pr-3">Direction</th>
+                            <th className="py-2 pr-3">Fill Delta</th>
+                            <th className="py-2 pr-3">Impact</th>
+                            <th className="py-2 pr-3">Bad Fill</th>
+                            <th className="py-2 pr-3">At</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {sessionHealth.riskProof.recentAudits.map((audit) => (
+                            <tr key={`${audit.sessionId}-${audit.at}`} className="border-b border-gray-800/50">
+                              <td className="py-2 pr-3 font-medium text-white">{audit.username}</td>
+                              <td className="py-2 pr-3 font-mono text-gray-400">{audit.sessionId.slice(0, 8)}</td>
+                              <td className="py-2 pr-3 text-gray-300">{audit.direction.replace(/_/g, ' ')}</td>
+                              <td className={`py-2 pr-3 ${audit.outputDeltaBps !== null && audit.outputDeltaBps < 0 ? 'text-yellow-300' : 'text-emerald-300'}`}>{audit.outputDeltaBps === null ? '—' : `${audit.outputDeltaBps} bps`}</td>
+                              <td className="py-2 pr-3 text-gray-300">{audit.priceImpactBps === null ? '—' : `${audit.priceImpactBps} bps`}</td>
+                              <td className={`py-2 pr-3 font-semibold ${audit.badFill ? 'text-red-300' : 'text-emerald-300'}`}>{audit.badFill ? 'YES' : 'no'}</td>
+                              <td className="py-2 pr-3 text-gray-500">{formatDateTime(audit.at)}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+
                 <SizingTable snapshots={sessionHealth.recentSizing} />
 
                 <div className="bg-gray-900 border border-gray-800 rounded-xl p-5 space-y-4">
                   <div className="flex items-center justify-between gap-3">
                     <div>
-                      <p className="text-sm font-semibold text-white">Live Session Control</p>
-                      <p className="text-xs text-gray-600 mt-0.5">Active and pending sessions with direct maintenance stop access.</p>
+                      <p className="text-sm font-semibold text-white">Session Stop Control</p>
+                      <p className="text-xs text-gray-600 mt-0.5">Compact per-session rows. Admin can only trigger maintenance stop.</p>
                     </div>
                     <button
                       onClick={() => void loadAdminSessions()}
@@ -1524,56 +2613,48 @@ export default function Home() {
                       No active or pending sessions to manage.
                     </div>
                   ) : (
-                    <div className="grid grid-cols-1 xl:grid-cols-2 gap-3">
-                      {adminSessions.map((session) => {
-                        const realizedPnl = getAdminSessionRealizedPnl(session);
-                        const positionLabel = getAdminSessionPositionLabel(session);
-                        const isStopping = session.status === 'stopping';
-
-                        return (
-                          <div key={session.id} className="rounded-lg border border-gray-800 bg-gray-950/70 px-4 py-4 space-y-3">
-                            <div className="flex items-start justify-between gap-3">
-                              <div>
-                                <p className="text-sm font-medium text-white">{session.username}</p>
-                                <p className="text-[11px] text-gray-600">{session.id.slice(0, 8)} · {session.status.replace(/_/g, ' ')}</p>
-                              </div>
-                              <button
-                                onClick={() => void handleForceStopSession(session.id)}
-                                disabled={isStopping || forceStoppingSessionId === session.id}
-                                className="rounded-md border border-red-700/50 bg-red-950/40 px-3 py-1.5 text-xs text-red-200 transition hover:bg-red-900/50 disabled:cursor-not-allowed disabled:opacity-40"
-                              >
-                                {forceStoppingSessionId === session.id ? 'Stopping…' : isStopping ? 'Stopping' : 'Force Stop'}
-                              </button>
-                            </div>
-
-                            <div className="grid grid-cols-2 gap-2">
-                              <SizingMetric label="Position" value={positionLabel} />
-                              <SizingMetric label="Balance" value={lamportsToSolString(getAdminSessionBalanceLamports(session))} />
-                              <SizingMetric label="Realized PnL" value={formatSignedUsd(realizedPnl)} />
-                              <SizingMetric label="Started" value={formatDateTime(session.started_at)} />
-                            </div>
-
-                            <div className="space-y-1 text-[11px] text-gray-500">
-                              <div className="flex items-center justify-between gap-3">
-                                <span>requested</span>
-                                <span className="text-gray-300">{formatDateTime(session.requested_at)}</span>
-                              </div>
-                              <div className="flex items-center justify-between gap-3">
-                                <span>session wallet</span>
-                                <span className="font-mono text-gray-300">{shortWallet(session.session_wallet)}</span>
-                              </div>
-                              <div className="flex items-center justify-between gap-3">
-                                <span>owner wallet</span>
-                                <span className="font-mono text-gray-300">{shortWallet(session.owner_wallet)}</span>
-                              </div>
-                              <div className="flex items-center justify-between gap-3">
-                                <span>stop reason</span>
-                                <span className="text-gray-300">{session.stop_reason ? session.stop_reason.replace(/_/g, ' ') : '—'}</span>
-                              </div>
-                            </div>
-                          </div>
-                        );
-                      })}
+                    <div className="max-h-155 overflow-auto rounded-lg border border-gray-800">
+                      <table className="w-full text-[11px]">
+                        <thead className="sticky top-0 z-10 bg-gray-950">
+                          <tr className="text-left text-[10px] uppercase tracking-wider text-gray-600 border-b border-gray-800">
+                            <th className="py-2 pr-3">User</th>
+                            <th className="py-2 pr-3">Session</th>
+                            <th className="py-2 pr-3">Status</th>
+                            <th className="py-2 pr-3">Health</th>
+                            <th className="py-2 pr-3">Position</th>
+                            <th className="py-2 pr-3">Balance</th>
+                            <th className="py-2 pr-3">Started</th>
+                            <th className="py-2 pr-3">Stop reason</th>
+                            <th className="py-2 pr-3 text-right">Action</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {adminSessions.map((session) => {
+                            const isStopping = session.status === 'stopping';
+                            return (
+                              <tr key={session.id} className="border-b border-gray-800/50">
+                                <td className="py-2 pr-3 text-white font-medium">{session.username}</td>
+                                <td className="py-2 pr-3 font-mono text-gray-400">{session.id.slice(0, 8)}</td>
+                                <td className="py-2 pr-3 text-gray-300">{session.status.replace(/_/g, ' ')}</td>
+                                <td className="py-2 pr-3 text-gray-300">{getAdminSessionHealthLabel(session)}</td>
+                                <td className="py-2 pr-3 text-gray-300">{getAdminSessionPositionLabel(session)}</td>
+                                <td className="py-2 pr-3 text-gray-300">{lamportsToSolString(getAdminSessionBalanceLamports(session))}</td>
+                                <td className="py-2 pr-3 text-gray-500">{formatDateTime(session.started_at)}</td>
+                                <td className="py-2 pr-3 text-gray-500">{session.stop_reason ? session.stop_reason.replace(/_/g, ' ') : '—'}</td>
+                                <td className="py-2 pr-3 text-right">
+                                  <button
+                                    onClick={() => void handleForceStopSession(session.id)}
+                                    disabled={isStopping || forceStoppingSessionId === session.id}
+                                    className="rounded-md border border-red-700/50 bg-red-950/40 px-2.5 py-1 text-[10px] text-red-200 transition hover:bg-red-900/50 disabled:cursor-not-allowed disabled:opacity-40"
+                                  >
+                                    {forceStoppingSessionId === session.id ? 'Stopping…' : isStopping ? 'Stopping' : 'Force Stop'}
+                                  </button>
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
                     </div>
                   )}
                 </div>
@@ -1608,16 +2689,236 @@ export default function Home() {
             )}
           </div>
         )}
+
+        {/* Token Universe Tab */}
+        {tab === 'token-universe' && (
+          <div className="space-y-6">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm font-medium text-white">Token Universe</p>
+                <p className="text-xs text-gray-600 mt-0.5">This controls what the bot is allowed to trade. Green/enabled means tradable; disabled rows are audit history only.</p>
+              </div>
+              <button
+                onClick={() => void fetchTokenUniverse()}
+                disabled={tokenUniverseLoading}
+                className="text-xs border border-gray-700 hover:border-gray-500 text-gray-400 hover:text-white px-3 py-1.5 rounded-md transition-colors disabled:opacity-40"
+              >
+                {tokenUniverseLoading ? 'Refreshing…' : '↻ Refresh'}
+              </button>
+            </div>
+
+            {tokenUniverseLoading && !tokenUniverse ? (
+              <div className="py-16 text-center text-gray-600 text-sm">Loading token universe…</div>
+            ) : tokenUniverse && (
+              <>
+                <div className="grid grid-cols-2 gap-4 xl:grid-cols-5">
+                  <StatCard label="Tradable Now" value={tokenUniverse.summary.enabledTokens} sub={`${tokenUniverse.summary.configuredTokens - tokenUniverse.summary.enabledTokens} disabled / audit only`} />
+                  <StatCard label="Held Right Now" value={tokenUniverse.summary.activelyHeldTokens} sub="open session positions" />
+                  <StatCard label="Used This Week" value={tokenUniverse.summary.tradedTokens7d} sub="tokens with trades" />
+                  <StatCard label="Route-Approved" value={tokenUniverse.admission.summary.admitted} sub={`${tokenUniverse.admission.summary.rejected} route/safety rejected`} />
+                  <StatCard label="Most Used" value={tokenUniverse.bestToken?.symbol ?? '—'} sub={tokenUniverse.bestToken ? `${tokenUniverse.bestToken.confirmedTradeCount7d} confirmed trades` : 'no confirmed trades'} />
+                </div>
+
+                <div className="rounded-xl border border-cyan-900/40 bg-cyan-950/10 p-4 text-xs text-cyan-100">
+                  <p className="font-semibold text-cyan-200">How to read this tab</p>
+                  <p className="mt-1 text-cyan-100/80">
+                    The bot only trades rows marked <span className="font-semibold text-emerald-300">enabled</span>. A token must come from Jupiter Token API v2, pass RogueZero safety filters, and/or pass route checks before it should be enabled. Disabled tokens stay visible so we can audit what was rejected instead of hiding history.
+                  </p>
+                </div>
+
+                <div className="grid grid-cols-1 gap-4 xl:grid-cols-3">
+                  <div className="bg-gray-900 border border-gray-800 rounded-xl p-5 space-y-3">
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <p className="text-sm font-semibold text-white">Where Tokens Come From</p>
+                        <p className="text-xs text-gray-600 mt-0.5">Jupiter Token API v2 lists are filtered before anything becomes tradable.</p>
+                      </div>
+                      <span className={[
+                        'rounded-full border px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.18em]',
+                        tokenUniverse.autoSort.status === 'applied'
+                          ? 'border-emerald-900/40 bg-emerald-950/15 text-emerald-300'
+                          : tokenUniverse.autoSort.status === 'skipped'
+                            ? 'border-yellow-900/40 bg-yellow-950/15 text-yellow-300'
+                            : 'border-gray-800 bg-gray-950/60 text-gray-400',
+                      ].join(' ')}>
+                        {tokenUniverse.autoSort.status}
+                      </span>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2 text-[11px]">
+                      <SizingMetric label="database table" value={tokenUniverse.autoSort.sourceTable ?? 'rz_token_universe'} />
+                      <SizingMetric label="last worker sort" value={formatDateTime(tokenUniverse.autoSort.lastRunAt)} />
+                      <SizingMetric label="tokens checked" value={String(tokenUniverse.autoSort.candidateCount)} />
+                      <SizingMetric label="worker enabled" value={String(tokenUniverse.autoSort.enabledCount)} />
+                    </div>
+                    {tokenUniverse.autoSort.reason && (
+                      <p className="text-xs text-yellow-300">{tokenUniverse.autoSort.reason}</p>
+                    )}
+                  </div>
+
+                  <div className="bg-gray-900 border border-gray-800 rounded-xl p-5 space-y-3">
+                    <div>
+                      <p className="text-sm font-semibold text-white">Safety + Route Checks</p>
+                      <p className="text-xs text-gray-600 mt-0.5">Shows whether candidates passed safety filters and USDC route checks.</p>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2 text-[11px]">
+                      <SizingMetric label="route rows checked" value={String(tokenUniverse.admission.summary.total)} />
+                      <SizingMetric label="last checked" value={formatDateTime(tokenUniverse.admission.summary.latestObservedAt)} />
+                      <SizingMetric label="currently disabled" value={String(tokenUniverse.summary.configuredTokens - tokenUniverse.summary.enabledTokens)} />
+                      <SizingMetric label="needs recovery" value={String(tokenUniverse.deadletter.openCount)} />
+                    </div>
+                    {tokenUniverse.admission.candidates.length > 0 && (
+                      <div className="flex flex-wrap gap-1.5 pt-1">
+                        {tokenUniverse.admission.candidates.slice(0, 8).map((candidate) => (
+                          <span
+                            key={`${candidate.status}:${candidate.mint}`}
+                            className={[
+                              'rounded-full border px-2 py-1 text-[10px]',
+                              candidate.status === 'admitted'
+                                ? 'border-emerald-900/40 bg-emerald-950/15 text-emerald-300'
+                                : 'border-red-900/40 bg-red-950/15 text-red-300',
+                            ].join(' ')}
+                          >
+                            {candidate.symbol} · {candidate.status}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="bg-gray-900 border border-gray-800 rounded-xl p-5 space-y-3">
+                    <div>
+                      <p className="text-sm font-semibold text-white">Currently Held</p>
+                      <p className="text-xs text-gray-600 mt-0.5">Tokens sitting in active session wallets right now.</p>
+                    </div>
+                    {tokenUniverse.activeTokens.length === 0 ? (
+                      <div className="rounded-lg border border-gray-800 bg-gray-950/70 px-3 py-3 text-sm text-gray-500">
+                        No active token exposure right now.
+                      </div>
+                    ) : (
+                      <div className="space-y-2">
+                        {tokenUniverse.activeTokens.slice(0, 8).map((token) => (
+                          <div key={token.mint} className="flex items-center justify-between gap-3 rounded-lg border border-gray-800 bg-gray-950/70 px-3 py-2 text-xs">
+                            <div>
+                              <div className="font-medium text-white">{token.symbol}</div>
+                              <div className="font-mono text-[10px] text-gray-500">{shortWallet(token.mint)}</div>
+                            </div>
+                            <span className="text-[10px] font-semibold uppercase tracking-[0.16em] text-emerald-300">
+                              {token.activeSessionCount} active
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+                <div className="bg-gray-900 border border-gray-800 rounded-xl p-5 space-y-3">
+                  <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+                    <div>
+                      <p className="text-sm font-semibold text-white">Tradable Tokens</p>
+                      <p className="text-xs text-gray-600 mt-0.5">This is the actual bot universe. Disabled/rejected rows are hidden below as audit history.</p>
+                    </div>
+                    <p className="text-[11px] text-gray-500">updated {formatDateTime(tokenUniverse.generatedAt)}</p>
+                  </div>
+
+                  {tokenUniverse.tokens.length === 0 ? (
+                    <div className="text-sm text-gray-500">No token universe rows found yet.</div>
+                  ) : (
+                    <div className="space-y-4">
+                      {tokenUniverse.tokens.filter((token) => token.enabled).length === 0 ? (
+                        <div className="rounded-lg border border-red-900/30 bg-red-950/20 px-4 py-4 text-sm text-red-300">
+                          No tradable tokens are enabled. The worker should not enter new positions until this is fixed.
+                        </div>
+                      ) : (
+                        <div className="max-h-96 overflow-auto rounded-lg border border-emerald-900/30">
+                          <table className="w-full text-[11px]">
+                            <thead className="sticky top-0 z-10 bg-gray-950">
+                              <tr className="text-left text-[10px] uppercase tracking-wider text-gray-600 border-b border-gray-800">
+                                <th className="py-2 pr-3">Token</th>
+                                <th className="py-2 pr-3">Why allowed</th>
+                                <th className="py-2 pr-3">Priority</th>
+                                <th className="py-2 pr-3">Trades (7d)</th>
+                                <th className="py-2 pr-3">Confirmed (7d)</th>
+                                <th className="py-2 pr-3">Active</th>
+                                <th className="py-2 pr-3">Last Traded</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {tokenUniverse.tokens.filter((token) => token.enabled).map((token) => (
+                                <tr key={token.mint} className="border-b border-gray-800/50">
+                                  <td className="py-2 pr-3">
+                                    <div className="text-white font-medium">{token.symbol}</div>
+                                    <div className="text-[10px] text-gray-500 font-mono">{shortWallet(token.mint)}</div>
+                                  </td>
+                                  <td className="py-2 pr-3 text-emerald-300">
+                                    {token.notes?.replace('admitted:', 'route-approved · ').replace('core-seed', 'core seed') ?? 'approved'}
+                                  </td>
+                                  <td className="py-2 pr-3 text-gray-300">{token.priority}</td>
+                                  <td className="py-2 pr-3 text-gray-300">{token.tradeCount7d}</td>
+                                  <td className="py-2 pr-3 text-gray-300">{token.confirmedTradeCount7d}</td>
+                                  <td className="py-2 pr-3">
+                                    <span className={token.currentlyActive ? 'text-emerald-300' : 'text-gray-500'}>{token.currentlyActive ? 'active' : '—'}</span>
+                                  </td>
+                                  <td className="py-2 pr-3 text-gray-500">{formatDateTime(token.lastTradedAt)}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      )}
+
+                      <details className="rounded-lg border border-gray-800 bg-gray-950/50">
+                        <summary className="cursor-pointer px-3 py-2 text-xs text-gray-400 hover:text-white">
+                          Audit-only disabled/rejected rows ({tokenUniverse.tokens.filter((token) => !token.enabled).length})
+                        </summary>
+                        <div className="max-h-155 overflow-auto border-t border-gray-800">
+                          <table className="w-full text-[11px]">
+                            <thead className="sticky top-0 z-10 bg-gray-950">
+                              <tr className="text-left text-[10px] uppercase tracking-wider text-gray-600 border-b border-gray-800">
+                                <th className="py-2 pr-3">Token</th>
+                                <th className="py-2 pr-3">Status</th>
+                                <th className="py-2 pr-3">Priority</th>
+                                <th className="py-2 pr-3">Reason / source</th>
+                                <th className="py-2 pr-3">Trades (7d)</th>
+                                <th className="py-2 pr-3">Last Traded</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {tokenUniverse.tokens.filter((token) => !token.enabled).map((token) => (
+                                <tr key={token.mint} className="border-b border-gray-800/50">
+                                  <td className="py-2 pr-3">
+                                    <div className="text-white font-medium">{token.symbol}</div>
+                                    <div className="text-[10px] text-gray-500 font-mono">{shortWallet(token.mint)}</div>
+                                  </td>
+                                  <td className="py-2 pr-3 text-gray-500">audit only</td>
+                                  <td className="py-2 pr-3 text-gray-300">{token.priority}</td>
+                                  <td className="py-2 pr-3 text-gray-500">
+                                    {token.notes?.replace('jupiter-token-api-v2:', 'Jupiter v2 · ') ?? 'disabled / legacy'}
+                                  </td>
+                                  <td className="py-2 pr-3 text-gray-300">{token.tradeCount7d}</td>
+                                  <td className="py-2 pr-3 text-gray-500">{formatDateTime(token.lastTradedAt)}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </details>
+                    </div>
+                  )}
+                </div>
+              </>
+            )}
+          </div>
+        )}
       </main>
 
-      {/* ── Add User Modal ── */}
+      {/* ── Add/Edit User Modal ── */}
       {showModal && (
         <div
           className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 px-4"
           onClick={(e) => { if (e.target === e.currentTarget) setShowModal(false); }}
         >
           <div className="bg-gray-900 border border-gray-700 rounded-xl p-7 w-full max-w-md shadow-2xl">
-            <h2 className="text-base font-semibold text-white mb-5">Add New User</h2>
+            <h2 className="text-base font-semibold text-white mb-5">{editingUser ? 'Edit User' : 'Add New User'}</h2>
             <form onSubmit={(e) => void handleCreateUser(e)} className="space-y-4">
               <div>
                 <label className="block text-xs text-gray-400 mb-1.5">Username</label>
@@ -1661,10 +2962,36 @@ export default function Home() {
                   ))}
                 </div>
               </div>
+              <div>
+                <label className="block text-xs text-gray-400 mb-1.5">Max Wallet USD</label>
+                <input
+                  type="number"
+                  min="1"
+                  step="1"
+                  required
+                  value={form.maxWalletUsd}
+                  onChange={e => setForm(f => ({ ...f, maxWalletUsd: e.target.value }))}
+                  placeholder="10000"
+                  className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2.5 text-sm text-white placeholder-gray-600 focus:outline-none focus:border-emerald-500 transition-colors"
+                />
+              </div>
+              <div>
+                <label className="block text-xs text-gray-400 mb-1.5">User Group</label>
+                <select
+                  value={form.groupId}
+                  onChange={e => setForm(f => ({ ...f, groupId: e.target.value }))}
+                  className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2.5 text-sm text-white focus:outline-none focus:border-violet-500 transition-colors"
+                >
+                  <option value="">No group</option>
+                  {groups.map(group => (
+                    <option key={group.id} value={group.id}>{group.name} · {group.bot_limit} bots</option>
+                  ))}
+                </select>
+              </div>
               <div className="flex gap-3 pt-1">
                 <button
                   type="button"
-                  onClick={() => setShowModal(false)}
+                  onClick={() => { setShowModal(false); setEditingUser(null); }}
                   className="flex-1 bg-gray-800 hover:bg-gray-700 text-gray-300 text-sm font-medium py-2.5 rounded-lg transition-colors"
                 >
                   Cancel
@@ -1674,7 +3001,112 @@ export default function Home() {
                   disabled={formBusy}
                   className="flex-1 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white text-sm font-medium py-2.5 rounded-lg transition-colors"
                 >
-                  {formBusy ? 'Creating…' : 'Create User'}
+                  {formBusy ? 'Saving…' : editingUser ? 'Save User' : 'Create User'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* ── Add/Edit Group Modal ── */}
+      {showGroupModal && (
+        <div
+          className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 px-4"
+          onClick={(e) => { if (e.target === e.currentTarget) setShowGroupModal(false); }}
+        >
+          <div className="bg-gray-900 border border-gray-700 rounded-xl p-7 w-full max-w-lg shadow-2xl">
+            <h2 className="text-base font-semibold text-white mb-5">{editingGroup ? 'Edit Group' : 'Add to Group'}</h2>
+            <form onSubmit={(e) => void handleCreateOrUpdateGroup(e)} className="space-y-4">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs text-gray-400 mb-1.5">Group Name</label>
+                  <input
+                    type="text"
+                    required
+                    value={groupForm.name}
+                    onChange={e => setGroupForm(f => ({ ...f, name: e.target.value }))}
+                    placeholder="e.g. Alpha Cohort"
+                    className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2.5 text-sm text-white placeholder-gray-600 focus:outline-none focus:border-violet-500 transition-colors"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs text-gray-400 mb-1.5">Number of Bots</label>
+                  <input
+                    type="number"
+                    min="1"
+                    step="1"
+                    required
+                    value={groupForm.botLimit}
+                    onChange={e => setGroupForm(f => ({ ...f, botLimit: e.target.value }))}
+                    className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2.5 text-sm text-white focus:outline-none focus:border-violet-500 transition-colors"
+                  />
+                </div>
+              </div>
+              <div>
+                <label className="block text-xs text-gray-400 mb-1.5">Add Existing User</label>
+                <select
+                  value={groupForm.existingUserId}
+                  onChange={e => setGroupForm(f => ({ ...f, existingUserId: e.target.value }))}
+                  className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2.5 text-sm text-white focus:outline-none focus:border-violet-500 transition-colors"
+                >
+                  <option value="">Choose a user...</option>
+                  {users.filter(u => !editingGroup || u.group_id !== editingGroup.id).map(user => (
+                    <option key={user.id} value={user.id}>{user.username} {user.group_name ? `(currently ${user.group_name})` : ''}</option>
+                  ))}
+                </select>
+              </div>
+              {!editingGroup && (
+                <div className="rounded-lg border border-gray-800 bg-gray-950/50 p-3 space-y-3">
+                  <p className="text-xs text-gray-500">Or create a new user directly inside this group.</p>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <input
+                      type="text"
+                      value={groupForm.newUsername}
+                      onChange={e => setGroupForm(f => ({ ...f, newUsername: e.target.value }))}
+                      placeholder="Username"
+                      className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2.5 text-sm text-white placeholder-gray-600 focus:outline-none focus:border-violet-500 transition-colors"
+                    />
+                    <input
+                      type="text"
+                      value={groupForm.newWalletAddress}
+                      onChange={e => setGroupForm(f => ({ ...f, newWalletAddress: e.target.value }))}
+                      placeholder="Wallet address"
+                      className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2.5 text-sm text-white placeholder-gray-600 focus:outline-none focus:border-violet-500 transition-colors font-mono"
+                    />
+                    <select
+                      value={groupForm.newDuration}
+                      onChange={e => setGroupForm(f => ({ ...f, newDuration: e.target.value }))}
+                      className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2.5 text-sm text-white focus:outline-none focus:border-violet-500 transition-colors"
+                    >
+                      {DURATIONS.map(opt => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
+                    </select>
+                    <input
+                      type="number"
+                      min="1"
+                      step="1"
+                      value={groupForm.newMaxWalletUsd}
+                      onChange={e => setGroupForm(f => ({ ...f, newMaxWalletUsd: e.target.value }))}
+                      placeholder="Max wallet USD"
+                      className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2.5 text-sm text-white placeholder-gray-600 focus:outline-none focus:border-violet-500 transition-colors"
+                    />
+                  </div>
+                </div>
+              )}
+              <div className="flex gap-3 pt-1">
+                <button
+                  type="button"
+                  onClick={() => { setShowGroupModal(false); setEditingGroup(null); }}
+                  className="flex-1 bg-gray-800 hover:bg-gray-700 text-gray-300 text-sm font-medium py-2.5 rounded-lg transition-colors"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={formBusy}
+                  className="flex-1 bg-violet-600 hover:bg-violet-500 disabled:opacity-50 text-white text-sm font-medium py-2.5 rounded-lg transition-colors"
+                >
+                  {formBusy ? 'Saving…' : editingGroup ? 'Save Group' : 'Create Group'}
                 </button>
               </div>
             </form>

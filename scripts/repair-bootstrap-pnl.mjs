@@ -10,9 +10,9 @@ const apply = process.argv.includes('--apply');
 const limitArg = process.argv.find((arg) => arg.startsWith('--limit='));
 const limit = limitArg ? Number(limitArg.slice('--limit='.length)) : null;
 
-const databaseUrl = process.env.DATABASE_PRIVATE_URL || process.env.DATABASE_URL;
+const databaseUrl = process.env.DATABASE_PRIVATE_URL?.trim();
 if (!databaseUrl) {
-  throw new Error('DATABASE_PRIVATE_URL or DATABASE_URL is required');
+  throw new Error('DATABASE_PRIVATE_URL is required');
 }
 
 const parsed = new URL(databaseUrl);

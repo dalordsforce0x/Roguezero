@@ -1,4 +1,8 @@
-﻿import { createDecipheriv } from 'node:crypto';
+﻿import { createDecipheriv, randomUUID } from 'node:crypto';
+import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import dotenv from 'dotenv';
 import pg from 'pg';
 import bs58 from 'bs58';
@@ -25,12 +29,12 @@ import {
   type Account as SplTokenAccount,
   type Mint as SplTokenMint,
 } from '@solana/spl-token';
-import { createSharedTokenBucket, getExponentialBackoffDelayMs } from '@roguezero/provider-governor';
+import { createMonthlyBudgetGovernor, createSharedTokenBucket, getExponentialBackoffDelayMs } from '@roguezero/provider-governor';
 import {
-  computeSolEntryCapLamports,
+  createRoundRobinKeySelector,
   computeTradeAmountLamports,
   getDatabaseConnectionUrl,
-  getHeliusRpcUrl,
+  getHeliusRpcUrls,
   getJupiterPriceConfig,
   getPythPriceConfig,
   getRuntimeSpeedProfile,
@@ -50,25 +54,41 @@ import {
   type WorkerSignalPolicy,
 } from '@roguezero/runtime-config';
 import {
+  DEFAULT_ROTATION_INTERVAL_MINUTES,
+  buildFlatSessionPositionState,
   mergeSessionServiceControl,
+  summarizePositionsState,
   type Session,
+  type SessionPositionState,
+  type SessionPositionsState,
   type SessionServiceControlPatch,
 } from '@roguezero/session-schema';
 import {
   computeFullExitAmountAtomic,
+  computeGasRefillPlan,
   resolveTradeGateAssessment,
+  shouldApplyPostExitSolReserveProtection,
   shouldForceExitExecution,
+  type TradeDirection,
   type TradeGateAssessment,
 } from './tradeExecutionPolicy.js';
+import {
+  computeSessionSolSweepLamports,
+  getResidualTokenAccounts,
+  hasResidualWalletState,
+  isBrickedResidualWallet,
+} from './stopRecoveryPolicy.js';
 import {
   DEFAULT_BOLLINGER_CONFIG,
   DEFAULT_SUPERTREND_CONFIG,
   computeBollingerSignal,
+  computeAtrFromTape,
   computeSupertrendSignal,
-  recommendStrategy,
+  getNextStrategyInSequence,
+  getStrategyScanOrder,
   type BollingerConfig,
-  type SignalDecision,
   type PriceSample,
+  type StrategyKey,
   type SupertrendConfig,
 } from './strategies.js';
 
@@ -86,28 +106,48 @@ const POLL_MS  = Number(process.env.WORKER_POLL_INTERVAL_MS ?? 5000);
 const MIN_LOOP_MS = Number(process.env.WORKER_MIN_LOOP_INTERVAL_MS ?? 250);
 const LOOP_JITTER_RATIO = Number(process.env.WORKER_LOOP_JITTER_RATIO ?? 0.1);
 const FUNDING_POLL_FALLBACK_MS = Number(process.env.WORKER_FUNDING_POLL_FALLBACK_MS ?? 60000);
+// Active session-wallet balance is served from a subscription-backed cache, revalidated by
+// RPC at most this often. onAccountChange keeps it fresh between revalidations; the TTL is a
+// safety net against websocket gaps. Cuts the per-cycle pre-trade balance RPC for 350 bots.
+const BALANCE_CACHE_TTL_MS = Number(process.env.WORKER_BALANCE_CACHE_TTL_MS ?? 60000);
+const AWAITING_FUNDING_TIMEOUT_MINUTES = Number(process.env.WORKER_AWAITING_FUNDING_TIMEOUT_MINUTES ?? 120);
 const POST_SUBMIT_RECONCILE_GRACE_MS = Number(process.env.WORKER_POST_SUBMIT_RECONCILE_GRACE_MS ?? 10000);
-const STALE_SESSION_MINUTES = Number(process.env.WORKER_STALE_SESSION_MINUTES ?? 30);
-const JUPITER_GENERAL_RPS = Number(process.env.JUPITER_GENERAL_RPS ?? 8);
-const JUPITER_GENERAL_BURST = Number(process.env.JUPITER_GENERAL_BURST ?? JUPITER_GENERAL_RPS);
-const HELIUS_RPC_RPS = Number(process.env.HELIUS_RPC_RPS ?? 40);
-const HELIUS_RPC_BURST = Number(process.env.HELIUS_RPC_BURST ?? Math.min(10, HELIUS_RPC_RPS));
+const STALE_SESSION_MINUTES = Number(process.env.WORKER_STALE_SESSION_MINUTES ?? 0);
+const EXECUTION_QUEUE_CLAIMS_PER_TICK = Number(process.env.WORKER_EXECUTION_QUEUE_CLAIMS_PER_TICK ?? 5);
+const EXECUTION_QUEUE_LOCK_MS = Number(process.env.WORKER_EXECUTION_QUEUE_LOCK_MS ?? 120000);
+// Shared DB-backed fleet buckets (same keys in worker + API). Defaults are the
+// real provider 90%-of-cap fleet ceilings for 350 bots:
+//   Jupiter Pro general: 150 RPS cap -> 135 RPS (90%)
+//   Helius Business RPC: 200 RPS cap -> 180 RPS (90%)
+const JUPITER_GENERAL_RPS = Number(process.env.JUPITER_GENERAL_RPS ?? 135);
+const JUPITER_GENERAL_BURST = Number(process.env.JUPITER_GENERAL_BURST ?? Math.min(20, JUPITER_GENERAL_RPS));
+const HELIUS_RPC_RPS = Number(process.env.HELIUS_RPC_RPS ?? 180);
+const HELIUS_RPC_BURST = Number(process.env.HELIUS_RPC_BURST ?? Math.min(20, HELIUS_RPC_RPS));
+const HELIUS_MONTHLY_CREDIT_LIMIT = Number(process.env.HELIUS_MONTHLY_CREDIT_LIMIT ?? 100_000_000);
+const HELIUS_MONTHLY_BUDGET_ENFORCE = process.env.HELIUS_MONTHLY_BUDGET_ENFORCE !== 'false';
+// Jupiter Pro yearly includes 6B credits/year (~500M/month equivalent).
+const JUPITER_MONTHLY_REQUEST_LIMIT = Number(process.env.JUPITER_MONTHLY_REQUEST_LIMIT ?? 500_000_000);
+const JUPITER_MONTHLY_BUDGET_ENFORCE = process.env.JUPITER_MONTHLY_BUDGET_ENFORCE === 'true';
 const DATABASE_QUERY_TIMEOUT_MS = Number(process.env.DATABASE_QUERY_TIMEOUT_MS ?? 15000);
 const DATABASE_STATEMENT_TIMEOUT_MS = Number(process.env.DATABASE_STATEMENT_TIMEOUT_MS ?? 12000);
 const DATABASE_LOCK_TIMEOUT_MS = Number(process.env.DATABASE_LOCK_TIMEOUT_MS ?? 5000);
 const DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS = Number(process.env.DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS ?? 10000);
+const DEPLOY_CANARY = process.env.DEPLOY_CANARY ?? 'rz-canary-2026-06-01-01';
 const fundingThresholds = getWorkerFundingThresholds(process.env);
 const sizingPolicy = getWorkerSizingPolicy(process.env);
 const pricePollPolicy: WorkerPricePollPolicy = getWorkerPricePollPolicy(process.env);
 const signalPolicy: WorkerSignalPolicy = getWorkerSignalPolicy(process.env);
 const positionExitPolicy: WorkerPositionExitPolicy = getWorkerPositionExitPolicy(process.env);
 let jupiterPriceConfig: JupiterPriceConfig | null = null;
+let jupiterPriceApiKeySelector: ReturnType<typeof createRoundRobinKeySelector> | null = null;
 let pythPriceConfig: PythPriceConfig | null = null;
 try {
   jupiterPriceConfig = getJupiterPriceConfig(process.env);
+  jupiterPriceApiKeySelector = createRoundRobinKeySelector(jupiterPriceConfig.apiKeys);
   pythPriceConfig = getPythPriceConfig(process.env);
 } catch (err) {
   console.warn('[worker] price feed config unavailable:', String(err));
+  jupiterPriceApiKeySelector = null;
 }
 
 // SOL mint address
@@ -121,18 +161,91 @@ const MAX_ROUTE_SETUP_LAMPORTS = fundingThresholds.maxRouteSetupLamports;
 const OPERATING_BUFFER_LAMPORTS = fundingThresholds.operatingBufferLamports;
 const TX_FEE_LAMPORTS = fundingThresholds.txFeeLamports;
 const MIN_TRADEABLE_LAMPORTS = fundingThresholds.minimumTradeableLamports;
+const FUNDING_READY_SLOP_LAMPORTS = Number(process.env.WORKER_FUNDING_READY_SLOP_LAMPORTS ?? 5_000);
 const MIN_SOL_OPERATING_RESERVE_LAMPORTS = TX_FEE_LAMPORTS + OPERATING_BUFFER_LAMPORTS;
 const MIN_USDC_ENTRY_ATOMIC = Number(process.env.WORKER_MIN_USDC_ENTRY_ATOMIC ?? 1_000_000);
-const MIN_ENTRY_SIGNAL_PERSISTENCE_SAMPLES = Number(process.env.WORKER_MIN_ENTRY_SIGNAL_PERSISTENCE_SAMPLES ?? 2);
+const MIN_USDC_POSITION_NOTIONAL_ATOMIC = Number(
+  process.env.WORKER_MIN_USDC_POSITION_NOTIONAL_ATOMIC ?? MIN_USDC_ENTRY_ATOMIC,
+);
+const SOL_FEE_RESERVE_LAMPORTS = Number(process.env.WORKER_SOL_FEE_RESERVE_LAMPORTS ?? MIN_SOL_OPERATING_RESERVE_LAMPORTS);
+// ── SOL gas keep-alive ───────────────────────────────────────────────────────
+// Every swap (including selling back to SOL) costs SOL for fees + tip + rent. If
+// a session's SOL fee reserve drains while it still holds USDC working capital,
+// the loop would otherwise stall (`insufficient_sol_fee_reserve`) or stop
+// (`depleted`) with money still in the wallet. The keep-alive converts a small
+// USDC slice back into SOL BEFORE the reserve is exhausted, so sessions keep
+// compounding instead of giving up.
+// Cost of a single refill swap (fee + route-setup rent) — also the hard cutoff
+// below which a refill swap can no longer be afforded.
+const GAS_REFILL_SWAP_COST_LAMPORTS = Number(
+  process.env.WORKER_GAS_REFILL_SWAP_COST_LAMPORTS
+  ?? (TX_FEE_LAMPORTS + MAX_ROUTE_SETUP_LAMPORTS),
+);
+// Trigger a refill once SOL falls to/below the operating reserve plus one swap
+// cost — i.e. low, but still affordable to act on.
+const GAS_REFILL_TRIGGER_LAMPORTS = Number(
+  process.env.WORKER_GAS_REFILL_TRIGGER_LAMPORTS
+  ?? (MIN_SOL_OPERATING_RESERVE_LAMPORTS + GAS_REFILL_SWAP_COST_LAMPORTS),
+);
+// Refill back up to a comfortable multi-swap buffer so we do not refill every loop.
+const GAS_REFILL_BUFFER_SWAPS = Number(process.env.WORKER_GAS_REFILL_BUFFER_SWAPS ?? 4);
+const GAS_REFILL_TARGET_LAMPORTS = Number(
+  process.env.WORKER_GAS_REFILL_TARGET_LAMPORTS
+  ?? (MIN_SOL_OPERATING_RESERVE_LAMPORTS + (GAS_REFILL_BUFFER_SWAPS * GAS_REFILL_SWAP_COST_LAMPORTS)),
+);
+// USDC kept untouched so a refill never strands trading capital below an entry.
+const GAS_REFILL_MIN_USDC_KEEP_ATOMIC = Number(process.env.WORKER_GAS_REFILL_MIN_USDC_KEEP_ATOMIC ?? 0);
+// Smallest USDC slice worth converting for a refill (default 0.20 USDC).
+const GAS_REFILL_MIN_USDC_ATOMIC = Number(process.env.WORKER_GAS_REFILL_MIN_USDC_ATOMIC ?? 200_000);
+const GAS_REFILL_SLIPPAGE_HEADROOM = Number(process.env.WORKER_GAS_REFILL_SLIPPAGE_HEADROOM ?? 1.02);
+const USDC_OPERATING_RESERVE_ATOMIC = Number(process.env.WORKER_USDC_OPERATING_RESERVE_ATOMIC ?? 0);
+const SOL_TO_USDC_CONVERSION_RESERVE_LAMPORTS = Math.max(
+  SOL_FEE_RESERVE_LAMPORTS,
+  MIN_SOL_OPERATING_RESERVE_LAMPORTS,
+) + (TX_FEE_LAMPORTS * 4) + (MAX_ROUTE_SETUP_LAMPORTS * 2);
+const MIN_ENTRY_SIGNAL_PERSISTENCE_SAMPLES = Number(process.env.WORKER_MIN_ENTRY_SIGNAL_PERSISTENCE_SAMPLES ?? 1);
 const MAX_QUOTE_PRICE_IMPACT_BPS = Number(process.env.WORKER_MAX_QUOTE_PRICE_IMPACT_BPS ?? 120);
 const WORKER_UNIVERSE_SCOUT_ENABLED = process.env.WORKER_UNIVERSE_SCOUT_ENABLED !== 'false';
-const WORKER_UNIVERSE_SCOUT_MAX_CANDIDATES = Number(process.env.WORKER_UNIVERSE_SCOUT_MAX_CANDIDATES ?? 6);
-const WORKER_UNIVERSE_SCOUT_MAX_SOL_PRICE_IMPACT_BPS = Number(process.env.WORKER_UNIVERSE_SCOUT_MAX_SOL_PRICE_IMPACT_BPS ?? 150);
-const WORKER_UNIVERSE_SCOUT_MIN_SOL_RANK = Number(process.env.WORKER_UNIVERSE_SCOUT_MIN_SOL_RANK ?? 2);
+const WORKER_UNIVERSE_SCOUT_MAX_CANDIDATES = Number(process.env.WORKER_UNIVERSE_SCOUT_MAX_CANDIDATES ?? 20);
+const WORKER_UNIVERSE_SCOUT_REQUIRE_PERSISTENT_BULLISH = process.env.WORKER_UNIVERSE_SCOUT_REQUIRE_PERSISTENT_BULLISH === 'true';
+const WORKER_UNIVERSE_SCOUT_ALLOW_ROUTED_FALLBACK = process.env.WORKER_UNIVERSE_SCOUT_ALLOW_ROUTED_FALLBACK !== 'false';
+const WORKER_ENTRY_CORE_UNIVERSE_ONLY = process.env.WORKER_ENTRY_CORE_UNIVERSE_ONLY === 'true';
+const WORKER_BLOCK_PUMP_MINT_ENTRIES = process.env.WORKER_BLOCK_PUMP_MINT_ENTRIES !== 'false';
+const WORKER_UNIVERSE_SCOUT_MAX_ENTRY_PRICE_IMPACT_BPS = Number(
+  process.env.WORKER_UNIVERSE_SCOUT_MAX_ENTRY_PRICE_IMPACT_BPS
+  ?? process.env.WORKER_UNIVERSE_SCOUT_MAX_SOL_PRICE_IMPACT_BPS
+  ?? 50,
+);
+const WORKER_MAX_CONSECUTIVE_LOSSES = Number(process.env.WORKER_MAX_CONSECUTIVE_LOSSES ?? 2);
+const WORKER_MAX_BAD_FILL_STREAK = Number(process.env.WORKER_MAX_BAD_FILL_STREAK ?? 2);
+const WORKER_SOFT_RISK_COOLDOWN_MS = Number(process.env.WORKER_SOFT_RISK_COOLDOWN_MS ?? 5 * 60_000);
+// Correlation diversification + post-loss cooldown controls.
+// Cap how many open positions may share a correlation cluster (e.g. all the
+// SOL-beta LSTs move together, so holding SOL + JitoSOL + mSOL + bSOL is one
+// directional bet across four slots). Default 1 = strict diversification.
+const WORKER_MAX_OPEN_PER_CLUSTER = Number(process.env.WORKER_MAX_OPEN_PER_CLUSTER ?? 1);
+// After a stop_loss, exclude the stopped token's whole cluster from new entries
+// for this window so the bot does not immediately re-buy what it just sold.
+const WORKER_STOP_LOSS_LOCK_MS = Number(process.env.WORKER_STOP_LOSS_LOCK_MS ?? 10 * 60_000);
+// In a flat tape there is no persistent bullish candidate; only a routed-fallback
+// pick survives. Suppress those noise entries so we only buy real momentum.
+const WORKER_FLAT_REGIME_SUPPRESS_FALLBACK = process.env.WORKER_FLAT_REGIME_SUPPRESS_FALLBACK !== 'false';
+const WORKER_VOLATILITY_SIZING_ENABLED = process.env.WORKER_VOLATILITY_SIZING_ENABLED !== 'false';
+const WORKER_VOLATILITY_LOOKBACK_SAMPLES = Number(process.env.WORKER_VOLATILITY_LOOKBACK_SAMPLES ?? 12);
+const WORKER_VOLATILITY_TARGET_BPS = Number(process.env.WORKER_VOLATILITY_TARGET_BPS ?? 40);
+const WORKER_VOLATILITY_MIN_SIZE_BPS = Number(process.env.WORKER_VOLATILITY_MIN_SIZE_BPS ?? 2500);
+const WORKER_ROUTE_STABILITY_ENABLED = process.env.WORKER_ROUTE_STABILITY_ENABLED !== 'false';
+const WORKER_ROUTE_STABILITY_SAMPLES = Number(process.env.WORKER_ROUTE_STABILITY_SAMPLES ?? 2);
+const WORKER_ROUTE_STABILITY_DELAY_MS = Number(process.env.WORKER_ROUTE_STABILITY_DELAY_MS ?? 350);
+const WORKER_ROUTE_STABILITY_MAX_OUTPUT_DRIFT_BPS = Number(process.env.WORKER_ROUTE_STABILITY_MAX_OUTPUT_DRIFT_BPS ?? 30);
+const WORKER_ROUTE_STABILITY_MAX_IMPACT_DRIFT_BPS = Number(process.env.WORKER_ROUTE_STABILITY_MAX_IMPACT_DRIFT_BPS ?? 15);
 const TOKEN_UNIVERSE_AUTO_SORT_ENABLED = process.env.WORKER_TOKEN_UNIVERSE_AUTO_SORT_ENABLED !== 'false';
+// For 350-bot fleet breadth, default to scouting disabled rows too, then let
+// autosort/admission decide what gets enabled.
+const TOKEN_UNIVERSE_INCLUDE_DISABLED_CANDIDATES = process.env.WORKER_TOKEN_UNIVERSE_INCLUDE_DISABLED_CANDIDATES === 'true';
 const TOKEN_UNIVERSE_AUTO_SORT_INTERVAL_MS = Number(process.env.WORKER_TOKEN_UNIVERSE_AUTO_SORT_INTERVAL_MS ?? 180000);
-const TOKEN_UNIVERSE_AUTO_SORT_MAX_MINTS = Number(process.env.WORKER_TOKEN_UNIVERSE_AUTO_SORT_MAX_MINTS ?? 16);
-const TOKEN_UNIVERSE_AUTO_SORT_TOP_ENABLED = Number(process.env.WORKER_TOKEN_UNIVERSE_AUTO_SORT_TOP_ENABLED ?? 8);
+const TOKEN_UNIVERSE_AUTO_SORT_MAX_MINTS = Number(process.env.WORKER_TOKEN_UNIVERSE_AUTO_SORT_MAX_MINTS ?? 200);
+const TOKEN_UNIVERSE_AUTO_SORT_TOP_ENABLED = Number(process.env.WORKER_TOKEN_UNIVERSE_AUTO_SORT_TOP_ENABLED ?? 120);
 const TOKEN_UNIVERSE_AUTO_SORT_NOTIONAL_USDC_ATOMIC = Number(process.env.WORKER_TOKEN_UNIVERSE_AUTO_SORT_NOTIONAL_USDC_ATOMIC ?? 10_000_000);
 const TOKEN_UNIVERSE_AUTO_SORT_MAX_PRICE_IMPACT_BPS = Number(process.env.WORKER_TOKEN_UNIVERSE_AUTO_SORT_MAX_PRICE_IMPACT_BPS ?? 200);
 const TOKEN_UNIVERSE_ENGINE_MAX_STALE_MS = Number(process.env.WORKER_TOKEN_UNIVERSE_ENGINE_MAX_STALE_MS ?? 900000);
@@ -145,13 +258,66 @@ const TOKEN_UNIVERSE_MIN_STAY_RUNS = Number(process.env.WORKER_TOKEN_UNIVERSE_MI
 const TOKEN_UNIVERSE_EVICTION_RANK_BUFFER = Number(process.env.WORKER_TOKEN_UNIVERSE_EVICTION_RANK_BUFFER ?? 2);
 const TOKEN_UNIVERSE_PROBE_FREEZE_FAILURE_STREAK = Number(process.env.WORKER_TOKEN_UNIVERSE_PROBE_FREEZE_FAILURE_STREAK ?? 3);
 const TOKEN_UNIVERSE_PROBE_UNFREEZE_HEALTHY_STREAK = Number(process.env.WORKER_TOKEN_UNIVERSE_PROBE_UNFREEZE_HEALTHY_STREAK ?? 2);
+// Scheduled new-token discovery (the "feeder"): runs scripts/admit-token-candidates.mjs
+// on a timer so brand-new hot tokens get exit-route-tested and added to the universe
+// automatically. Runs ADDITIVE-ONLY (never disables existing rows; eviction is owned by
+// the autosort engine). This is the second half of the living universe; autosort only
+// re-ranks/prunes tokens already in the table.
+const TOKEN_ADMISSION_SCHEDULE_ENABLED = process.env.WORKER_TOKEN_ADMISSION_SCHEDULE_ENABLED !== 'false';
+const TOKEN_ADMISSION_SCHEDULE_INTERVAL_MS = Number(process.env.WORKER_TOKEN_ADMISSION_SCHEDULE_INTERVAL_MS ?? 3_600_000);
+const TOKEN_ADMISSION_SCHEDULE_INITIAL_DELAY_MS = Number(process.env.WORKER_TOKEN_ADMISSION_SCHEDULE_INITIAL_DELAY_MS ?? 120_000);
 const TOKEN_UNIVERSE_AUTOSORT_STATE_WRITE_MIN_INTERVAL_MS = Number(process.env.WORKER_TOKEN_UNIVERSE_AUTOSORT_STATE_WRITE_MIN_INTERVAL_MS ?? 120000);
 const TOKEN_UNIVERSE_METADATA_WRITE_MIN_INTERVAL_MS = Number(process.env.WORKER_TOKEN_UNIVERSE_METADATA_WRITE_MIN_INTERVAL_MS ?? 300000);
+const MARKET_SCANNER_CANDIDATE_TTL_MS = Number(process.env.WORKER_MARKET_SCANNER_CANDIDATE_TTL_MS ?? 180000);
+const MARKET_SCANNER_MAX_PERSISTED_CANDIDATES = Number(process.env.WORKER_MARKET_SCANNER_MAX_PERSISTED_CANDIDATES ?? 50);
 const RUNTIME_CONTROL_KEY = 'global_live_runtime';
 const RUNTIME_CONTROL_REFRESH_MS = Number(process.env.RUNTIME_CONTROL_REFRESH_MS ?? 5000);
 let liveSpeedProfileName: RuntimeSpeedProfileName = normalizeRuntimeSpeedProfileName(process.env.WORKER_SPEED_PROFILE);
 let liveSpeedProfile = getRuntimeSpeedProfile(liveSpeedProfileName, process.env);
 let lastRuntimeControlRefreshAt = 0;
+
+// ── Fleet auto-shift (Surge/Pulse/Glide) ────────────────────────────────────
+// The worker is the single fleet-wide throttle for all bots. It watches real
+// provider pressure (Helius + Jupiter monthly-budget projection) and real-time
+// execution-queue saturation, then shifts the live speed profile so combined
+// fleet load stays under 90% of every provider lane. Downshift (toward glide)
+// is fast for safety; upshift (toward surge) is slow to avoid flapping. When an
+// operator pins the mode (modeSource === 'manual') the worker only computes the
+// recommendation and never applies it.
+type BudgetPressureLevel = 'normal' | 'watch' | 'throttle' | 'halt';
+type LaneBudgetPressure = { pressure: BudgetPressureLevel; usageRatio: number; at: number };
+let latestHeliusBudgetPressure: LaneBudgetPressure = { pressure: 'normal', usageRatio: 0, at: 0 };
+let latestJupiterBudgetPressure: LaneBudgetPressure = { pressure: 'normal', usageRatio: 0, at: 0 };
+let liveModeSource: 'auto' | 'manual' = 'auto';
+let liveEntriesEnabled: boolean = true;
+let liveMaintenanceReason: string | null = null;
+
+const AUTO_SHIFT_ENABLED = process.env.WORKER_AUTO_SHIFT_ENABLED !== 'false';
+const AUTO_SHIFT_EVAL_MS = Number(process.env.WORKER_AUTO_SHIFT_EVAL_MS ?? 15_000);
+const AUTO_SHIFT_DOWNSHIFT_SAMPLES = Number(process.env.WORKER_AUTO_SHIFT_DOWNSHIFT_SAMPLES ?? 2);
+const AUTO_SHIFT_UPSHIFT_SAMPLES = Number(process.env.WORKER_AUTO_SHIFT_UPSHIFT_SAMPLES ?? 6);
+const AUTO_SHIFT_QUEUE_PULSE_AGE_MS = Number(process.env.WORKER_AUTO_SHIFT_QUEUE_PULSE_AGE_MS ?? 8_000);
+const AUTO_SHIFT_QUEUE_GLIDE_AGE_MS = Number(process.env.WORKER_AUTO_SHIFT_QUEUE_GLIDE_AGE_MS ?? 20_000);
+const AUTO_SHIFT_QUEUE_PULSE_DEPTH = Number(process.env.WORKER_AUTO_SHIFT_QUEUE_PULSE_DEPTH ?? 50);
+const AUTO_SHIFT_QUEUE_GLIDE_DEPTH = Number(process.env.WORKER_AUTO_SHIFT_QUEUE_GLIDE_DEPTH ?? 120);
+
+// Profile severity ladder: lower index = more restrictive (deeper protection).
+const SPEED_PROFILE_LADDER: RuntimeSpeedProfileName[] = ['glide', 'pulse', 'surge'];
+const speedProfileLevel = (name: RuntimeSpeedProfileName): number => {
+  const idx = SPEED_PROFILE_LADDER.indexOf(name);
+  return idx === -1 ? SPEED_PROFILE_LADDER.length - 1 : idx;
+};
+const speedProfileFromLevel = (level: number): RuntimeSpeedProfileName => {
+  const clamped = Math.max(0, Math.min(SPEED_PROFILE_LADDER.length - 1, level));
+  return SPEED_PROFILE_LADDER[clamped];
+};
+
+let autoShiftDownStreak = 0;
+let autoShiftUpStreak = 0;
+let lastAutoShiftEvalAt = 0;
+let lastAutoShiftReason = 'init';
+let lastAutoShiftTransitionAt: string | null = null;
+const WORKER_INSTANCE_ID = process.env.WORKER_INSTANCE_ID?.trim() || `worker-${process.pid}-${randomUUID()}`;
 
 // â”€â”€ DB pool â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
@@ -178,36 +344,29 @@ const getPool = () => {
 
 const getTokenUniversePool = () => {
   if (tokenUniversePool) return tokenUniversePool;
-
-  const overrideUrl = process.env.ROGUEAI_TOKEN_UNIVERSE_DATABASE_URL?.trim();
-  if (!overrideUrl) {
-    tokenUniversePool = getPool();
-    return tokenUniversePool;
-  }
-
-  const parsed = new URL(overrideUrl);
-  parsed.searchParams.delete('sslmode');
-  tokenUniversePool = new Pool({
-    connectionString: parsed.toString(),
-    ssl: { rejectUnauthorized: false },
-    max: 2,
-    query_timeout: DATABASE_QUERY_TIMEOUT_MS,
-    statement_timeout: DATABASE_STATEMENT_TIMEOUT_MS,
-    lock_timeout: DATABASE_LOCK_TIMEOUT_MS,
-    idle_in_transaction_session_timeout: DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS,
-  });
-
+  tokenUniversePool = getPool();
   return tokenUniversePool;
 };
 
 // â”€â”€ Solana connection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 let connection: Connection | null = null;
+let connectionPool: Connection[] | null = null;
+let connectionCursor = 0;
 const getConnection = () => {
-  if (connection) return connection;
-  const rpc = getHeliusRpcUrl(process.env);
-  connection = new Connection(rpc, 'confirmed');
-  return connection;
+  if (!connectionPool || connectionPool.length === 0) {
+    const rpcUrls = getHeliusRpcUrls(process.env);
+    connectionPool = rpcUrls.map((rpcUrl) => new Connection(rpcUrl, 'confirmed'));
+    connection = connectionPool[0] ?? null;
+  }
+
+  if (!connectionPool || connectionPool.length === 0) {
+    throw new Error('Helius RPC connection pool is not configured');
+  }
+
+  const selected = connectionPool[connectionCursor % connectionPool.length];
+  connectionCursor = (connectionCursor + 1) % connectionPool.length;
+  return selected;
 };
 
 // â”€â”€ DB helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -231,7 +390,204 @@ type RawSession = {
 type RuntimeControlRow = {
   state: {
     speedProfile?: unknown;
+    modeSource?: unknown;
+    recommendedProfile?: unknown;
+    transitionReason?: unknown;
+    lastTransitionAt?: unknown;
+    pressure?: unknown;
+    entriesEnabled?: boolean;
+    maintenanceReason?: string | null;
   } | null;
+};
+
+type ExecutionQueueRow = {
+  id: string;
+  session_id: string;
+  status: 'queued' | 'running';
+  priority: number;
+  reason: string;
+  attempts: number;
+  available_at: Date;
+  locked_by: string | null;
+  locked_until: Date | null;
+  created_at: Date;
+  updated_at: Date;
+};
+
+let executionQueueReadyPromise: Promise<void> | null = null;
+
+const ensureExecutionQueueReady = async () => {
+  if (!executionQueueReadyPromise) {
+    const dbPool = getPool();
+    executionQueueReadyPromise = dbPool.query(`
+      CREATE TABLE IF NOT EXISTS execution_queue (
+        id UUID PRIMARY KEY,
+        session_id UUID NOT NULL,
+        status TEXT NOT NULL,
+        priority INTEGER NOT NULL DEFAULT 0,
+        reason TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        available_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        locked_by TEXT,
+        locked_until TIMESTAMPTZ,
+        last_error TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `)
+      .then(() => dbPool.query(`
+        CREATE UNIQUE INDEX IF NOT EXISTS execution_queue_one_active_per_session_idx
+        ON execution_queue (session_id)
+        WHERE status IN ('queued', 'running')
+      `))
+      .then(() => dbPool.query(`
+        CREATE INDEX IF NOT EXISTS execution_queue_claim_idx
+        ON execution_queue (status, available_at, priority DESC, created_at ASC)
+      `))
+      .then(() => undefined);
+  }
+
+  return executionQueueReadyPromise;
+};
+
+const enqueueExecutionIntent = async (
+  session: RawSession,
+  params: { priority?: number; reason?: string } = {},
+): Promise<boolean> => {
+  await ensureExecutionQueueReady();
+  const dbPool = getPool();
+
+  const result = await dbPool.query<{ id: string }>(
+    `
+      INSERT INTO execution_queue (
+        id,
+        session_id,
+        status,
+        priority,
+        reason,
+        available_at,
+        created_at,
+        updated_at
+      ) VALUES (
+        $1,
+        $2,
+        'queued',
+        $3,
+        $4,
+        NOW(),
+        NOW(),
+        NOW()
+      )
+      ON CONFLICT (session_id) WHERE status IN ('queued', 'running')
+      DO NOTHING
+      RETURNING id
+    `,
+    [randomUUID(), session.id, params.priority ?? 0, params.reason ?? 'trade_due'],
+  );
+
+  return (result.rowCount ?? 0) > 0;
+};
+
+const claimExecutionQueueItems = async (): Promise<ExecutionQueueRow[]> => {
+  await ensureExecutionQueueReady();
+  const dbPool = getPool();
+  const limit = Math.max(1, Math.floor(EXECUTION_QUEUE_CLAIMS_PER_TICK));
+  const lockMs = Math.max(1000, Math.floor(EXECUTION_QUEUE_LOCK_MS));
+
+  await dbPool.query(
+    `
+      UPDATE execution_queue
+         SET status = 'queued',
+             locked_by = NULL,
+             locked_until = NULL,
+             updated_at = NOW(),
+             last_error = 'stale_running_lock_reclaimed'
+       WHERE status = 'running'
+         AND locked_until IS NOT NULL
+         AND locked_until < NOW()
+    `,
+  );
+
+  const result = await dbPool.query<ExecutionQueueRow>(
+    `
+      WITH claimable AS (
+        SELECT id
+          FROM execution_queue
+         WHERE status = 'queued'
+           AND available_at <= NOW()
+         ORDER BY priority DESC, available_at ASC, created_at ASC
+         LIMIT $1
+         FOR UPDATE SKIP LOCKED
+      )
+      UPDATE execution_queue q
+         SET status = 'running',
+             locked_by = $2,
+             locked_until = NOW() + ($3::text || ' milliseconds')::interval,
+             attempts = q.attempts + 1,
+             updated_at = NOW()
+        FROM claimable
+       WHERE q.id = claimable.id
+      RETURNING q.*
+    `,
+    [limit, WORKER_INSTANCE_ID, lockMs],
+  );
+
+  return result.rows;
+};
+
+const completeExecutionQueueItem = async (queueItemId: string) => {
+  await ensureExecutionQueueReady();
+  await getPool().query(
+    `DELETE FROM execution_queue WHERE id = $1`,
+    [queueItemId],
+  );
+};
+
+const failExecutionQueueItem = async (queueItemId: string, error: unknown) => {
+  await ensureExecutionQueueReady();
+  await getPool().query(
+    `
+      UPDATE execution_queue
+         SET status = 'queued',
+             locked_by = NULL,
+             locked_until = NULL,
+             last_error = $2,
+             available_at = NOW() + INTERVAL '5 seconds',
+             updated_at = NOW()
+       WHERE id = $1
+    `,
+    [queueItemId, String(error).slice(0, 500)],
+  );
+};
+
+const reclaimOwnExecutionQueueLocksOnBoot = async () => {
+  await ensureExecutionQueueReady();
+  const result = await getPool().query<{ id: string }>(
+    `
+      UPDATE execution_queue
+         SET status = 'queued',
+             locked_by = NULL,
+             locked_until = NULL,
+             last_error = 'worker_restart_reclaimed_own_lock',
+             available_at = NOW(),
+             updated_at = NOW()
+       WHERE status = 'running'
+         AND locked_by = $1
+      RETURNING id
+    `,
+    [WORKER_INSTANCE_ID],
+  );
+
+  if ((result.rowCount ?? 0) > 0) {
+    console.warn(JSON.stringify({
+      service: 'roguezero-worker',
+      kind: 'execution_queue_reclaim_on_boot',
+      workerInstanceId: WORKER_INSTANCE_ID,
+      reclaimed: result.rowCount,
+      ids: result.rows.map((row) => row.id),
+      ts: new Date().toISOString(),
+    }));
+  }
 };
 
 const querySessions = async (statuses: string[]): Promise<RawSession[]> => {
@@ -290,6 +646,12 @@ const refreshLiveRuntimeControl = async (force = false) => {
       : process.env.WORKER_SPEED_PROFILE,
   );
 
+  liveModeSource = result.rows[0]?.state?.modeSource === 'manual' ? 'manual' : 'auto';
+  liveEntriesEnabled = result.rows[0]?.state?.entriesEnabled === false ? false : true;
+  liveMaintenanceReason = typeof result.rows[0]?.state?.maintenanceReason === 'string'
+    ? result.rows[0].state.maintenanceReason.slice(0, 160)
+    : null;
+
   if (result.rowCount === 0) {
     await getPool().query(
       `INSERT INTO runtime_control_settings (control_key, state, updated_at)
@@ -307,6 +669,167 @@ const refreshLiveRuntimeControl = async (force = false) => {
 };
 
 const getLiveSpeedProfile = () => liveSpeedProfile;
+
+// ── Fleet auto-shift controller ──────────────────────────────────────────────
+// Maps the worst-performing provider lane to the most restrictive profile it
+// warrants, applies hysteresis, and persists the resulting mode plus the
+// recommendation/pressure telemetry the admin surface reads.
+const budgetPressureToLevel = (pressure: BudgetPressureLevel): number => {
+  switch (pressure) {
+    case 'halt':
+    case 'throttle':
+      return speedProfileLevel('glide');
+    case 'watch':
+      return speedProfileLevel('pulse');
+    case 'normal':
+    default:
+      return speedProfileLevel('surge');
+  }
+};
+
+const getExecutionQueuePressure = async (): Promise<{ depth: number; oldestMs: number }> => {
+  try {
+    await ensureExecutionQueueReady();
+    const result = await getPool().query<{ depth: string; oldest_ms: string | null }>(
+      `SELECT count(*)::text AS depth,
+              COALESCE(EXTRACT(EPOCH FROM (NOW() - MIN(created_at))) * 1000, 0)::text AS oldest_ms
+         FROM execution_queue
+        WHERE status = 'queued'
+          AND available_at <= NOW()`,
+    );
+    const row = result.rows[0];
+    return {
+      depth: Number(row?.depth ?? 0),
+      oldestMs: Math.max(0, Number(row?.oldest_ms ?? 0)),
+    };
+  } catch {
+    return { depth: 0, oldestMs: 0 };
+  }
+};
+
+const queuePressureToLevel = (depth: number, oldestMs: number): number => {
+  if (oldestMs >= AUTO_SHIFT_QUEUE_GLIDE_AGE_MS || depth >= AUTO_SHIFT_QUEUE_GLIDE_DEPTH) {
+    return speedProfileLevel('glide');
+  }
+  if (oldestMs >= AUTO_SHIFT_QUEUE_PULSE_AGE_MS || depth >= AUTO_SHIFT_QUEUE_PULSE_DEPTH) {
+    return speedProfileLevel('pulse');
+  }
+  return speedProfileLevel('surge');
+};
+
+const persistRuntimeControlState = async (state: Record<string, unknown>) => {
+  await ensureRuntimeControlStore();
+  await getPool().query(
+    `INSERT INTO runtime_control_settings (control_key, state, updated_at)
+     VALUES ($1, $2::jsonb, NOW())
+     ON CONFLICT (control_key)
+     DO UPDATE SET state = $2::jsonb, updated_at = NOW()`,
+    [RUNTIME_CONTROL_KEY, JSON.stringify(state)],
+  );
+};
+
+const evaluateFleetAutoShift = async () => {
+  if (!AUTO_SHIFT_ENABLED) return;
+  const now = Date.now();
+  if ((now - lastAutoShiftEvalAt) < AUTO_SHIFT_EVAL_MS) return;
+  lastAutoShiftEvalAt = now;
+
+  const queue = await getExecutionQueuePressure();
+
+  // Worst lane wins: the most restrictive (lowest) level any lane demands.
+  const heliusLevel = budgetPressureToLevel(latestHeliusBudgetPressure.pressure);
+  const jupiterLevel = budgetPressureToLevel(latestJupiterBudgetPressure.pressure);
+  const queueLevel = queuePressureToLevel(queue.depth, queue.oldestMs);
+  const instantLevel = Math.min(heliusLevel, jupiterLevel, queueLevel);
+  const recommended = speedProfileFromLevel(instantLevel);
+
+  const worstLaneReason = (() => {
+    if (instantLevel === queueLevel && queueLevel <= heliusLevel && queueLevel <= jupiterLevel) {
+      return `queue depth=${queue.depth} oldest=${Math.round(queue.oldestMs)}ms`;
+    }
+    if (instantLevel === heliusLevel && heliusLevel <= jupiterLevel) {
+      return `helius budget ${latestHeliusBudgetPressure.pressure}`;
+    }
+    return `jupiter budget ${latestJupiterBudgetPressure.pressure}`;
+  })();
+
+  const pressureTelemetry = {
+    heliusBudget: latestHeliusBudgetPressure.pressure,
+    heliusUsageRatio: latestHeliusBudgetPressure.usageRatio,
+    jupiterBudget: latestJupiterBudgetPressure.pressure,
+    jupiterUsageRatio: latestJupiterBudgetPressure.usageRatio,
+    queueDepth: queue.depth,
+    queueOldestMs: Math.round(queue.oldestMs),
+    worstLane: worstLaneReason,
+  };
+
+  // Operator pinned the mode: surface the recommendation/pressure, apply nothing.
+  if (liveModeSource === 'manual') {
+    autoShiftDownStreak = 0;
+    autoShiftUpStreak = 0;
+    await persistRuntimeControlState({
+      speedProfile: liveSpeedProfileName,
+      modeSource: 'manual',
+      entriesEnabled: liveEntriesEnabled,
+      maintenanceReason: liveMaintenanceReason,
+      recommendedProfile: recommended,
+      transitionReason: lastAutoShiftReason,
+      lastTransitionAt: lastAutoShiftTransitionAt,
+      pressure: pressureTelemetry,
+    }).catch((err) => console.warn('[worker] auto-shift persist (manual) failed:', String(err)));
+    return;
+  }
+
+  const appliedLevel = speedProfileLevel(liveSpeedProfileName);
+  let targetLevel = appliedLevel;
+  let transitioned = false;
+  let reason = lastAutoShiftReason;
+
+  if (instantLevel < appliedLevel) {
+    // Pressure rising → downshift toward protection. Fast, can jump straight.
+    autoShiftDownStreak += 1;
+    autoShiftUpStreak = 0;
+    if (autoShiftDownStreak >= AUTO_SHIFT_DOWNSHIFT_SAMPLES) {
+      targetLevel = instantLevel;
+      transitioned = true;
+      reason = `auto_downshift: ${worstLaneReason}`;
+      autoShiftDownStreak = 0;
+    }
+  } else if (instantLevel > appliedLevel) {
+    // Pressure recovering → upshift one step at a time. Slow.
+    autoShiftUpStreak += 1;
+    autoShiftDownStreak = 0;
+    if (autoShiftUpStreak >= AUTO_SHIFT_UPSHIFT_SAMPLES) {
+      targetLevel = appliedLevel + 1;
+      transitioned = true;
+      reason = `auto_upshift: lanes recovered (${worstLaneReason})`;
+      autoShiftUpStreak = 0;
+    }
+  } else {
+    autoShiftDownStreak = 0;
+    autoShiftUpStreak = 0;
+  }
+
+  if (transitioned && targetLevel !== appliedLevel) {
+    const nextProfile = speedProfileFromLevel(targetLevel);
+    liveSpeedProfileName = nextProfile;
+    liveSpeedProfile = getRuntimeSpeedProfile(nextProfile, process.env);
+    lastAutoShiftReason = reason;
+    lastAutoShiftTransitionAt = new Date().toISOString();
+    log('info', 'fleet', `auto-shift ${speedProfileFromLevel(appliedLevel)} → ${nextProfile} (${reason})`);
+  }
+
+  await persistRuntimeControlState({
+    speedProfile: liveSpeedProfileName,
+    modeSource: 'auto',
+    entriesEnabled: liveEntriesEnabled,
+    maintenanceReason: liveMaintenanceReason,
+    recommendedProfile: recommended,
+    transitionReason: lastAutoShiftReason,
+    lastTransitionAt: lastAutoShiftTransitionAt,
+    pressure: pressureTelemetry,
+  }).catch((err) => console.warn('[worker] auto-shift persist failed:', String(err)));
+};
 
 const setSessionStatus = async (
   id: string,
@@ -434,6 +957,66 @@ const heliusLimiter = createSharedTokenBucket({
   maxTokens: HELIUS_RPC_BURST,
   refillRatePerSec: HELIUS_RPC_RPS,
 });
+const heliusMonthlyBudget = createMonthlyBudgetGovernor({
+  pool: sharedRatePool,
+  key: 'helius-credits',
+  monthlyLimitUnits: HELIUS_MONTHLY_CREDIT_LIMIT,
+  enforceLimit: HELIUS_MONTHLY_BUDGET_ENFORCE,
+});
+const jupiterMonthlyBudget = createMonthlyBudgetGovernor({
+  pool: sharedRatePool,
+  key: 'jupiter-requests',
+  monthlyLimitUnits: JUPITER_MONTHLY_REQUEST_LIMIT,
+  enforceLimit: JUPITER_MONTHLY_BUDGET_ENFORCE,
+});
+
+const reserveProviderBudget = async (params: {
+  provider: 'helius' | 'jupiter';
+  units?: number;
+  governor: { reserve: (units?: number) => Promise<{ granted: boolean; pressure: string; remainingUnits: number; usageRatio: number }> };
+}) => {
+  const budget = await params.governor.reserve(params.units ?? 1);
+
+  // Record the latest projected budget pressure per provider so the fleet
+  // auto-shift controller can react to slow-burn monthly-budget exhaustion.
+  const laneSnapshot: LaneBudgetPressure = {
+    pressure: (budget.pressure as BudgetPressureLevel) ?? 'normal',
+    usageRatio: budget.usageRatio,
+    at: Date.now(),
+  };
+  if (params.provider === 'helius') {
+    latestHeliusBudgetPressure = laneSnapshot;
+  } else {
+    latestJupiterBudgetPressure = laneSnapshot;
+  }
+
+  if (budget.pressure === 'watch' || budget.pressure === 'throttle') {
+    console.warn(JSON.stringify({
+      level: 'warn',
+      service: 'roguezero-worker',
+      kind: 'provider_monthly_budget_pressure',
+      provider: params.provider,
+      pressure: budget.pressure,
+      remainingUnits: budget.remainingUnits,
+      usageRatio: budget.usageRatio,
+      ts: new Date().toISOString(),
+    }));
+  }
+
+  if (!budget.granted) {
+    throw new Error(`${params.provider} monthly budget exhausted`);
+  }
+};
+
+const reserveHeliusRpc = async () => {
+  await reserveProviderBudget({ provider: 'helius', governor: heliusMonthlyBudget, units: 1 });
+  await heliusLimiter.acquire();
+};
+
+const reserveJupiterRequest = async () => {
+  await reserveProviderBudget({ provider: 'jupiter', governor: jupiterMonthlyBudget, units: 1 });
+  await jupiterLimiter.acquire();
+};
 
 // â”€â”€ Stage 4 price feeds (chunk 2) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Two independent pollers, two independent rate buckets:
@@ -467,6 +1050,7 @@ let lastSignalSnapshot: NonNullable<Session['serviceControl']['lastSignal']> | n
 let pythConsecutiveFailures = 0;
 let jupiterPriceConsecutiveFailures = 0;
 let tokenUniverseMints: string[] = [];
+let tokenUniverseActiveMints: string[] = [];
 let tokenUniverseSourceTable: string | null = null;
 let tokenUniverseTableMeta: TokenUniverseTableMeta | null = null;
 let lastTokenUniverseRefreshAt = 0;
@@ -479,31 +1063,152 @@ let lastTokenUniverseAutoSortStateWriteMs = 0;
 let lastTokenUniverseAutoSortStateSignature: string | null = null;
 let lastTokenUniverseMetadataWriteMs = 0;
 let lastTokenUniverseMetadataSignature: string | null = null;
-const universeSortProbeTaker = Keypair.generate().publicKey.toBase58();
+const universeSortProbeTaker = process.env.WORKER_UNIVERSE_PROBE_TAKER?.trim()
+  || '11111111111111111111111111111111';
+const tokenUniverseSymbolByMint = new Map<string, string>();
 const latestJupiterUsdByMint = new Map<string, number>();
 const previousJupiterUsdByMint = new Map<string, number>();
+const latestJupiterDecimalsByMint = new Map<string, number>();
 
 const TOKEN_UNIVERSE_REFRESH_MS = Number(process.env.WORKER_TOKEN_UNIVERSE_REFRESH_MS ?? 60000);
-const TOKEN_UNIVERSE_TABLE_CANDIDATES = (process.env.ROGUEAI_TOKEN_UNIVERSE_TABLES
-  ?? 'rogueai_token_universe,token_universe,rz_token_universe')
+const TOKEN_UNIVERSE_TABLE_CANDIDATES = (process.env.RZ_TOKEN_UNIVERSE_TABLES
+  ?? 'rz_token_universe,token_universe')
   .split(',')
   .map((value) => value.trim())
   .filter((value) => value.length > 0);
-const TOKEN_UNIVERSE_MAX_MINTS = Number(process.env.WORKER_TOKEN_UNIVERSE_MAX_MINTS ?? 64);
+const TOKEN_UNIVERSE_MAX_MINTS = Number(process.env.WORKER_TOKEN_UNIVERSE_MAX_MINTS ?? 500);
+const WORKER_JUPITER_PRICE_BATCH_SIZE = Number(process.env.WORKER_JUPITER_PRICE_BATCH_SIZE ?? 80);
 const solanaPublicKeyPattern = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const TOKEN_UNIVERSE_BOOTSTRAP_ENABLED = process.env.WORKER_TOKEN_UNIVERSE_BOOTSTRAP_ENABLED !== 'false';
 const DEFAULT_TOKEN_UNIVERSE_SEED = [
   { mint: SOL_MINT, symbol: 'SOL', priority: 100 },
   { mint: USDC_MINT, symbol: 'USDC', priority: 90 },
-  { mint: 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', symbol: 'USDT', priority: 80 },
+  { mint: 'JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN', symbol: 'JUP', priority: 89 },
+  { mint: 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', symbol: 'USDT', priority: 88 },
+  { mint: 'J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn', symbol: 'JitoSOL', priority: 87 },
+  { mint: 'mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So', symbol: 'mSOL', priority: 86 },
+  { mint: 'bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1', symbol: 'bSOL', priority: 85 },
+  { mint: 'jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL', symbol: 'JTO', priority: 84 },
+  { mint: 'HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3', symbol: 'PYTH', priority: 83 },
+  { mint: 'KMNo3nJsBXfcpJTVhZcXLW7RmTwTt4GVFE7suUBo9sS', symbol: 'KMNO', priority: 82 },
+  { mint: '3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh', symbol: 'WBTC', priority: 81 },
+  { mint: '85VBFQZC9TZkfaptBWjvUw7YbZjy52A6mjtPGjstQAmQ', symbol: 'W', priority: 80 },
+  { mint: 'hntyVP6YFm1Hg25TN9WGLqM12b8TQmcknKrdu1oxWux', symbol: 'HNT', priority: 79 },
+  { mint: 'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263', symbol: 'BONK', priority: 78 },
+  { mint: 'EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm', symbol: 'WIF', priority: 77 },
+  { mint: 'MEW1gQWJ3nEXg2qgERiKu7FAFj79PHvQVREQUzScPP5', symbol: 'MEW', priority: 76 },
+  { mint: '7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr', symbol: 'POPCAT', priority: 75 },
+  { mint: '4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R', symbol: 'RAY', priority: 74 },
+  { mint: 'orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1kektZE', symbol: 'ORCA', priority: 73 },
+  { mint: '5oVNBeEEQvYi1cX3ir8Dx5n1P7pdxydbGF2X4TxVusJm', symbol: 'DRIFT', priority: 72 },
+  { mint: 'SHDWyBxihqiCjDYwvisits5jfez2EfbR347c5cKAgqje', symbol: 'SHDW', priority: 71 },
 ];
+const TRUSTED_ENTRY_UNIVERSE_MINTS = [
+  SOL_MINT,
+  USDC_MINT,
+  'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',
+  'JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN',
+  'J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn',
+  'mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So',
+  'bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1',
+  'jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL',
+  'HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3',
+  'KMNo3nJsBXfcpJTVhZcXLW7RmTwTt4GVFE7suUBo9sS',
+  '3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh',
+  '85VBFQZC9TZkfaptBWjvUw7YbZjy52A6mjtPGjstQAmQ',
+  'hntyVP6YFm1Hg25TN9WGLqM12b8TQmcknKrdu1oxWux',
+  'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263',
+  'EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm',
+  'MEW1gQWJ3nEXg2qgERiKu7FAFj79PHvQVREQUzScPP5',
+  '7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr',
+  '4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R',
+  'orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1kektZE',
+  '5oVNBeEEQvYi1cX3ir8Dx5n1P7pdxydbGF2X4TxVusJm',
+  'SHDWyBxihqiCjDYwvisits5jfez2EfbR347c5cKAgqje',
+];
+const TRUSTED_ENTRY_UNIVERSE_MINT_SET = new Set(TRUSTED_ENTRY_UNIVERSE_MINTS);
+const STABLE_ENTRY_TARGET_MINTS = new Set<string>([
+  USDC_MINT,
+  'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',
+]);
+const TOKEN_UNIVERSE_HARD_BLOCKED_MINTS = new Set<string>([
+  '4SZjjNABoqhbd4hnapbvoEPEqT8mnNkfbEoAwALf1V8t', // CAVE
+]);
+const TOKEN_UNIVERSE_HARD_BLOCKED_SYMBOLS = new Set<string>([
+  'CAVE',
+  'APPLE',
+  'USELESS',
+]);
+
+// Correlation clusters for diversification. Tokens in the same cluster move
+// together, so the bot treats them as a single directional bet. SOL and its
+// liquid-staking derivatives (LSTs) track the SOL price almost 1:1; wrapped BTC
+// variants track BTC; stables track the dollar. Everything else is treated as
+// its own single-token cluster so the per-cluster cap never restricts genuinely
+// uncorrelated names.
+const TOKEN_CLUSTER_BY_MINT: Record<string, string> = {
+  [SOL_MINT]: 'sol_beta',
+  'J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn': 'sol_beta', // JitoSOL
+  'mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So': 'sol_beta', // mSOL
+  'bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1': 'sol_beta', // bSOL
+  '3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh': 'btc', // WBTC
+  [USDC_MINT]: 'stable',
+  'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB': 'stable', // USDT
+};
+const TOKEN_CLUSTER_BY_SYMBOL: Record<string, string> = {
+  SOL: 'sol_beta',
+  JitoSOL: 'sol_beta',
+  mSOL: 'sol_beta',
+  bSOL: 'sol_beta',
+  JupSOL: 'sol_beta',
+  jupSOL: 'sol_beta',
+  INF: 'sol_beta',
+  WBTC: 'btc',
+  PBTC: 'btc',
+  pBTC: 'btc',
+  cbBTC: 'btc',
+  BTC: 'btc',
+  USDC: 'stable',
+  USDT: 'stable',
+  USDS: 'stable',
+  USDe: 'stable',
+};
+const getClusterForMint = (mint: string): string => {
+  const byMint = TOKEN_CLUSTER_BY_MINT[mint];
+  if (byMint) {
+    return byMint;
+  }
+  const symbol = tokenUniverseSymbolByMint.get(mint);
+  if (symbol) {
+    const bySymbol = TOKEN_CLUSTER_BY_SYMBOL[symbol];
+    if (bySymbol) {
+      return bySymbol;
+    }
+  }
+  return `single:${mint}`;
+};
 
 type TokenUniverseTableMeta = {
   tableName: string;
   mintColumn: string;
+  symbolColumn: string | null;
   enabledColumn: string | null;
   priorityColumn: string | null;
   updatedAtColumn: string | null;
+};
+
+type TokenUniverseRow = {
+  mint: string | null;
+  symbol: string | null;
+  enabled: boolean;
+  notes: string | null;
+};
+
+const isApprovedUniverseRow = (row: TokenUniverseRow) => {
+  const notes = row.notes?.trim() ?? '';
+  return TRUSTED_ENTRY_UNIVERSE_MINT_SET.has(row.mint ?? '')
+    || notes === 'core-seed'
+    || notes.startsWith('admitted:');
 };
 
 type TokenUniverseRankSample = {
@@ -534,6 +1239,8 @@ const sharedMarketTape = {
   solUsdJupiter: [] as MarketTapePoint[],
   solUsdDrift: [] as DriftTapePoint[],
 };
+
+const jupiterMomentumTapeByMint = new Map<string, MarketTapePoint[]>();
 
 type PersistedMarketTapeRow = {
   state: {
@@ -817,6 +1524,161 @@ type TokenUniverseMetadataWrite = {
   topTokens: unknown[];
 };
 
+let marketScannerStoreReadyPromise: Promise<void> | null = null;
+
+const ensureMarketScannerStore = async (dbPool: pg.Pool = getTokenUniversePool()) => {
+  if (!marketScannerStoreReadyPromise) {
+    marketScannerStoreReadyPromise = dbPool.query(`
+      CREATE TABLE IF NOT EXISTS public.market_scanner_runs (
+        id UUID PRIMARY KEY,
+        scanner_name TEXT NOT NULL,
+        source_table TEXT,
+        status TEXT NOT NULL,
+        reason TEXT,
+        candidate_count INTEGER NOT NULL DEFAULT 0,
+        accepted_count INTEGER NOT NULL DEFAULT 0,
+        rejected_count INTEGER NOT NULL DEFAULT 0,
+        provider_cost_estimate INTEGER NOT NULL DEFAULT 0,
+        started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        finished_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        details JSONB NOT NULL DEFAULT '{}'::jsonb
+      )
+    `)
+      .then(() => dbPool.query(`
+        CREATE TABLE IF NOT EXISTS public.market_candidates (
+          id UUID PRIMARY KEY,
+          scanner_run_id UUID NOT NULL REFERENCES public.market_scanner_runs(id) ON DELETE CASCADE,
+          strategy_slot TEXT NOT NULL,
+          input_mint TEXT NOT NULL,
+          output_mint TEXT NOT NULL,
+          output_symbol TEXT,
+          signal_score NUMERIC,
+          liquidity_score NUMERIC,
+          route_quality NUMERIC,
+          slippage_bps NUMERIC,
+          max_trade_size_atomic TEXT,
+          observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          valid_until TIMESTAMPTZ NOT NULL,
+          status TEXT NOT NULL,
+          provider_cost_estimate INTEGER NOT NULL DEFAULT 0,
+          risk_flags JSONB NOT NULL DEFAULT '[]'::jsonb,
+          details JSONB NOT NULL DEFAULT '{}'::jsonb
+        )
+      `))
+      .then(() => dbPool.query(`
+        CREATE INDEX IF NOT EXISTS market_candidates_active_idx
+        ON public.market_candidates (status, valid_until DESC, route_quality DESC)
+      `))
+      .then(() => dbPool.query(`
+        CREATE INDEX IF NOT EXISTS market_candidates_output_mint_idx
+        ON public.market_candidates (output_mint, observed_at DESC)
+      `))
+      .then(() => undefined);
+  }
+
+  return marketScannerStoreReadyPromise;
+};
+
+const persistMarketScannerRun = async (params: {
+  sourceTable: string | null;
+  status: 'applied' | 'skipped';
+  reason: string | null;
+  samples: TokenUniverseRankSample[];
+  enabledTop: number;
+  dbPool?: pg.Pool;
+}) => {
+  const dbPool = params.dbPool ?? getTokenUniversePool();
+  await ensureMarketScannerStore(dbPool);
+
+  const now = new Date();
+  const validUntil = new Date(now.getTime() + Math.max(30_000, MARKET_SCANNER_CANDIDATE_TTL_MS));
+  const persistedSamples = params.samples.slice(0, Math.max(1, MARKET_SCANNER_MAX_PERSISTED_CANDIDATES));
+  const acceptedSamples = persistedSamples.filter((sample, index) => (
+    index < params.enabledTop
+    && sample.routeFound
+    && (sample.priceImpactBps === null || sample.priceImpactBps <= TOKEN_UNIVERSE_AUTO_SORT_MAX_PRICE_IMPACT_BPS)
+  ));
+  const runId = randomUUID();
+
+  await dbPool.query('BEGIN');
+  try {
+    await dbPool.query(
+      `INSERT INTO public.market_scanner_runs (
+         id, scanner_name, source_table, status, reason, candidate_count,
+         accepted_count, rejected_count, provider_cost_estimate, started_at,
+         finished_at, details
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10, $11::jsonb)`,
+      [
+        runId,
+        'token_universe_autosort',
+        params.sourceTable,
+        params.status,
+        params.reason,
+        params.samples.length,
+        acceptedSamples.length,
+        Math.max(0, persistedSamples.length - acceptedSamples.length),
+        params.samples.length,
+        now,
+        JSON.stringify({
+          enabledTop: params.enabledTop,
+          maxPriceImpactBps: TOKEN_UNIVERSE_AUTO_SORT_MAX_PRICE_IMPACT_BPS,
+          candidateTtlMs: MARKET_SCANNER_CANDIDATE_TTL_MS,
+        }),
+      ],
+    );
+
+    for (let index = 0; index < persistedSamples.length; index += 1) {
+      const sample = persistedSamples[index];
+      const impactPass = sample.priceImpactBps === null || sample.priceImpactBps <= TOKEN_UNIVERSE_AUTO_SORT_MAX_PRICE_IMPACT_BPS;
+      const rankPass = index < params.enabledTop;
+      const accepted = sample.routeFound && impactPass && rankPass;
+      const riskFlags = [
+        !sample.routeFound ? 'route_not_found' : null,
+        !impactPass ? 'price_impact_too_high' : null,
+        !rankPass ? 'below_enabled_rank_cutoff' : null,
+      ].filter((value): value is string => value !== null);
+
+      await dbPool.query(
+        `INSERT INTO public.market_candidates (
+           id, scanner_run_id, strategy_slot, input_mint, output_mint,
+           output_symbol, signal_score, liquidity_score, route_quality,
+           slippage_bps, max_trade_size_atomic, observed_at, valid_until,
+           status, provider_cost_estimate, risk_flags, details
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16::jsonb, $17::jsonb)`,
+        [
+          randomUUID(),
+          runId,
+          'momentum',
+          SOL_MINT,
+          sample.mint,
+          resolveTokenSymbol(sample.mint),
+          sample.momentumBps,
+          sample.priceImpactBps === null ? null : -sample.priceImpactBps,
+          sample.score,
+          sample.priceImpactBps,
+          String(TOKEN_UNIVERSE_AUTO_SORT_NOTIONAL_USDC_ATOMIC),
+          now,
+          validUntil,
+          accepted ? 'active' : 'rejected',
+          1,
+          JSON.stringify(riskFlags),
+          JSON.stringify({
+            rank: index + 1,
+            usdPrice: sample.usdPrice,
+            priorUsdPrice: sample.priorUsdPrice,
+            routeFound: sample.routeFound,
+          }),
+        ],
+      );
+    }
+
+    await dbPool.query('COMMIT');
+  } catch (error) {
+    await dbPool.query('ROLLBACK');
+    throw error;
+  }
+};
+
 const persistTokenUniverseMetadata = async (
   write: TokenUniverseMetadataWrite,
   dbPool: pg.Pool = getTokenUniversePool(),
@@ -833,7 +1695,7 @@ const persistTokenUniverseMetadata = async (
 
   try {
     await dbPool.query(
-      `INSERT INTO public.rogueai_token_universe_metadata (
+      `INSERT INTO public.rz_token_universe_metadata (
          source_table, status, reason, candidate_count, enabled_count,
          avg_momentum_bps, avg_price_impact_bps, top_tokens, built_at
        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, now())`,
@@ -959,6 +1821,13 @@ const pushBounded = <T>(tape: T[], point: T, maxSize: number) => {
   }
 };
 
+const getMomentumTapeForMint = (mint: string): readonly MarketTapePoint[] => {
+  if (mint === SOL_MINT) {
+    return sharedMarketTape.solUsdPyth;
+  }
+  return jupiterMomentumTapeByMint.get(mint) ?? [];
+};
+
 const getSharedMarketTapeSummary = () => ({
   pythDepth: sharedMarketTape.solUsdPyth.length,
   jupiterDepth: sharedMarketTape.solUsdJupiter.length,
@@ -983,7 +1852,7 @@ const computeMomentumBps = (samples: readonly MarketTapePoint[], lookbackSamples
   return Math.round(((latest.usdPrice - baseline.usdPrice) / baseline.usdPrice) * 10_000);
 };
 
-const classifyMomentum = (momentumBps: number, thresholdBps: number) => {
+const classifyMomentum = (momentumBps: number, thresholdBps: number): 'bullish' | 'bearish' | 'flat' => {
   if (momentumBps >= thresholdBps) {
     return 'bullish';
   }
@@ -1050,15 +1919,16 @@ const parseQuotePriceImpactBps = (priceImpactPct: string | null | undefined): nu
   }
 
   const parsed = Number(priceImpactPct);
-  if (!Number.isFinite(parsed) || parsed < 0) {
+  if (!Number.isFinite(parsed)) {
     return null;
   }
+  const absoluteImpact = Math.abs(parsed);
 
   // Jupiter payloads have historically appeared as either fraction (0.01 = 1%)
   // or percentage-like values. Support both defensively.
-  return parsed <= 1
-    ? Math.round(parsed * 10_000)
-    : Math.round(parsed * 100);
+  return absoluteImpact <= 1
+    ? Math.round(absoluteImpact * 10_000)
+    : Math.round(absoluteImpact * 100);
 };
 
 const logSignalEvent = (event: object) => {
@@ -1112,6 +1982,15 @@ const dedupeMints = (mints: readonly string[]) => {
   return next;
 };
 
+const isHardBlockedUniverseToken = (params: { mint: string; symbol?: string | null }) => {
+  if (TOKEN_UNIVERSE_HARD_BLOCKED_MINTS.has(params.mint)) {
+    return true;
+  }
+
+  const symbol = params.symbol?.trim().toUpperCase();
+  return !!symbol && TOKEN_UNIVERSE_HARD_BLOCKED_SYMBOLS.has(symbol);
+};
+
 const computePriceMomentumBps = (latestUsd: number | null, priorUsd: number | null) => {
   if (!latestUsd || !priorUsd || priorUsd <= 0) {
     return 0;
@@ -1130,6 +2009,184 @@ const buildUniverseSortScore = (params: {
   return boundedMomentum - impactPenalty + routeBonus;
 };
 
+const getMintDecimals = (mint: string): number => {
+  if (mint === SOL_MINT) return 9;
+  if (mint === USDC_MINT) return 6;
+  if (mint === 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB') return 6;
+  return latestJupiterDecimalsByMint.get(mint) ?? 9;
+};
+
+const toUiAmount = (mint: string, atomicAmount: number, decimalsOverride?: number | null): number => {
+  const decimals = decimalsOverride ?? getMintDecimals(mint);
+  return atomicAmount / (10 ** decimals);
+};
+
+const resolveTokenSymbol = (mint: string): string => {
+  if (mint === SOL_MINT) return 'SOL';
+  if (mint === USDC_MINT) return 'USDC';
+  if (mint === 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB') return 'USDT';
+  return tokenUniverseSymbolByMint.get(mint) ?? `${mint.slice(0, 4)}...${mint.slice(-4)}`;
+};
+
+const isLongPositionStatus = (status: SessionPositionState['status']) =>
+  status === 'long' || status === 'long_sol';
+
+const getPositionMint = (positionState: SessionPositionState): string =>
+  positionState.positionMint ?? SOL_MINT;
+
+const getPositionSymbol = (positionState: SessionPositionState): string =>
+  positionState.positionSymbol ?? resolveTokenSymbol(getPositionMint(positionState));
+
+const clonePositionState = (positionState: SessionPositionState): SessionPositionState => ({
+  ...positionState,
+});
+
+const normalizePositionsState = (positionsState: SessionPositionsState | null | undefined): SessionPositionsState => {
+  const nextPositions = Object.fromEntries(
+    Object.entries(positionsState?.positions ?? {}).filter(([, position]) => (
+      !!position
+      && isLongPositionStatus(position.status)
+      && typeof position.positionMint === 'string'
+    )),
+  ) as SessionPositionsState['positions'];
+
+  const activePositionMint = positionsState?.activePositionMint;
+  return {
+    activePositionMint: activePositionMint && nextPositions[activePositionMint]
+      ? activePositionMint
+      : (Object.keys(nextPositions)[0] ?? null),
+    positions: nextPositions,
+  };
+};
+
+const getPositionsState = (session: RawSession): SessionPositionsState => {
+  if (session.service_control.positionsState) {
+    return normalizePositionsState(session.service_control.positionsState);
+  }
+
+  const legacy = session.service_control.positionState;
+  if (legacy && isLongPositionStatus(legacy.status)) {
+    const mint = legacy.positionMint ?? SOL_MINT;
+    return {
+      activePositionMint: mint,
+      positions: {
+        [mint]: clonePositionState({
+          ...legacy,
+          positionMint: mint,
+          positionSymbol: legacy.positionSymbol ?? resolveTokenSymbol(mint),
+        }),
+      },
+    };
+  }
+
+  return {
+    activePositionMint: null,
+    positions: {},
+  };
+};
+
+const listOpenPositions = (positionsState: SessionPositionsState) =>
+  Object.entries(normalizePositionsState(positionsState).positions)
+    .map(([mint, position]) => ({ mint, position }))
+    .filter(({ position }) => isLongPositionStatus(position.status));
+
+const countOpenPositions = (positionsState: SessionPositionsState) =>
+  listOpenPositions(positionsState).length;
+
+const persistPositionsState = async (
+  session: RawSession,
+  positionsState: SessionPositionsState,
+  summaryFallback: Partial<SessionPositionState> = {},
+) => {
+  const normalized = normalizePositionsState(positionsState);
+  const currentSummary = session.service_control.positionState;
+  const nextSummary = summarizePositionsState(normalized, {
+    lastMarkedPriceUsd: summaryFallback.lastMarkedPriceUsd ?? currentSummary?.lastMarkedPriceUsd ?? null,
+    lastMarkedAt: summaryFallback.lastMarkedAt ?? currentSummary?.lastMarkedAt ?? null,
+    exitReason: summaryFallback.exitReason ?? currentSummary?.exitReason ?? null,
+  });
+
+  await persistServiceControl(session, {
+    positionsState: normalized,
+    positionState: nextSummary,
+  });
+
+  return normalized;
+};
+
+const buildMintMomentumSignal = (mint: string, config: { lookbackSamples: number; thresholdBps: number }) => {
+  const latestUsd = latestJupiterUsdByMint.get(mint) ?? null;
+  const priorUsd = previousJupiterUsdByMint.get(mint) ?? null;
+  const tape = getMomentumTapeForMint(mint);
+  const momentumBps = computeMomentumBps(tape, config.lookbackSamples);
+  const fallbackMomentumBps = computePriceMomentumBps(latestUsd, priorUsd);
+  const ready = momentumBps !== null;
+  return {
+    at: new Date().toISOString(),
+    source: 'pyth-hermes' as const,
+    signal: 'momentum' as const,
+    status: ready ? 'ready' as const : 'warming_up' as const,
+    regime: ready ? classifyMomentum(momentumBps, config.thresholdBps) : null,
+    lookbackSamples: config.lookbackSamples,
+    thresholdBps: config.thresholdBps,
+    momentumBps: ready ? momentumBps : null,
+    guardReason: ready ? null : `price_tape_warming_${tape.length}/${config.lookbackSamples + 1}`,
+    latestUsd,
+    priorUsdPrice: priorUsd,
+    fallbackMomentumBps,
+  };
+};
+
+const buildRuntimeSignalForMint = (
+  mint: string,
+  activeStrategy: 'momentum' | 'mean_reversion' | 'supertrend',
+  strategyConfig: ReturnType<typeof getSessionStrategyConfig>,
+): NonNullable<Session['serviceControl']['lastSignal']> => {
+  if (activeStrategy === 'momentum') {
+    return buildMintMomentumSignal(mint, strategyConfig.momentum);
+  }
+
+  if (activeStrategy === 'mean_reversion') {
+    const tape = getMomentumTapeForMint(mint).map((sample) => ({
+      sampledAt: sample.sampledAt,
+      usdPrice: sample.usdPrice,
+    }));
+    const signal = computeBollingerSignal(tape, strategyConfig.meanReversion);
+    return {
+      at: new Date().toISOString(),
+      source: 'pyth-hermes',
+      signal: 'momentum',
+      status: signal.status,
+      regime: signal.regime,
+      lookbackSamples: strategyConfig.momentum.lookbackSamples,
+      thresholdBps: strategyConfig.momentum.thresholdBps,
+      momentumBps: signal.momentumBps,
+      guardReason: signal.guardReason,
+    };
+  }
+
+  if (activeStrategy === 'supertrend') {
+    const tape = getMomentumTapeForMint(mint).map((sample) => ({
+      sampledAt: sample.sampledAt,
+      usdPrice: sample.usdPrice,
+    }));
+    const signal = computeSupertrendSignal(tape, strategyConfig.supertrend);
+    return {
+      at: new Date().toISOString(),
+      source: 'pyth-hermes',
+      signal: 'momentum',
+      status: signal.status,
+      regime: signal.regime,
+      lookbackSamples: strategyConfig.momentum.lookbackSamples,
+      thresholdBps: strategyConfig.momentum.thresholdBps,
+      momentumBps: signal.momentumBps,
+      guardReason: signal.guardReason,
+    };
+  }
+
+  return buildMintMomentumSignal(mint, strategyConfig.momentum);
+};
+
 const applyTokenUniverseAutoSort = async () => {
   if (!TOKEN_UNIVERSE_AUTO_SORT_ENABLED) {
     return;
@@ -1142,6 +2199,7 @@ const applyTokenUniverseAutoSort = async () => {
   lastTokenUniverseAutoSortAt = now;
 
   if (!tokenUniverseTableMeta?.enabledColumn || !tokenUniverseTableMeta?.priorityColumn) {
+    tokenUniverseActiveMints = [];
     await persistTokenUniverseMetadata({
       sourceTable: tokenUniverseSourceTable,
       status: 'skipped',
@@ -1166,10 +2224,11 @@ const applyTokenUniverseAutoSort = async () => {
   }
 
   const candidateMints = dedupeMints(tokenUniverseMints)
-    .filter((mint) => mint !== USDC_MINT)
+    .filter((mint) => mint !== SOL_MINT && mint !== USDC_MINT)
     .slice(0, Math.max(1, TOKEN_UNIVERSE_AUTO_SORT_MAX_MINTS));
 
   if (candidateMints.length === 0) {
+    tokenUniverseActiveMints = [];
     await persistTokenUniverseMetadata({
       sourceTable: tokenUniverseSourceTable,
       status: 'skipped',
@@ -1209,11 +2268,27 @@ const applyTokenUniverseAutoSort = async () => {
   const pruneDecisions = new Map<string, { reason: string; deadRuns: number; crossedThreshold: boolean }>();
   const recoveredMints: string[] = [];
   let routeProbeUnavailableCount = 0;
-  const protectedMints = new Set<string>([
-    SOL_MINT,
-    USDC_MINT,
-    'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',
-  ]);
+  const currentlyEnabledUniverseMints = new Set(tokenUniverseActiveMints);
+  const buildHealthEntry = (
+    mint: string,
+    previous: TokenUniverseHealthEntry | null,
+    overrides: Partial<TokenUniverseHealthEntry> = {},
+  ): TokenUniverseHealthEntry => {
+    const dbEnabled = currentlyEnabledUniverseMints.has(mint);
+    const trustedSeed = TRUSTED_ENTRY_UNIVERSE_MINT_SET.has(mint);
+    const enabled = overrides.enabled ?? previous?.enabled ?? dbEnabled ?? trustedSeed;
+    return {
+      deadRuns: overrides.deadRuns ?? previous?.deadRuns ?? 0,
+      admitRuns: overrides.admitRuns ?? previous?.admitRuns ?? 0,
+      evictRuns: overrides.evictRuns ?? previous?.evictRuns ?? 0,
+      enabled,
+      enabledSinceRun: overrides.enabledSinceRun
+        ?? previous?.enabledSinceRun
+        ?? (enabled ? currentRun : null),
+      lastReason: overrides.lastReason ?? previous?.lastReason ?? null,
+      lastSeenAt: overrides.lastSeenAt ?? new Date().toISOString(),
+    };
+  };
   for (const mint of candidateMints) {
     const previous = nextHealthState.mints[mint] ?? null;
     const routeCheck = await apiPost<BuildRouteScoutResponse>('/jupiter/swap/build', {
@@ -1223,7 +2298,7 @@ const applyTokenUniverseAutoSort = async () => {
       taker: universeSortProbeTaker,
       feeTokenSymbol: 'USDC',
       slippageBps: '50',
-    }, { limiter: jupiterLimiter });
+    });
 
     if (!routeCheck.ok && routeCheck.status >= 500) {
       routeProbeUnavailableCount += 1;
@@ -1264,11 +2339,8 @@ const applyTokenUniverseAutoSort = async () => {
     if (deadReason) {
       const deadRuns = (previous?.deadRuns ?? 0) + 1;
       nextHealthState.mints[mint] = {
+        ...buildHealthEntry(mint, previous),
         deadRuns,
-        admitRuns: previous?.admitRuns ?? 0,
-        evictRuns: previous?.evictRuns ?? 0,
-        enabled: previous?.enabled ?? false,
-        enabledSinceRun: previous?.enabledSinceRun ?? null,
         lastReason: deadReason,
         lastSeenAt: new Date().toISOString(),
       };
@@ -1284,11 +2356,8 @@ const applyTokenUniverseAutoSort = async () => {
         recoveredMints.push(mint);
       }
       nextHealthState.mints[mint] = {
+        ...buildHealthEntry(mint, previous),
         deadRuns: 0,
-        admitRuns: previous?.admitRuns ?? 0,
-        evictRuns: previous?.evictRuns ?? 0,
-        enabled: previous?.enabled ?? false,
-        enabledSinceRun: previous?.enabledSinceRun ?? null,
         lastReason: null,
         lastSeenAt: new Date().toISOString(),
       };
@@ -1324,6 +2393,7 @@ const applyTokenUniverseAutoSort = async () => {
   }
 
   if (hasProbeUnavailable) {
+    tokenUniverseActiveMints = [];
     const reason = nextHealthState.probeFrozen
       ? 'probe_health_frozen'
       : 'route_probe_unavailable';
@@ -1366,6 +2436,7 @@ const applyTokenUniverseAutoSort = async () => {
   }
 
   if (nextHealthState.probeFrozen) {
+    tokenUniverseActiveMints = [];
     const trimmed = trimTokenUniverseHealthState(nextHealthState);
     await persistTokenUniverseHealthState(trimmed);
     tokenUniverseProbeFrozen = trimmed.probeFrozen;
@@ -1406,6 +2477,7 @@ const applyTokenUniverseAutoSort = async () => {
   }
 
   if (rankedSamples.length === 0) {
+    tokenUniverseActiveMints = [];
     const reason = 'no_candidates_after_probe';
 
     const trimmed = trimTokenUniverseHealthState(nextHealthState);
@@ -1448,6 +2520,7 @@ const applyTokenUniverseAutoSort = async () => {
 
   rankedSamples.sort((a, b) => b.score - a.score);
   const enabledTop = Math.max(1, TOKEN_UNIVERSE_AUTO_SORT_TOP_ENABLED);
+  const admissionApprovedMints = new Set(tokenUniverseMints);
 
   const dbPool = getTokenUniversePool();
   const table = tokenUniverseTableMeta.tableName;
@@ -1465,18 +2538,13 @@ const applyTokenUniverseAutoSort = async () => {
   }> = [];
   const admittedRows: string[] = [];
   const evictedRows: string[] = [];
+  const enabledRuntimeMints: string[] = [];
 
   for (let index = 0; index < rankedSamples.length; index += 1) {
     const sample = rankedSamples[index];
-    const entry = nextHealthState.mints[sample.mint] ?? {
-      deadRuns: 0,
-      admitRuns: 0,
-      evictRuns: 0,
-      enabled: false,
-      enabledSinceRun: null,
-      lastReason: null,
-      lastSeenAt: new Date().toISOString(),
-    };
+    const trustedSeed = TRUSTED_ENTRY_UNIVERSE_MINT_SET.has(sample.mint);
+    const admissionApproved = admissionApprovedMints.has(sample.mint);
+    const entry = buildHealthEntry(sample.mint, nextHealthState.mints[sample.mint] ?? null);
 
     const enableByRank = index < enabledTop;
     const evictionRank = enabledTop + Math.max(1, TOKEN_UNIVERSE_EVICTION_RANK_BUFFER);
@@ -1488,10 +2556,10 @@ const applyTokenUniverseAutoSort = async () => {
     const pruneDecision = pruneDecisions.get(sample.mint);
     const shouldPrune = TOKEN_UNIVERSE_DEAD_PRUNE_ENABLED
       && Boolean(pruneDecision)
-      && !protectedMints.has(sample.mint)
+      && !trustedSeed
       && (pruneDecision?.deadRuns ?? 0) >= TOKEN_UNIVERSE_DEAD_RUN_THRESHOLD;
 
-    let shouldEnable = entry.enabled;
+    let shouldEnable = admissionApproved || entry.enabled || trustedSeed;
     let enabledSinceRun = entry.enabledSinceRun;
     let admitRuns = entry.admitRuns;
     let evictRuns = entry.evictRuns;
@@ -1500,6 +2568,11 @@ const applyTokenUniverseAutoSort = async () => {
       shouldEnable = false;
       enabledSinceRun = null;
       admitRuns = 0;
+      evictRuns = 0;
+    } else if (trustedSeed || admissionApproved) {
+      shouldEnable = true;
+      enabledSinceRun = enabledSinceRun ?? currentRun;
+      admitRuns = strongCandidate ? Math.min(admitRuns + 1, 10_000) : admitRuns;
       evictRuns = 0;
     } else if (!shouldEnable) {
       admitRuns = strongCandidate ? (admitRuns + 1) : 0;
@@ -1538,13 +2611,21 @@ const applyTokenUniverseAutoSort = async () => {
       enabledSinceRun,
       lastReason: shouldPrune
         ? (pruneDecision?.reason ?? entry.lastReason)
-        : weakCandidate
+        : trustedSeed
+          ? 'trusted_seed'
+          : admissionApproved
+            ? (strongCandidate ? 'route_qualified_active' : 'route_qualified_pool')
+          : weakCandidate
           ? 'weak_candidate'
           : strongCandidate
             ? 'strong_candidate'
             : entry.lastReason,
       lastSeenAt: new Date().toISOString(),
     };
+
+    if (shouldEnable) {
+      enabledRuntimeMints.push(sample.mint);
+    }
 
     const priority = shouldPrune ? 0 : Math.max(0, 1_000 - index);
 
@@ -1573,11 +2654,38 @@ const applyTokenUniverseAutoSort = async () => {
     }
   }
 
+  for (const token of DEFAULT_TOKEN_UNIVERSE_SEED) {
+    if (!TRUSTED_ENTRY_UNIVERSE_MINT_SET.has(token.mint)) continue;
+    if (!enabledRuntimeMints.includes(token.mint)) {
+      enabledRuntimeMints.push(token.mint);
+    }
+    if (rankedSamples.some((sample) => sample.mint === token.mint)) continue;
+
+    const updateSql = updatedAtColumn
+      ? `UPDATE public.${table}
+           SET ${enabledColumn} = TRUE,
+               ${priorityColumn} = GREATEST(COALESCE(${priorityColumn}, 0), $1),
+               ${updatedAtColumn} = NOW()
+         WHERE ${mintColumn}::text = $2`
+      : `UPDATE public.${table}
+           SET ${enabledColumn} = TRUE,
+               ${priorityColumn} = GREATEST(COALESCE(${priorityColumn}, 0), $1)
+         WHERE ${mintColumn}::text = $2`;
+
+    await dbPool.query(updateSql, [token.priority, token.mint]);
+    nextHealthState.mints[token.mint] = buildHealthEntry(token.mint, nextHealthState.mints[token.mint] ?? null, {
+      enabled: true,
+      enabledSinceRun: nextHealthState.mints[token.mint]?.enabledSinceRun ?? currentRun,
+      evictRuns: 0,
+      lastReason: 'trusted_seed',
+    });
+  }
+
   if (deadletterRows.length > 0) {
     for (const row of deadletterRows) {
       try {
         await dbPool.query(
-          `INSERT INTO public.rogueai_token_universe_deadletter (
+          `INSERT INTO public.rz_token_universe_deadletter (
              source_table, mint, symbol, reason, dead_runs, score,
              momentum_bps, price_impact_bps, details, dumped_at
            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, now())`,
@@ -1609,12 +2717,12 @@ const applyTokenUniverseAutoSort = async () => {
     for (const mint of recoveredMints) {
       try {
         await dbPool.query(
-          `UPDATE public.rogueai_token_universe_deadletter
+          `UPDATE public.rz_token_universe_deadletter
               SET recovered_at = now(),
                   recovered_reason = 'route_and_impact_recovered'
             WHERE id = (
               SELECT id
-                FROM public.rogueai_token_universe_deadletter
+                FROM public.rz_token_universe_deadletter
                WHERE mint = $1
                  AND recovered_at IS NULL
                ORDER BY dumped_at DESC
@@ -1631,13 +2739,17 @@ const applyTokenUniverseAutoSort = async () => {
   const trimmed = trimTokenUniverseHealthState(nextHealthState);
   await persistTokenUniverseHealthState(trimmed);
   tokenUniverseProbeFrozen = trimmed.probeFrozen;
+  tokenUniverseActiveMints = dedupeMints(enabledRuntimeMints);
+  const routeAcceptedCount = rankedSamples.filter((sample, idx) => idx < enabledTop && sample.routeFound && (sample.priceImpactBps === null || sample.priceImpactBps <= TOKEN_UNIVERSE_AUTO_SORT_MAX_PRICE_IMPACT_BPS)).length;
+  const enabledCount = tokenUniverseActiveMints.length;
 
   logPriceEvent({
     provider: 'token-universe',
     autoSort: 'applied',
     sourceTable: table,
     candidateCount: rankedSamples.length,
-    enabledCount: rankedSamples.filter((sample, idx) => idx < enabledTop && sample.routeFound && (sample.priceImpactBps === null || sample.priceImpactBps <= TOKEN_UNIVERSE_AUTO_SORT_MAX_PRICE_IMPACT_BPS)).length,
+    enabledCount,
+    routeAcceptedCount,
     deadDumpCount: deadletterRows.length,
     recoveredCount: recoveredMints.length,
     admittedCount: admittedRows.length,
@@ -1657,7 +2769,6 @@ const applyTokenUniverseAutoSort = async () => {
     })),
   });
 
-  const enabledCount = rankedSamples.filter((sample, idx) => idx < enabledTop && sample.routeFound && (sample.priceImpactBps === null || sample.priceImpactBps <= TOKEN_UNIVERSE_AUTO_SORT_MAX_PRICE_IMPACT_BPS)).length;
   lastTokenUniverseEngineAppliedAt = Date.now();
   lastTokenUniverseEngineEnabledCount = enabledCount;
 
@@ -1688,6 +2799,23 @@ const applyTokenUniverseAutoSort = async () => {
       routeFound: sample.routeFound,
     })),
   }, dbPool);
+
+  try {
+    await persistMarketScannerRun({
+      sourceTable: table,
+      status: 'applied',
+      reason: null,
+      samples: rankedSamples,
+      enabledTop,
+      dbPool,
+    });
+  } catch (err) {
+    logPriceEvent({
+      provider: 'market-scanner',
+      persistFailed: true,
+      error: String(err),
+    });
+  }
 
   await persistTokenUniverseAutoSortState({
     status: 'applied',
@@ -1725,17 +2853,23 @@ const ensureTokenUniverseTable = async () => {
   try {
     const dbPool = getTokenUniversePool();
     await dbPool.query(`
-      CREATE TABLE IF NOT EXISTS public.rogueai_token_universe (
+      CREATE TABLE IF NOT EXISTS public.rz_token_universe (
         mint TEXT PRIMARY KEY,
         symbol TEXT,
         enabled BOOLEAN NOT NULL DEFAULT true,
         priority INTEGER NOT NULL DEFAULT 0,
+        notes TEXT,
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
       )
     `);
 
     await dbPool.query(`
-      CREATE TABLE IF NOT EXISTS public.rogueai_token_universe_metadata (
+      ALTER TABLE public.rz_token_universe
+        ADD COLUMN IF NOT EXISTS notes TEXT
+    `);
+
+    await dbPool.query(`
+      CREATE TABLE IF NOT EXISTS public.rz_token_universe_metadata (
         id BIGSERIAL PRIMARY KEY,
         source_table TEXT,
         status TEXT NOT NULL,
@@ -1750,7 +2884,7 @@ const ensureTokenUniverseTable = async () => {
     `);
 
     await dbPool.query(`
-      CREATE TABLE IF NOT EXISTS public.rogueai_token_universe_deadletter (
+      CREATE TABLE IF NOT EXISTS public.rz_token_universe_deadletter (
         id BIGSERIAL PRIMARY KEY,
         source_table TEXT,
         mint TEXT NOT NULL,
@@ -1766,24 +2900,30 @@ const ensureTokenUniverseTable = async () => {
     `);
 
     await dbPool.query(`
-      ALTER TABLE public.rogueai_token_universe_deadletter
+      ALTER TABLE public.rz_token_universe_deadletter
       ADD COLUMN IF NOT EXISTS recovered_at TIMESTAMPTZ,
       ADD COLUMN IF NOT EXISTS recovered_reason TEXT
     `);
 
     for (const token of DEFAULT_TOKEN_UNIVERSE_SEED) {
       await dbPool.query(
-        `INSERT INTO public.rogueai_token_universe (mint, symbol, enabled, priority)
-         VALUES ($1, $2, true, $3)
+        `INSERT INTO public.rz_token_universe (mint, symbol, enabled, priority, notes)
+         VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT (mint) DO NOTHING`,
-        [token.mint, token.symbol, token.priority],
+        [
+          token.mint,
+          token.symbol,
+          TRUSTED_ENTRY_UNIVERSE_MINT_SET.has(token.mint),
+          token.priority,
+          TRUSTED_ENTRY_UNIVERSE_MINT_SET.has(token.mint) ? 'core-seed' : 'disabled:legacy-static-seed',
+        ],
       );
     }
 
     logPriceEvent({
       provider: 'token-universe',
       bootstrap: 'completed',
-      table: 'rogueai_token_universe',
+      table: 'rz_token_universe',
       seeded: DEFAULT_TOKEN_UNIVERSE_SEED.length,
     });
   } catch (err) {
@@ -1804,6 +2944,8 @@ const refreshTokenUniverseMints = async (force = false) => {
 
   if (TOKEN_UNIVERSE_TABLE_CANDIDATES.length === 0) {
     tokenUniverseMints = [];
+    tokenUniverseActiveMints = [];
+    tokenUniverseSymbolByMint.clear();
     tokenUniverseSourceTable = null;
     tokenUniverseTableMeta = null;
     return tokenUniverseMints;
@@ -1826,6 +2968,8 @@ const refreshTokenUniverseMints = async (force = false) => {
 
     if (!selectedTable || !isSafeSqlIdentifier(selectedTable)) {
       tokenUniverseMints = [];
+      tokenUniverseActiveMints = [];
+      tokenUniverseSymbolByMint.clear();
       tokenUniverseSourceTable = null;
       tokenUniverseTableMeta = null;
       return tokenUniverseMints;
@@ -1843,43 +2987,95 @@ const refreshTokenUniverseMints = async (force = false) => {
     const mintColumn = ['mint', 'mint_address', 'token_mint', 'address'].find((column) => columns.has(column)) ?? null;
     if (!mintColumn || !isSafeSqlIdentifier(mintColumn)) {
       tokenUniverseMints = [];
+      tokenUniverseActiveMints = [];
+      tokenUniverseSymbolByMint.clear();
       tokenUniverseSourceTable = selectedTable;
       tokenUniverseTableMeta = null;
       return tokenUniverseMints;
     }
 
+    const symbolColumn = ['symbol', 'ticker', 'token_symbol', 'name'].find((column) => columns.has(column)) ?? null;
     const enabledColumn = ['enabled', 'is_enabled', 'active'].find((column) => columns.has(column)) ?? null;
     const priorityColumn = ['priority', 'rank', 'score', 'weight'].find((column) => columns.has(column)) ?? null;
+    const notesColumn = columns.has('notes') ? 'notes' : null;
     const updatedAtColumn = ['updated_at', 'updatedAt', 'modified_at'].find((column) => columns.has(column)) ?? null;
 
-    const whereClause = (!TOKEN_UNIVERSE_AUTO_SORT_ENABLED && enabledColumn && isSafeSqlIdentifier(enabledColumn))
+      const whereClause = enabledColumn && isSafeSqlIdentifier(enabledColumn) && !TOKEN_UNIVERSE_INCLUDE_DISABLED_CANDIDATES
       ? `WHERE COALESCE(${enabledColumn}, true) = true`
       : '';
     const orderClause = priorityColumn && isSafeSqlIdentifier(priorityColumn)
       ? `ORDER BY ${priorityColumn} DESC NULLS LAST`
       : '';
 
-    const query = `SELECT ${mintColumn}::text AS mint
+    const symbolSelect = symbolColumn && isSafeSqlIdentifier(symbolColumn)
+      ? `, ${symbolColumn}::text AS symbol`
+      : `, NULL::text AS symbol`;
+    const enabledSelect = enabledColumn && isSafeSqlIdentifier(enabledColumn)
+      ? `, COALESCE(${enabledColumn}, true)::boolean AS enabled`
+      : `, true::boolean AS enabled`;
+    const notesSelect = notesColumn && isSafeSqlIdentifier(notesColumn)
+      ? `, ${notesColumn}::text AS notes`
+      : `, NULL::text AS notes`;
+    const query = `SELECT ${mintColumn}::text AS mint${symbolSelect}${enabledSelect}${notesSelect}
                      FROM public.${selectedTable}
                      ${whereClause}
                      ${orderClause}
                      LIMIT ${Math.max(1, TOKEN_UNIVERSE_MAX_MINTS)}`;
 
-    const mintResult = await dbPool.query<{ mint: string | null }>(query);
-    tokenUniverseMints = dedupeMints(mintResult.rows.map((row) => row.mint ?? ''));
+    const mintResult = await dbPool.query<TokenUniverseRow>(query);
+    const approvedRows = mintResult.rows.filter(isApprovedUniverseRow);
+    const trustedMints = TRUSTED_ENTRY_UNIVERSE_MINTS.filter((mint) => !TOKEN_UNIVERSE_HARD_BLOCKED_MINTS.has(mint));
+    tokenUniverseMints = dedupeMints([
+      ...trustedMints,
+      ...(
+      approvedRows
+        .filter((row) => !isHardBlockedUniverseToken({ mint: row.mint ?? '', symbol: row.symbol }))
+        .map((row) => row.mint ?? '')
+      ),
+    ]);
+    tokenUniverseSymbolByMint.clear();
+    for (const row of approvedRows) {
+      const mint = row.mint ?? '';
+      if (!solanaPublicKeyPattern.test(mint)) continue;
+      if (isHardBlockedUniverseToken({ mint, symbol: row.symbol })) continue;
+      const symbol = row.symbol?.trim();
+      if (symbol && symbol.length > 0) {
+        tokenUniverseSymbolByMint.set(mint, symbol.toUpperCase());
+      }
+    }
     tokenUniverseSourceTable = selectedTable;
     tokenUniverseTableMeta = {
       tableName: selectedTable,
       mintColumn,
+      symbolColumn: symbolColumn && isSafeSqlIdentifier(symbolColumn) ? symbolColumn : null,
       enabledColumn: enabledColumn && isSafeSqlIdentifier(enabledColumn) ? enabledColumn : null,
       priorityColumn: priorityColumn && isSafeSqlIdentifier(priorityColumn) ? priorityColumn : null,
       updatedAtColumn: updatedAtColumn && isSafeSqlIdentifier(updatedAtColumn) ? updatedAtColumn : null,
     };
 
+    // Seed active runtime mints from current DB-enabled rows immediately so
+    // entry logic has a usable universe before autosort's next full pass.
+    const enabledRuntimeSeed = dedupeMints([
+      ...trustedMints,
+      ...approvedRows
+        .filter((row) => row.enabled)
+        .filter((row) => !isHardBlockedUniverseToken({ mint: row.mint ?? '', symbol: row.symbol }))
+        .map((row) => row.mint ?? ''),
+    ]);
+
+    if (enabledRuntimeSeed.length > 0) {
+      tokenUniverseActiveMints = enabledRuntimeSeed;
+      lastTokenUniverseEngineAppliedAt = Date.now();
+      lastTokenUniverseEngineEnabledCount = tokenUniverseActiveMints.length;
+      tokenUniverseProbeFrozen = false;
+    }
+
     logPriceEvent({
       provider: 'token-universe',
       sourceTable: tokenUniverseSourceTable,
       mintCount: tokenUniverseMints.length,
+      enabledMintCount: approvedRows.filter((row) => row.enabled).length,
+      includeDisabledCandidates: TOKEN_UNIVERSE_INCLUDE_DISABLED_CANDIDATES,
     });
   } catch (err) {
     logPriceEvent({
@@ -1942,33 +3138,42 @@ const fetchJupiterPricesUsd = async (
   if (!jupiterPriceConfig) {
     throw new Error('jupiter price config not initialised');
   }
-  await jupiterLimiter.acquire();
-  const url = `${jupiterPriceConfig.apiBaseUrl}?ids=${mints.join(',')}`;
-  const res = await fetch(url, {
-    headers: { 'x-api-key': jupiterPriceConfig.apiKey },
-  });
-  if (!res.ok) {
-    throw new Error(`jupiter price v3 ${res.status} ${res.statusText}`);
-  }
-  const body = (await res.json()) as Record<
-    string,
-    { usdPrice: number; blockId: number; decimals: number } | null
-  >;
+
   const out: Record<string, JupiterPriceSample> = {};
-  const sampledAt = new Date().toISOString();
-  for (const mint of mints) {
-    const entry = body[mint];
-    if (entry && typeof entry.usdPrice === 'number') {
-      out[mint] = {
-        source: 'jupiter-price-v3',
-        mint,
-        usdPrice: entry.usdPrice,
-        blockId: entry.blockId,
-        decimals: entry.decimals,
-        sampledAt,
-      };
+
+  const batchSize = Math.max(1, Math.floor(WORKER_JUPITER_PRICE_BATCH_SIZE));
+  for (let i = 0; i < mints.length; i += batchSize) {
+    const batch = mints.slice(i, i + batchSize);
+    if (batch.length === 0) continue;
+
+    await reserveJupiterRequest();
+    const url = `${jupiterPriceConfig.apiBaseUrl}?ids=${batch.join(',')}`;
+    const res = await fetch(url, {
+      headers: { 'x-api-key': (jupiterPriceApiKeySelector?.next() ?? jupiterPriceConfig.apiKey) },
+    });
+    if (!res.ok) {
+      throw new Error(`jupiter price v3 ${res.status} ${res.statusText}`);
+    }
+    const body = (await res.json()) as Record<
+      string,
+      { usdPrice: number; blockId: number; decimals: number } | null
+    >;
+    const sampledAt = new Date().toISOString();
+    for (const mint of batch) {
+      const entry = body[mint];
+      if (entry && typeof entry.usdPrice === 'number') {
+        out[mint] = {
+          source: 'jupiter-price-v3',
+          mint,
+          usdPrice: entry.usdPrice,
+          blockId: entry.blockId,
+          decimals: entry.decimals,
+          sampledAt,
+        };
+      }
     }
   }
+
   return out;
 };
 
@@ -2093,15 +3298,27 @@ const runJupiterPricePollTick = async (): Promise<void> => {
     ]);
     const samples = await fetchJupiterPricesUsd(mints);
     for (const mint of Object.keys(samples)) {
-      const nextUsd = samples[mint]?.usdPrice;
+      const sample = samples[mint];
+      const nextUsd = sample?.usdPrice;
       if (typeof nextUsd !== 'number' || !Number.isFinite(nextUsd) || nextUsd <= 0) {
         continue;
+      }
+      const nextDecimals = sample?.decimals;
+      if (typeof nextDecimals === 'number' && Number.isFinite(nextDecimals) && nextDecimals >= 0) {
+        latestJupiterDecimalsByMint.set(mint, Math.floor(nextDecimals));
       }
       const currentUsd = latestJupiterUsdByMint.get(mint);
       if (typeof currentUsd === 'number' && Number.isFinite(currentUsd) && currentUsd > 0) {
         previousJupiterUsdByMint.set(mint, currentUsd);
       }
       latestJupiterUsdByMint.set(mint, nextUsd);
+      const mintTape = jupiterMomentumTapeByMint.get(mint) ?? [];
+      pushBounded(mintTape, {
+        sampledAt: sample?.sampledAt ?? new Date().toISOString(),
+        usdPrice: nextUsd,
+        source: 'jupiter-price-v3',
+      }, pricePollPolicy.sharedTapeSize);
+      jupiterMomentumTapeByMint.set(mint, mintTape);
     }
     const sol = samples[SOL_MINT];
     const usdc = samples[USDC_MINT];
@@ -2196,23 +3413,28 @@ const startPriceLoops = (): void => {
 // â”€â”€ Rate-limited Helius RPC helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 const rlGetBalance = async (pubkey: PublicKey, commitment: 'processed' | 'confirmed' | 'finalized' = 'confirmed'): Promise<number> => {
-  await heliusLimiter.acquire();
+  await reserveHeliusRpc();
   return getConnection().getBalance(pubkey, commitment);
 };
 
 const rlGetLatestBlockhash = async () => {
-  await heliusLimiter.acquire();
+  await reserveHeliusRpc();
   return getConnection().getLatestBlockhash();
 };
 
 const rlGetMinimumBalanceForRentExemption = async (dataLength: number): Promise<number> => {
-  await heliusLimiter.acquire();
+  await reserveHeliusRpc();
   return getConnection().getMinimumBalanceForRentExemption(dataLength);
 };
 
 const rlGetMint = async (address: PublicKey, programId: PublicKey): Promise<SplTokenMint> => {
-  await heliusLimiter.acquire();
+  await reserveHeliusRpc();
   return getMint(getConnection(), address, 'confirmed', programId);
+};
+
+const rlGetAccountInfo = async (address: PublicKey) => {
+  await reserveHeliusRpc();
+  return getConnection().getAccountInfo(address, 'confirmed');
 };
 
 const rlGetTokenAccountsByOwner = async (
@@ -2220,17 +3442,17 @@ const rlGetTokenAccountsByOwner = async (
   programId: PublicKey,
   commitment: 'processed' | 'confirmed' | 'finalized' = 'confirmed',
 ) => {
-  await heliusLimiter.acquire();
+  await reserveHeliusRpc();
   return getConnection().getTokenAccountsByOwner(owner, { programId }, commitment);
 };
 
 const rlConfirmTransaction = async (args: { signature: string; blockhash: string; lastValidBlockHeight: number }) => {
-  await heliusLimiter.acquire();
+  await reserveHeliusRpc();
   return getConnection().confirmTransaction(args);
 };
 
 const rlSendRawTransaction = async (serializedTransaction: Buffer | Uint8Array) => {
-  await heliusLimiter.acquire();
+  await reserveHeliusRpc();
   return getConnection().sendRawTransaction(serializedTransaction, {
     skipPreflight: true,
     maxRetries: 0,
@@ -2328,6 +3550,12 @@ const checkFunding = async (session: RawSession, observedBalance?: number): Prom
       return;
     }
   }
+    const requestedFundingLamports = Math.max(
+      MIN_TRADEABLE_LAMPORTS,
+      Number(session.funding.requestedFundingLamports ?? 0) || 0,
+    );
+    const readyThresholdLamports = Math.max(0, requestedFundingLamports - FUNDING_READY_SLOP_LAMPORTS);
+
 
   lastFundingCheckAt.set(session.id, Date.now());
 
@@ -2342,7 +3570,7 @@ const checkFunding = async (session: RawSession, observedBalance?: number): Prom
     }
   }
 
-  if (balance >= MIN_TRADEABLE_LAMPORTS) {
+  if (balance >= readyThresholdLamports) {
     const kp = await getKeypair(session.id);
     if (!kp) {
       await failFundingSession(
@@ -2366,18 +3594,12 @@ const checkFunding = async (session: RawSession, observedBalance?: number): Prom
       startingBalanceAtomic: balanceAtomic,
       currentBalanceAtomic: balanceAtomic,
     });
-    await persistServiceControl(session, {
-      positionState: {
-        status: 'flat',
-        entryPriceUsd: null,
-        entryAt: null,
-        quantityAtomic: null,
-        highWaterPriceUsd: null,
-        lastMarkedPriceUsd: markedPriceUsd,
-        lastMarkedAt: markedAt,
-        pendingExitReason: null,
-        exitReason: null,
-      },
+    await persistPositionsState(session, {
+      activePositionMint: null,
+      positions: {},
+    }, {
+      lastMarkedPriceUsd: markedPriceUsd,
+      lastMarkedAt: markedAt,
     });
     await setSessionStatus(session.id, 'ready', {}, { expectedStatuses: ['awaiting_funding'] });
     const listenerId = fundingSubscriptionIds.get(session.id);
@@ -2387,9 +3609,9 @@ const checkFunding = async (session: RawSession, observedBalance?: number): Prom
       });
       fundingSubscriptionIds.delete(session.id);
     }
-    log('info', session.id, `funded (${balance} lamports) â†’ ready`);
+    log('info', session.id, `funded (${balance}/${requestedFundingLamports} lamports, threshold=${readyThresholdLamports}) â†’ ready`);
   } else {
-    log('info', session.id, `awaiting funding â€” balance: ${balance}/${MIN_TRADEABLE_LAMPORTS} lamports`);
+    log('info', session.id, `awaiting funding â€” balance: ${balance}/${requestedFundingLamports} lamports (threshold=${readyThresholdLamports})`);
   }
 };
 
@@ -2472,12 +3694,143 @@ const shouldRunFundingFallbackCheck = (sessionId: string) => {
   return (Date.now() - lastCheckAt) >= FUNDING_POLL_FALLBACK_MS;
 };
 
+// ── Active session-wallet balance cache (subscription-backed) ────────────────
+// The session wallet is mutated only by the worker during active trading, so an
+// onAccountChange subscription plus post-submit cache writes keep this coherent.
+// Pre-trade reads use the cache; an RPC revalidation TTL guards against ws gaps.
+const liveSessionBalances = new Map<string, { lamports: number; at: number }>();
+const activeBalanceSubscriptionIds = new Map<string, number>();
+
+const setCachedSessionBalance = (walletBase58: string, lamports: number) => {
+  liveSessionBalances.set(walletBase58, { lamports, at: Date.now() });
+};
+
+const subscribeActiveSessionBalance = (session: RawSession) => {
+  if (activeBalanceSubscriptionIds.has(session.id)) {
+    return;
+  }
+
+  const sessionWallet = new PublicKey(session.session_wallet);
+  const listenerId = getConnection().onAccountChange(
+    sessionWallet,
+    (accountInfo) => {
+      setCachedSessionBalance(session.session_wallet, accountInfo.lamports);
+    },
+    'confirmed',
+  );
+
+  activeBalanceSubscriptionIds.set(session.id, listenerId);
+};
+
+const unsubscribeActiveSessionBalance = (sessionId: string, walletBase58?: string) => {
+  const listenerId = activeBalanceSubscriptionIds.get(sessionId);
+  if (listenerId !== undefined) {
+    getConnection().removeAccountChangeListener(listenerId).catch((err) => {
+      log('warn', sessionId, `failed to remove balance subscription: ${String(err)}`);
+    });
+    activeBalanceSubscriptionIds.delete(sessionId);
+  }
+  if (walletBase58) {
+    liveSessionBalances.delete(walletBase58);
+  }
+};
+
+const ACTIVE_BALANCE_SUB_STATUSES = new Set(['ready', 'starting', 'active', 'stopping']);
+
+const syncActiveBalanceSubscriptions = (sessions: RawSession[]) => {
+  const subscribableSessions = new Map<string, string>();
+  for (const session of sessions) {
+    if (ACTIVE_BALANCE_SUB_STATUSES.has(session.status)) {
+      subscribableSessions.set(session.id, session.session_wallet);
+      subscribeActiveSessionBalance(session);
+    }
+  }
+
+  for (const sessionId of activeBalanceSubscriptionIds.keys()) {
+    if (!subscribableSessions.has(sessionId)) {
+      unsubscribeActiveSessionBalance(sessionId);
+    }
+  }
+};
+
+// Returns a session-wallet balance, preferring the subscription-backed cache when it is
+// fresh, otherwise reading from RPC and seeding the cache. Use only for active session
+// wallets; post-submit and sweep paths should read RPC directly for guaranteed freshness.
+const getCachedSessionWalletBalance = async (pubkey: PublicKey): Promise<number> => {
+  const walletBase58 = pubkey.toBase58();
+  const cached = liveSessionBalances.get(walletBase58);
+  if (cached && (Date.now() - cached.at) < BALANCE_CACHE_TTL_MS) {
+    return cached.lamports;
+  }
+
+  const lamports = await rlGetBalance(pubkey);
+  setCachedSessionBalance(walletBase58, lamports);
+  return lamports;
+};
+
+
+
+const computeSolToUsdcConversionLamports = (solBalanceLamports: number): number => Math.max(
+  0,
+  Math.floor(solBalanceLamports - SOL_TO_USDC_CONVERSION_RESERVE_LAMPORTS),
+);
 // â”€â”€ Auto-start ready session â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 const activateSession = async (session: RawSession): Promise<void> => {
+  const keypair = await getKeypair(session.id);
+  if (!keypair) {
+    await setSessionStatus(session.id, 'error', { stop_reason: 'runtime_error' }, { expectedStatuses: ['ready', 'starting'] });
+    log('error', session.id, 'ready activation failed: missing session keypair');
+    return;
+  }
+
+  if (keypair.publicKey.toBase58() !== session.session_wallet) {
+    await setSessionStatus(session.id, 'error', { stop_reason: 'runtime_error' }, { expectedStatuses: ['ready', 'starting'] });
+    log('error', session.id, `ready activation failed: keypair mismatch stored=${keypair.publicKey.toBase58()} session=${session.session_wallet}`);
+    return;
+  }
+
+  let solBalance = await rlGetBalance(keypair.publicKey).catch(() => 0);
+  let usdcBalance = await getTokenBalanceAtomic(keypair.publicKey, USDC_MINT, TOKEN_PROGRAM_ID).catch(() => 0);
+
+  if (usdcBalance < MIN_USDC_ENTRY_ATOMIC) {
+    const lamportsToConvert = computeSolToUsdcConversionLamports(solBalance);
+    if (lamportsToConvert < MIN_TRADEABLE_LAMPORTS) {
+      log(
+        'warn',
+        session.id,
+        `ready activation waiting for USDC base: SOL convertible=${lamportsToConvert} reserve=${SOL_TO_USDC_CONVERSION_RESERVE_LAMPORTS} min=${MIN_TRADEABLE_LAMPORTS}`,
+      );
+      return;
+    }
+
+    const converted = await convertSolToUsdc(session, keypair, lamportsToConvert);
+    if (!converted) {
+      log('warn', session.id, 'ready activation waiting: SOL→USDC base conversion did not complete');
+      return;
+    }
+    usdcBalance = await getTokenBalanceAtomic(keypair.publicKey, USDC_MINT, TOKEN_PROGRAM_ID).catch(() => 0);
+    solBalance = await rlGetBalance(keypair.publicKey).catch(() => solBalance);
+  }
+
+  if (solBalance < MIN_SOL_OPERATING_RESERVE_LAMPORTS) {
+    log(
+      'warn',
+      session.id,
+      `ready activation waiting for SOL fee reserve: ${solBalance}/${MIN_SOL_OPERATING_RESERVE_LAMPORTS} lamports`,
+    );
+    return;
+  }
+
   const now = new Date().toISOString();
-  await setSessionStatus(session.id, 'active', { started_at: now }, { expectedStatuses: ['ready', 'starting'] });
-  log('info', session.id, 'ready â†’ active, trading loop begins');
+  await mergeFundingPatch(session, {
+    fundingMint: USDC_MINT,
+    fundingTokenSymbol: 'USDC',
+    startingBalanceAtomic: String(usdcBalance),
+    currentBalanceAtomic: String(usdcBalance),
+  });
+  await setSessionStatus(session.id, 'active', { started_at: now }, { expectedStatuses: ['starting'] });
+  log('info', session.id, `starting → active, USDC base trading begins (usdc=${usdcBalance}, solReserve=${solBalance})`);
 };
 
 // â”€â”€ Trade execution â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -2522,6 +3875,11 @@ type UniverseScoutSample = {
   routeFound: boolean;
   outAmountAtomic: number | null;
   priceImpactBps: number | null;
+  signalStatus: 'warming_up' | 'ready' | 'guarded_off';
+  regime: 'bullish' | 'bearish' | 'flat' | null;
+  momentumBps: number | null;
+  persistentBullish: boolean;
+  score: number;
 };
 
 type SubmitResponse = {
@@ -2532,6 +3890,16 @@ type SubmitResponse = {
     availableLamports: number;
     requiredLamports: number;
     gapLamports: number;
+  };
+  error?: string;
+};
+
+type ReconcileResponse = {
+  reconciled?: boolean;
+  execution?: {
+    id: string;
+    status: 'prepared' | 'submitted' | 'confirmed' | 'failed';
+    confirmationStatus?: 'processed' | 'confirmed' | 'finalized' | null;
   };
   error?: string;
 };
@@ -2555,12 +3923,13 @@ type PreparedTradeEconomics = {
 };
 
 const USDC_ATOMIC_PER_USD = 1_000_000;
+const MIN_PROFIT_TRANSFER_USD = Number(process.env.WORKER_MIN_PROFIT_TRANSFER_USD ?? 0.25);
 
 type TradeInventoryContext = {
-  inputMint: typeof SOL_MINT | typeof USDC_MINT;
-  inputSymbol: 'SOL' | 'USDC';
-  outputMint: typeof SOL_MINT | typeof USDC_MINT;
-  outputSymbol: 'SOL' | 'USDC';
+  inputMint: string;
+  inputSymbol: string;
+  outputMint: string;
+  outputSymbol: string;
   balanceAtomic: number;
   reserveAtomic: number;
   tradableAtomic: number;
@@ -2572,17 +3941,31 @@ type TradeInventoryContext = {
 };
 
 type TradeExecutionPlan = {
-  direction: 'exit_long_sol' | 'enter_long_sol';
+  direction: 'exit_long' | 'enter_long';
   inventory: TradeInventoryContext;
-  exitReason: NonNullable<Session['serviceControl']['positionState']>['exitReason'];
+  exitReason: SessionPositionState['exitReason'];
+  signalSnapshot: NonNullable<Session['serviceControl']['lastSignal']>;
+  scannerStrategy: StrategyKey;
+  entryStrategy: StrategyKey | null;
+  exitStrategy: StrategyKey | null;
 };
 
 type ExitTriggerDecision = {
   shouldExit: boolean;
-  reason: NonNullable<Session['serviceControl']['positionState']>['exitReason'];
+  reason: NonNullable<SessionPositionState['exitReason']>;
   markPriceUsd: number | null;
   pnlBps: number | null;
   trailingDrawdownBps: number | null;
+  thresholds: DynamicExitThresholds;
+};
+
+type DynamicExitThresholds = {
+  takeProfitBps: number;
+  stopLossBps: number;
+  trailingStopBps: number;
+  atrBps: number | null;
+  costFloorBps: number;
+  mode: 'atr' | 'fallback';
 };
 
 type UsdcTradeSizingDecision = {
@@ -2606,30 +3989,374 @@ const parseUnsignedNumeric = (value: string | null | undefined) => {
   return Number.isFinite(parsed) ? parsed : null;
 };
 
-const getUniverseScoutCandidateMints = () => dedupeMints([
-  SOL_MINT,
-  ...tokenUniverseMints,
-])
-  .filter((mint) => mint !== USDC_MINT)
-  .slice(0, Math.max(1, WORKER_UNIVERSE_SCOUT_MAX_CANDIDATES));
+const sleepMs = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, Math.max(0, ms)));
 
-const scoutEntryUniverse = async (params: {
+const getUtcDayKey = (date: Date = new Date()): string => date.toISOString().slice(0, 10);
+
+const getSessionRiskState = (session: RawSession): NonNullable<Session['serviceControl']['riskState']> => {
+  const dayKey = getUtcDayKey();
+  const state = session.service_control.riskState;
+  if (!state || state.dayKey !== dayKey) {
+    return {
+      dayKey,
+      dailyRealizedPnlUsd: 0,
+      consecutiveLosses: state?.consecutiveLosses ?? 0,
+      badFillStreak: state?.badFillStreak ?? 0,
+      lastLossAt: state?.lastLossAt ?? null,
+      lastBadFillAt: state?.lastBadFillAt ?? null,
+    };
+  }
+
+  return state;
+};
+
+const getRiskCircuitBreakerReason = (session: RawSession, sessionLossUsd: number): string | null => {
+  const riskState = getSessionRiskState(session);
+  const dailyLossUsd = Math.abs(Math.min(0, riskState.dailyRealizedPnlUsd));
+  const lastLossAtMs = riskState.lastLossAt ? Date.parse(riskState.lastLossAt) : 0;
+  const lastBadFillAtMs = riskState.lastBadFillAt ? Date.parse(riskState.lastBadFillAt) : 0;
+  const lossCooldownActive = WORKER_SOFT_RISK_COOLDOWN_MS > 0
+    && Number.isFinite(lastLossAtMs)
+    && lastLossAtMs > 0
+    && Date.now() - lastLossAtMs < WORKER_SOFT_RISK_COOLDOWN_MS;
+  const badFillCooldownActive = WORKER_SOFT_RISK_COOLDOWN_MS > 0
+    && Number.isFinite(lastBadFillAtMs)
+    && lastBadFillAtMs > 0
+    && Date.now() - lastBadFillAtMs < WORKER_SOFT_RISK_COOLDOWN_MS;
+
+  if (sessionLossUsd >= session.risk_limits.maxSessionLossUsd) {
+    return 'risk_limit_hit';
+  }
+
+  if (dailyLossUsd >= session.risk_limits.maxDailyLossUsd) {
+    return 'daily_loss_limit_hit';
+  }
+
+  if (WORKER_MAX_CONSECUTIVE_LOSSES > 0 && riskState.consecutiveLosses >= WORKER_MAX_CONSECUTIVE_LOSSES && lossCooldownActive) {
+    return 'consecutive_loss_limit_hit';
+  }
+
+  if (WORKER_MAX_BAD_FILL_STREAK > 0 && riskState.badFillStreak >= WORKER_MAX_BAD_FILL_STREAK && badFillCooldownActive) {
+    return 'bad_fill_limit_hit';
+  }
+
+  return null;
+};
+
+const computeRecentVolatilityBps = (samples: readonly MarketTapePoint[], lookbackSamples: number): number | null => {
+  const lookback = Math.max(2, Math.floor(lookbackSamples));
+  if (samples.length < lookback + 1) {
+    return null;
+  }
+
+  const recent = samples.slice(-(lookback + 1));
+  const returns: number[] = [];
+  for (let idx = 1; idx < recent.length; idx += 1) {
+    const prev = recent[idx - 1];
+    const next = recent[idx];
+    if (!prev || !next || prev.usdPrice <= 0) continue;
+    returns.push(Math.abs(((next.usdPrice - prev.usdPrice) / prev.usdPrice) * 10_000));
+  }
+
+  if (returns.length === 0) {
+    return null;
+  }
+
+  const avgAbsReturn = returns.reduce((sum, value) => sum + value, 0) / returns.length;
+  return Math.round(avgAbsReturn);
+};
+
+const applyVolatilityEntrySizing = (params: {
+  mint: string;
+  inventory: TradeInventoryContext;
+}): {
+  blocked: boolean;
+  reason: string | null;
+  volatilityBps: number | null;
+  sizeScaleBps: number;
+  adjustedAmountAtomic: number | null;
+} => {
+  const baseAmount = params.inventory.amountAtomic ?? 0;
+  if (!WORKER_VOLATILITY_SIZING_ENABLED || baseAmount <= 0) {
+    return {
+      blocked: false,
+      reason: null,
+      volatilityBps: null,
+      sizeScaleBps: 10_000,
+      adjustedAmountAtomic: baseAmount > 0 ? baseAmount : null,
+    };
+  }
+
+  const volatilityBps = computeRecentVolatilityBps(
+    getMomentumTapeForMint(params.mint),
+    WORKER_VOLATILITY_LOOKBACK_SAMPLES,
+  );
+  if (volatilityBps === null || volatilityBps <= WORKER_VOLATILITY_TARGET_BPS) {
+    return {
+      blocked: false,
+      reason: volatilityBps === null ? 'volatility_warming_up' : null,
+      volatilityBps,
+      sizeScaleBps: 10_000,
+      adjustedAmountAtomic: baseAmount,
+    };
+  }
+
+  const rawScaleBps = Math.floor((WORKER_VOLATILITY_TARGET_BPS / volatilityBps) * 10_000);
+  const sizeScaleBps = Math.max(
+    Math.min(10_000, WORKER_VOLATILITY_MIN_SIZE_BPS),
+    Math.min(10_000, rawScaleBps),
+  );
+  const adjustedAmountAtomic = Math.floor((baseAmount * sizeScaleBps) / 10_000);
+  if (adjustedAmountAtomic < params.inventory.minTradeAtomic) {
+    return {
+      blocked: true,
+      reason: 'volatility_size_below_min_trade',
+      volatilityBps,
+      sizeScaleBps,
+      adjustedAmountAtomic,
+    };
+  }
+
+  return {
+    blocked: false,
+    reason: sizeScaleBps < 10_000 ? 'volatility_sized_down' : null,
+    volatilityBps,
+    sizeScaleBps,
+    adjustedAmountAtomic,
+  };
+};
+
+const assessEntryRouteStability = async (params: {
+  inputMint: string;
+  outputMint: string;
   amountAtomic: number;
   takerWallet: string;
   slippageBps: number;
+}): Promise<{
+  stable: boolean;
+  reason: string;
+  sampleCount: number;
+  minOutAmountAtomic: number | null;
+  maxOutAmountAtomic: number | null;
+  outputDriftBps: number | null;
+  minPriceImpactBps: number | null;
+  maxPriceImpactBps: number | null;
+  impactDriftBps: number | null;
+}> => {
+  const requestedSamples = Math.max(1, Math.floor(WORKER_ROUTE_STABILITY_SAMPLES));
+  if (!WORKER_ROUTE_STABILITY_ENABLED || requestedSamples <= 1) {
+    return {
+      stable: true,
+      reason: 'route_stability_disabled',
+      sampleCount: 0,
+      minOutAmountAtomic: null,
+      maxOutAmountAtomic: null,
+      outputDriftBps: null,
+      minPriceImpactBps: null,
+      maxPriceImpactBps: null,
+      impactDriftBps: null,
+    };
+  }
+
+  const outAmounts: number[] = [];
+  const impacts: number[] = [];
+
+  for (let sampleIdx = 0; sampleIdx < requestedSamples; sampleIdx += 1) {
+    if (sampleIdx > 0) {
+      await sleepMs(WORKER_ROUTE_STABILITY_DELAY_MS);
+    }
+
+    const build = await apiPost<BuildRouteScoutResponse>('/jupiter/swap/build', {
+      inputMint: params.inputMint,
+      outputMint: params.outputMint,
+      amount: String(params.amountAtomic),
+      taker: params.takerWallet,
+      feeTokenSymbol: params.inputMint === USDC_MINT || params.outputMint === USDC_MINT ? 'USDC' : 'SOL',
+      slippageBps: String(params.slippageBps),
+    });
+
+    const outAmountAtomic = parseUnsignedNumeric(build.data?.build?.outAmount);
+    if (!build.ok || !build.data?.build || !outAmountAtomic || outAmountAtomic <= 0) {
+      return {
+        stable: false,
+        reason: 'route_stability_no_route',
+        sampleCount: sampleIdx + 1,
+        minOutAmountAtomic: outAmounts.length > 0 ? Math.min(...outAmounts) : null,
+        maxOutAmountAtomic: outAmounts.length > 0 ? Math.max(...outAmounts) : null,
+        outputDriftBps: null,
+        minPriceImpactBps: impacts.length > 0 ? Math.min(...impacts) : null,
+        maxPriceImpactBps: impacts.length > 0 ? Math.max(...impacts) : null,
+        impactDriftBps: null,
+      };
+    }
+
+    outAmounts.push(outAmountAtomic);
+    const impactBps = parseQuotePriceImpactBps(build.data.build.priceImpactPct ?? null);
+    if (impactBps !== null) {
+      impacts.push(impactBps);
+    }
+  }
+
+  const minOutAmountAtomic = Math.min(...outAmounts);
+  const maxOutAmountAtomic = Math.max(...outAmounts);
+  const outputDriftBps = maxOutAmountAtomic > 0
+    ? Math.round(((maxOutAmountAtomic - minOutAmountAtomic) / maxOutAmountAtomic) * 10_000)
+    : null;
+  const minPriceImpactBps = impacts.length > 0 ? Math.min(...impacts) : null;
+  const maxPriceImpactBps = impacts.length > 0 ? Math.max(...impacts) : null;
+  const impactDriftBps = minPriceImpactBps !== null && maxPriceImpactBps !== null
+    ? maxPriceImpactBps - minPriceImpactBps
+    : null;
+
+  if (maxPriceImpactBps !== null && maxPriceImpactBps > WORKER_UNIVERSE_SCOUT_MAX_ENTRY_PRICE_IMPACT_BPS) {
+    return {
+      stable: false,
+      reason: 'route_stability_impact_too_high',
+      sampleCount: requestedSamples,
+      minOutAmountAtomic,
+      maxOutAmountAtomic,
+      outputDriftBps,
+      minPriceImpactBps,
+      maxPriceImpactBps,
+      impactDriftBps,
+    };
+  }
+
+  if (outputDriftBps !== null && outputDriftBps > WORKER_ROUTE_STABILITY_MAX_OUTPUT_DRIFT_BPS) {
+    return {
+      stable: false,
+      reason: 'route_stability_output_unstable',
+      sampleCount: requestedSamples,
+      minOutAmountAtomic,
+      maxOutAmountAtomic,
+      outputDriftBps,
+      minPriceImpactBps,
+      maxPriceImpactBps,
+      impactDriftBps,
+    };
+  }
+
+  if (impactDriftBps !== null && impactDriftBps > WORKER_ROUTE_STABILITY_MAX_IMPACT_DRIFT_BPS) {
+    return {
+      stable: false,
+      reason: 'route_stability_impact_unstable',
+      sampleCount: requestedSamples,
+      minOutAmountAtomic,
+      maxOutAmountAtomic,
+      outputDriftBps,
+      minPriceImpactBps,
+      maxPriceImpactBps,
+      impactDriftBps,
+    };
+  }
+
+  return {
+    stable: true,
+    reason: 'route_stable',
+    sampleCount: requestedSamples,
+    minOutAmountAtomic,
+    maxOutAmountAtomic,
+    outputDriftBps,
+    minPriceImpactBps,
+    maxPriceImpactBps,
+    impactDriftBps,
+  };
+};
+
+const getUniverseScoutCandidateMints = (params: {
+  excludedMints?: ReadonlySet<string>;
+  excludedClusters?: ReadonlySet<string>;
+  useTrustedFallback?: boolean;
+} = {}) => {
+  const baseCandidates = dedupeMints(
+    params.useTrustedFallback || WORKER_ENTRY_CORE_UNIVERSE_ONLY
+      ? TRUSTED_ENTRY_UNIVERSE_MINTS
+      : [SOL_MINT, ...TRUSTED_ENTRY_UNIVERSE_MINTS, ...tokenUniverseActiveMints],
+  );
+
+  const qualityRank = (mint: string) => {
+    if (mint === SOL_MINT) return 0;
+    if (TRUSTED_ENTRY_UNIVERSE_MINT_SET.has(mint)) return 1;
+    const symbol = tokenUniverseSymbolByMint.get(mint) ?? '';
+    if (symbol && ['JUP', 'JTO', 'PYTH', 'KMNO', 'BONK', 'WIF', 'MEW', 'POPCAT', 'RAY', 'ORCA', 'DRIFT', 'SHDW', 'W', 'HNT'].includes(symbol)) {
+      return 2;
+    }
+    return 3;
+  };
+
+  return baseCandidates
+    .filter((mint) => {
+      const symbol = tokenUniverseSymbolByMint.get(mint) ?? null;
+      return !STABLE_ENTRY_TARGET_MINTS.has(mint)
+        && !TOKEN_UNIVERSE_HARD_BLOCKED_MINTS.has(mint)
+        && !isHardBlockedUniverseToken({ mint, symbol })
+        && (!WORKER_ENTRY_CORE_UNIVERSE_ONLY || TRUSTED_ENTRY_UNIVERSE_MINT_SET.has(mint))
+        && (!WORKER_BLOCK_PUMP_MINT_ENTRIES || !mint.toLowerCase().endsWith('pump'))
+        && !(params.excludedMints?.has(mint) ?? false)
+        && !(params.excludedClusters?.has(getClusterForMint(mint)) ?? false);
+    })
+    .sort((a, b) => qualityRank(a) - qualityRank(b))
+    .slice(0, Math.max(1, WORKER_UNIVERSE_SCOUT_MAX_CANDIDATES));
+};
+
+const scoutEntryUniverse = async (params: {
+  inputMint: string;
+  inputSymbol: string;
+  amountAtomic: number;
+  takerWallet: string;
+  slippageBps: number;
+  activeStrategy: StrategyKey;
+  strategyConfig: ReturnType<typeof getSessionStrategyConfig>;
+  lookbackSamples: number;
+  thresholdBps: number;
+  requiredSignalSamples: number;
+  excludedMints?: ReadonlySet<string>;
+  excludedClusters?: ReadonlySet<string>;
+  useTrustedFallback?: boolean;
 }) => {
-  const candidates = getUniverseScoutCandidateMints();
+  const candidates = getUniverseScoutCandidateMints({
+    excludedMints: params.excludedMints,
+    excludedClusters: params.excludedClusters,
+    useTrustedFallback: params.useTrustedFallback,
+  });
   const samples: UniverseScoutSample[] = [];
 
   for (const candidateMint of candidates) {
+    const tokenSignal = buildRuntimeSignalForMint(candidateMint, params.activeStrategy, params.strategyConfig);
+    const persistentBullish = tokenSignal.status === 'ready'
+      && tokenSignal.regime === 'bullish'
+      && (params.activeStrategy !== 'momentum'
+        || hasMomentumRegimePersistence({
+          samples: getMomentumTapeForMint(candidateMint),
+          lookbackSamples: params.lookbackSamples,
+          thresholdBps: params.thresholdBps,
+          regime: 'bullish',
+          requiredSamples: params.requiredSignalSamples,
+        }));
+
+    if (candidateMint === params.inputMint) {
+      samples.push({
+        mint: candidateMint,
+        routeFound: false,
+        outAmountAtomic: null,
+        priceImpactBps: null,
+        signalStatus: tokenSignal.status,
+        regime: tokenSignal.regime,
+        momentumBps: tokenSignal.momentumBps,
+        persistentBullish,
+        score: Number.NEGATIVE_INFINITY,
+      });
+      continue;
+    }
+
     const build = await apiPost<BuildRouteScoutResponse>('/jupiter/swap/build', {
-      inputMint: USDC_MINT,
+      inputMint: params.inputMint,
       outputMint: candidateMint,
       amount: String(params.amountAtomic),
       taker: params.takerWallet,
-      feeTokenSymbol: 'USDC',
+      feeTokenSymbol: params.inputMint === USDC_MINT || candidateMint === USDC_MINT ? 'USDC' : 'SOL',
       slippageBps: String(params.slippageBps),
-    }, { limiter: jupiterLimiter });
+    });
 
     if (!build.ok || !build.data.build) {
       samples.push({
@@ -2637,6 +4364,11 @@ const scoutEntryUniverse = async (params: {
         routeFound: false,
         outAmountAtomic: null,
         priceImpactBps: null,
+        signalStatus: tokenSignal.status,
+        regime: tokenSignal.regime,
+        momentumBps: tokenSignal.momentumBps,
+        persistentBullish,
+        score: Number.NEGATIVE_INFINITY,
       });
       continue;
     }
@@ -2644,32 +4376,59 @@ const scoutEntryUniverse = async (params: {
     const outAmountAtomic = parseUnsignedNumeric(build.data.build.outAmount);
     const priceImpactBps = parseQuotePriceImpactBps(build.data.build.priceImpactPct ?? null);
 
+    const effectiveImpactBps = priceImpactBps ?? Number.POSITIVE_INFINITY;
+    const momentumScore = tokenSignal.momentumBps ?? -10_000;
+    const persistenceBonus = persistentBullish ? 2_000 : 0;
+
     samples.push({
       mint: candidateMint,
       routeFound: Boolean(outAmountAtomic && outAmountAtomic > 0),
       outAmountAtomic,
       priceImpactBps,
+      signalStatus: tokenSignal.status,
+      regime: tokenSignal.regime,
+      momentumBps: tokenSignal.momentumBps,
+      persistentBullish,
+      score: persistenceBonus + momentumScore - effectiveImpactBps,
     });
   }
 
   const ranked = samples
     .filter((sample) => sample.routeFound)
-    .map((sample) => ({
-      ...sample,
-      effectiveImpactBps: sample.priceImpactBps ?? Number.POSITIVE_INFINITY,
-    }))
-    .sort((a, b) => a.effectiveImpactBps - b.effectiveImpactBps);
+    .sort((a, b) => b.score - a.score);
 
-  const solRankIndex = ranked.findIndex((sample) => sample.mint === SOL_MINT);
-  const solRank = solRankIndex >= 0 ? solRankIndex + 1 : null;
-  const solSample = ranked.find((sample) => sample.mint === SOL_MINT) ?? null;
+  const bestBullishSample = ranked.find((sample) => sample.persistentBullish)
+    ?? (WORKER_UNIVERSE_SCOUT_REQUIRE_PERSISTENT_BULLISH
+      ? null
+      : ranked.find((sample) => sample.signalStatus === 'ready' && sample.regime === 'bullish'))
+    ?? null;
+  const bestRoutedFallbackSample = WORKER_UNIVERSE_SCOUT_ALLOW_ROUTED_FALLBACK
+    ? (ranked[0] ?? null)
+    : null;
+  const bestSample = bestBullishSample ?? bestRoutedFallbackSample;
 
   return {
     candidates,
     ranked,
-    solRank,
-    solPriceImpactBps: solSample?.priceImpactBps ?? null,
-    bestMint: ranked[0]?.mint ?? null,
+    bestMint: bestSample?.mint ?? null,
+    bestPriceImpactBps: bestSample?.priceImpactBps ?? null,
+    bestOutAmountAtomic: bestSample?.outAmountAtomic ?? null,
+    bestUsesRoutedFallback: bestSample !== null && bestBullishSample === null && bestSample === bestRoutedFallbackSample,
+  };
+};
+
+const buildUniverseScoutGateSnapshot = (scout: Awaited<ReturnType<typeof scoutEntryUniverse>>): NonNullable<NonNullable<Session['serviceControl']['lastTradeGate']>['scout']> => {
+  const bestSample = scout.ranked[0] ?? null;
+
+  return {
+    candidateCount: scout.candidates.length,
+    routeFoundCount: scout.ranked.length,
+    bullishRouteCount: scout.ranked.filter((sample) => sample.signalStatus === 'ready' && sample.regime === 'bullish').length,
+    persistentBullishRouteCount: scout.ranked.filter((sample) => sample.persistentBullish).length,
+    bestMint: bestSample?.mint ?? null,
+    bestSymbol: bestSample ? resolveTokenSymbol(bestSample.mint) : null,
+    bestMomentumBps: bestSample?.momentumBps ?? null,
+    bestPriceImpactBps: bestSample?.priceImpactBps ?? null,
   };
 };
 
@@ -2682,33 +4441,50 @@ const getUsdValueFromAtomicAmount = (mint: string, amountAtomic: number): number
     return amountAtomic / USDC_ATOMIC_PER_USD;
   }
 
-  if (mint === SOL_MINT) {
-    const solUsd = lastPythSolSample?.usdPrice ?? lastJupiterSolSample?.usdPrice ?? 0;
-    if (solUsd <= 0) {
-      return 0;
-    }
-    return (amountAtomic / 1_000_000_000) * solUsd;
+  const usdPrice = mint === SOL_MINT
+    ? (lastPythSolSample?.usdPrice ?? lastJupiterSolSample?.usdPrice ?? 0)
+    : (latestJupiterUsdByMint.get(mint) ?? 0);
+  if (usdPrice <= 0) {
+    return 0;
   }
 
-  return 0;
+  return toUiAmount(mint, amountAtomic) * usdPrice;
 };
 
 const computeUsdcTradeAmountAtomic = (params: {
   balanceAtomic: number;
   maxPositionUsd: number;
+  maxOpenPositions: number;
+  openPositionsCount: number;
 }): UsdcTradeSizingDecision => {
   const balanceAtomic = Math.max(0, Math.floor(params.balanceAtomic));
-  const targetAtomic = balanceAtomic;
-  const maxTradeAtomic = Math.max(0, Math.floor(params.maxPositionUsd * USDC_ATOMIC_PER_USD));
-  const amountAtomic = Math.min(balanceAtomic, maxTradeAtomic);
+  const reserveAtomic = Math.max(0, Math.floor(USDC_OPERATING_RESERVE_ATOMIC));
+  const tradableAtomic = Math.max(0, balanceAtomic - reserveAtomic);
+  const openSlots = Math.max(1, Math.floor(params.maxOpenPositions - params.openPositionsCount));
+  const viableSlots = Math.max(
+    1,
+    Math.min(openSlots, Math.floor(tradableAtomic / Math.max(MIN_USDC_ENTRY_ATOMIC, MIN_USDC_POSITION_NOTIONAL_ATOMIC))),
+  );
+  const targetAtomic = Math.floor(tradableAtomic / viableSlots);
+  const configuredMaxTradeAtomic = Math.max(0, Math.floor(params.maxPositionUsd * USDC_ATOMIC_PER_USD));
+  // Earlier UI/schema defaults hard-coded maxPositionSizeUsd=20 while also
+  // defaulting maxOpenPositions=10. That was not an intentional per-user risk
+  // choice; it made small funded sessions economically untradeable. Preserve
+  // explicit lower caps for newly configured sessions, but let legacy 20/10
+  // sessions use the capital-aware target instead of staying stuck forever.
+  const legacyStaticDefaultCap = params.maxPositionUsd <= 20 && params.maxOpenPositions >= 10;
+  const maxTradeAtomic = legacyStaticDefaultCap
+    ? Math.max(configuredMaxTradeAtomic, targetAtomic)
+    : configuredMaxTradeAtomic;
+  const amountAtomic = Math.min(targetAtomic, maxTradeAtomic);
 
-  if (balanceAtomic < MIN_USDC_ENTRY_ATOMIC) {
+  if (tradableAtomic < MIN_USDC_ENTRY_ATOMIC) {
     return {
       skip: true,
       reason: 'insufficient_usdc_inventory',
       balanceAtomic,
-      reserveAtomic: 0,
-      tradableAtomic: balanceAtomic,
+      reserveAtomic,
+      tradableAtomic,
       targetAtomic,
       minTradeAtomic: MIN_USDC_ENTRY_ATOMIC,
       maxTradeAtomic,
@@ -2721,8 +4497,8 @@ const computeUsdcTradeAmountAtomic = (params: {
       skip: true,
       reason: 'below_min_usdc_trade',
       balanceAtomic,
-      reserveAtomic: 0,
-      tradableAtomic: balanceAtomic,
+      reserveAtomic,
+      tradableAtomic,
       targetAtomic,
       minTradeAtomic: MIN_USDC_ENTRY_ATOMIC,
       maxTradeAtomic,
@@ -2734,8 +4510,8 @@ const computeUsdcTradeAmountAtomic = (params: {
     skip: false,
     reason: null,
     balanceAtomic,
-    reserveAtomic: 0,
-    tradableAtomic: balanceAtomic,
+    reserveAtomic,
+    tradableAtomic,
     targetAtomic,
     minTradeAtomic: MIN_USDC_ENTRY_ATOMIC,
     maxTradeAtomic,
@@ -2747,8 +4523,43 @@ const rlGetTokenAccount = async (
   address: PublicKey,
   programId: PublicKey = TOKEN_PROGRAM_ID,
 ) => {
-  await heliusLimiter.acquire();
+  await reserveHeliusRpc();
   return getAccount(getConnection(), address, 'confirmed', programId);
+};
+
+type TokenBalanceLookupSnapshot = {
+  balanceAtomic: number;
+  programId: string | null;
+  tokenAccount: string | null;
+  source: 'associated_token_account' | 'owner_scan' | 'none';
+  attemptedPrograms: string[];
+};
+
+const getMintTokenProgramId = async (mint: PublicKey): Promise<PublicKey | null> => {
+  const mintInfo = await rlGetAccountInfo(mint);
+  if (mintInfo?.owner.equals(TOKEN_2022_PROGRAM_ID)) return TOKEN_2022_PROGRAM_ID;
+  if (mintInfo?.owner.equals(TOKEN_PROGRAM_ID)) return TOKEN_PROGRAM_ID;
+  return null;
+};
+
+const getTokenProgramCandidates = async (
+  mint: PublicKey,
+  preferredProgramId?: PublicKey,
+): Promise<PublicKey[]> => {
+  const programs = [
+    preferredProgramId,
+    preferredProgramId ? null : await getMintTokenProgramId(mint),
+    TOKEN_PROGRAM_ID,
+    TOKEN_2022_PROGRAM_ID,
+  ].filter((program): program is PublicKey => program instanceof PublicKey);
+
+  const seen = new Set<string>();
+  return programs.filter((program) => {
+    const key = program.toBase58();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 };
 
 let usdcTokenAccountRentLamportsPromise: Promise<number> | null = null;
@@ -2787,21 +4598,612 @@ const hasTokenAccount = async (
 const getTokenBalanceAtomic = async (
   owner: PublicKey,
   mint: string,
-  programId: PublicKey = TOKEN_PROGRAM_ID,
+  programId?: PublicKey,
 ): Promise<number> => {
-  const ata = await getAssociatedTokenAddress(
-    new PublicKey(mint),
-    owner,
-    false,
-    programId,
+  const snapshot = await getTokenBalanceSnapshot(owner, mint, programId);
+  return snapshot.balanceAtomic;
+};
+
+const getTokenBalanceSnapshot = async (
+  owner: PublicKey,
+  mint: string,
+  programId?: PublicKey,
+): Promise<TokenBalanceLookupSnapshot> => {
+  const mintPublicKey = new PublicKey(mint);
+  const programCandidates = await getTokenProgramCandidates(mintPublicKey, programId);
+  const attemptedPrograms = programCandidates.map((program) => program.toBase58());
+  let zeroAtaSnapshot: TokenBalanceLookupSnapshot | null = null;
+
+  for (const candidateProgramId of programCandidates) {
+    const ata = await getAssociatedTokenAddress(
+      mintPublicKey,
+      owner,
+      false,
+      candidateProgramId,
+    );
+
+    try {
+      const account = await rlGetTokenAccount(ata, candidateProgramId);
+      const balanceAtomic = Number(account.amount);
+      const snapshot: TokenBalanceLookupSnapshot = {
+        balanceAtomic,
+        programId: candidateProgramId.toBase58(),
+        tokenAccount: ata.toBase58(),
+        source: 'associated_token_account',
+        attemptedPrograms,
+      };
+
+      if (balanceAtomic > 0) return snapshot;
+      zeroAtaSnapshot ??= snapshot;
+    } catch {
+      // Fall through to other token programs and owner scan before declaring zero inventory.
+    }
+  }
+
+  for (const candidateProgramId of programCandidates) {
+    try {
+      const tokenAccounts = await rlGetTokenAccountsByOwner(owner, candidateProgramId);
+      let totalBalanceAtomic = 0;
+      let firstTokenAccount: string | null = null;
+
+      for (const tokenAccount of tokenAccounts.value) {
+        const account = unpackAccount(tokenAccount.pubkey, tokenAccount.account, candidateProgramId);
+        if (!account.mint.equals(mintPublicKey)) continue;
+
+        totalBalanceAtomic += Number(account.amount);
+        firstTokenAccount ??= tokenAccount.pubkey.toBase58();
+      }
+
+      if (totalBalanceAtomic > 0 || firstTokenAccount) {
+        return {
+          balanceAtomic: totalBalanceAtomic,
+          programId: candidateProgramId.toBase58(),
+          tokenAccount: firstTokenAccount,
+          source: 'owner_scan',
+          attemptedPrograms,
+        };
+      }
+    } catch {
+      // Keep trying all candidate programs; some mints/accounts are valid under only one program.
+    }
+  }
+
+  return zeroAtaSnapshot ?? {
+    balanceAtomic: 0,
+    programId: null,
+    tokenAccount: null,
+    source: 'none',
+    attemptedPrograms,
+  };
+};
+
+const getSessionProfitHandling = (session: RawSession) => (
+  session.user_control?.profitHandling ?? {
+    mode: 'send_to_owner' as const,
+    payoutToken: 'USDC' as const,
+  }
+);
+
+// Swap a fixed amount of the session wallet's SOL into USDC via the Jupiter prepare/sign/submit
+// flow. Used for USDC-base activation and for USDC profit payouts. Returns true once the swap
+// confirms and the USDC balance is available.
+const convertSolToUsdc = async (
+  session: RawSession,
+  keypair: Keypair,
+  lamportsToConvert: number,
+): Promise<boolean> => {
+  const slippageBps = Math.max(session.risk_limits.maxSlippageBps, 100);
+
+  const prepare = await apiPost<PrepareResponse>('/jupiter/swap/prepare', {
+    inputMint: SOL_MINT,
+    outputMint: USDC_MINT,
+    amount: String(lamportsToConvert),
+    taker: session.session_wallet,
+    feeTokenSymbol: 'SOL',
+    slippageBps: String(slippageBps),
+  });
+
+  if (
+    !prepare.ok
+    || !prepare.data.preparedTransactionBase64
+    || !prepare.data.executionId
+    || prepare.data.simulation?.err
+  ) {
+    log(
+      'warn',
+      session.id,
+      `SOL->USDC prepare failed: ${prepare.data.error ?? JSON.stringify(prepare.data.simulation?.err ?? prepare.status)}`,
+    );
+    if (prepare.data.executionId) {
+      await apiPost(`/jupiter/swap/executions/${prepare.data.executionId}/cancel`, {
+        stage: 'worker_cancel',
+        reason: 'sol_to_usdc_conversion_prepare_failed',
+      }).catch(() => {});
+    }
+    return false;
+  }
+
+  let tx: VersionedTransaction;
+  try {
+    tx = VersionedTransaction.deserialize(Buffer.from(prepare.data.preparedTransactionBase64, 'base64'));
+    tx.sign([keypair]);
+  } catch (err) {
+    log('warn', session.id, `SOL->USDC sign failed: ${String(err)}`);
+    await apiPost(`/jupiter/swap/executions/${prepare.data.executionId}/cancel`, {
+      stage: 'worker_cancel',
+      reason: 'sol_to_usdc_conversion_sign_failed',
+    }).catch(() => {});
+    return false;
+  }
+
+  const submit = await apiPost<SubmitResponse>('/jupiter/swap/submit', {
+    executionId: prepare.data.executionId,
+    signedTransactionBase64: Buffer.from(tx.serialize()).toString('base64'),
+    blockhash: prepare.data.blockhash,
+    lastValidBlockHeight: prepare.data.lastValidBlockHeight,
+  });
+
+  if (!submit.ok) {
+    log('warn', session.id, `SOL->USDC submit failed: ${submit.data.error ?? submit.status}`);
+    return false;
+  }
+
+  log('info', session.id, `SOL->USDC swap submitted (${lamportsToConvert} lamports) · sig ${submit.data.signature ?? 'pending'}`);
+
+  // Wait for the USDC to actually land before the caller transfers it to the owner.
+  for (let attempt = 1; attempt <= 8; attempt++) {
+    const usdc = await getTokenBalanceAtomic(keypair.publicKey, USDC_MINT, TOKEN_PROGRAM_ID).catch(() => 0);
+    if (usdc > 0) {
+      return true;
+    }
+    if (attempt === 8) {
+      log('warn', session.id, 'SOL->USDC swap confirmed but USDC balance not yet visible');
+      return false;
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 1500));
+  }
+
+  return false;
+};
+
+const convertUsdcToSol = async (
+  session: RawSession,
+  keypair: Keypair,
+  usdcAtomicToConvert: number,
+): Promise<boolean> => {
+  const slippageBps = Math.max(session.risk_limits.maxSlippageBps, 100);
+
+  const prepare = await apiPost<PrepareResponse>('/jupiter/swap/prepare', {
+    inputMint: USDC_MINT,
+    outputMint: SOL_MINT,
+    amount: String(usdcAtomicToConvert),
+    taker: session.session_wallet,
+    feeTokenSymbol: 'USDC',
+    slippageBps: String(slippageBps),
+  });
+
+  if (
+    !prepare.ok
+    || !prepare.data.preparedTransactionBase64
+    || !prepare.data.executionId
+    || prepare.data.simulation?.err
+  ) {
+    log(
+      'warn',
+      session.id,
+      `USDC->SOL gas refill prepare failed: ${prepare.data.error ?? JSON.stringify(prepare.data.simulation?.err ?? prepare.status)}`,
+    );
+    if (prepare.data.executionId) {
+      await apiPost(`/jupiter/swap/executions/${prepare.data.executionId}/cancel`, {
+        stage: 'worker_cancel',
+        reason: 'usdc_to_sol_gas_refill_prepare_failed',
+      }).catch(() => {});
+    }
+    return false;
+  }
+
+  let tx: VersionedTransaction;
+  try {
+    tx = VersionedTransaction.deserialize(Buffer.from(prepare.data.preparedTransactionBase64, 'base64'));
+    tx.sign([keypair]);
+  } catch (err) {
+    log('warn', session.id, `USDC->SOL gas refill sign failed: ${String(err)}`);
+    await apiPost(`/jupiter/swap/executions/${prepare.data.executionId}/cancel`, {
+      stage: 'worker_cancel',
+      reason: 'usdc_to_sol_gas_refill_sign_failed',
+    }).catch(() => {});
+    return false;
+  }
+
+  const submit = await apiPost<SubmitResponse>('/jupiter/swap/submit', {
+    executionId: prepare.data.executionId,
+    signedTransactionBase64: Buffer.from(tx.serialize()).toString('base64'),
+    blockhash: prepare.data.blockhash,
+    lastValidBlockHeight: prepare.data.lastValidBlockHeight,
+  });
+
+  if (!submit.ok) {
+    log('warn', session.id, `USDC->SOL gas refill submit failed: ${submit.data.error ?? submit.status}`);
+    return false;
+  }
+
+  log(
+    'info',
+    session.id,
+    `USDC->SOL gas refill submitted (${usdcAtomicToConvert} usdc atomic) · sig ${submit.data.signature ?? 'pending'}`,
+  );
+  return true;
+};
+
+/**
+ * SOL gas keep-alive. When the session's SOL fee reserve has drained toward the
+ * floor while it still holds USDC working capital, convert a small USDC slice
+ * back into SOL so the trade loop never stalls or stops with money in the wallet.
+ * Returns the (possibly higher) SOL balance to continue the loop with.
+ */
+const maybeRefillGasFromUsdc = async (
+  session: RawSession,
+  keypair: Keypair,
+  solBalanceLamports: number,
+): Promise<number> => {
+  const solUsd = lastPythSolSample?.usdPrice ?? lastJupiterSolSample?.usdPrice ?? 0;
+  const usdcBalanceAtomic = await getTokenBalanceAtomic(keypair.publicKey, USDC_MINT, TOKEN_PROGRAM_ID).catch(() => 0);
+
+  const plan = computeGasRefillPlan({
+    solBalanceLamports,
+    usdcBalanceAtomic,
+    solUsd,
+    triggerLamports: GAS_REFILL_TRIGGER_LAMPORTS,
+    targetLamports: GAS_REFILL_TARGET_LAMPORTS,
+    swapCostLamports: GAS_REFILL_SWAP_COST_LAMPORTS,
+    minUsdcKeepAtomic: GAS_REFILL_MIN_USDC_KEEP_ATOMIC,
+    minRefillUsdcAtomic: GAS_REFILL_MIN_USDC_ATOMIC,
+    slippageHeadroom: GAS_REFILL_SLIPPAGE_HEADROOM,
+    usdcAtomicPerUsd: USDC_ATOMIC_PER_USD,
+    lamportsPerSol: 1_000_000_000,
+  });
+
+  if (!plan.shouldRefill) {
+    // Only surface the actionable shortfalls; the common "plenty of SOL" and
+    // "already topped up" cases stay quiet to avoid log spam every loop.
+    if (plan.reason === 'sol_below_swap_cost' || plan.reason === 'no_spendable_usdc' || plan.reason === 'slice_below_min') {
+      log(
+        'info',
+        session.id,
+        `gas refill skipped (${plan.reason}): sol=${solBalanceLamports} usdc=${usdcBalanceAtomic} trigger=${GAS_REFILL_TRIGGER_LAMPORTS}`,
+      );
+    }
+    return solBalanceLamports;
+  }
+
+  log(
+    'info',
+    session.id,
+    `gas refill: SOL ${solBalanceLamports} <= trigger ${GAS_REFILL_TRIGGER_LAMPORTS}; converting ${plan.usdcToConvertAtomic} USDC atomic -> SOL (target ${GAS_REFILL_TARGET_LAMPORTS})`,
   );
 
-  try {
-    const account = await rlGetTokenAccount(ata, programId);
-    return Number(account.amount);
-  } catch {
+  const swapped = await convertUsdcToSol(session, keypair, plan.usdcToConvertAtomic);
+  if (!swapped) {
+    log('warn', session.id, 'gas refill: USDC->SOL conversion did not complete this cycle');
+    return solBalanceLamports;
+  }
+
+  // Wait for the refilled SOL to land before continuing the trade loop.
+  let newSolBalance = solBalanceLamports;
+  for (let attempt = 1; attempt <= 8; attempt++) {
+    const sol = await rlGetBalance(keypair.publicKey).catch(() => newSolBalance);
+    if (sol > solBalanceLamports) {
+      newSolBalance = sol;
+      break;
+    }
+    if (attempt === 8) {
+      log('warn', session.id, 'gas refill submitted but SOL balance not yet visible');
+    } else {
+      await new Promise<void>((resolve) => setTimeout(resolve, 1500));
+    }
+  }
+
+  setCachedSessionBalance(keypair.publicKey.toBase58(), newSolBalance);
+  log('info', session.id, `gas refill complete: SOL ${solBalanceLamports} -> ${newSolBalance}`);
+  return newSolBalance;
+};
+
+const maybeTransferRealizedProfit = async (
+  session: RawSession,
+  keypair: Keypair,
+  solBalanceLamports: number,
+  maxTransferUsd?: number,
+): Promise<number> => {
+  const handling = getSessionProfitHandling(session);
+  if (handling.mode !== 'send_to_owner') {
     return 0;
   }
+
+  const transferredProfitUsd = session.service_control.schedulingState?.transferredProfitUsd ?? 0;
+  const cumulativeAvailableProfitUsd = session.funding.realizedPnlUsd - transferredProfitUsd;
+  const availableProfitUsd = maxTransferUsd === undefined
+    ? cumulativeAvailableProfitUsd
+    : Math.min(cumulativeAvailableProfitUsd, maxTransferUsd);
+  if (!Number.isFinite(availableProfitUsd) || availableProfitUsd < MIN_PROFIT_TRANSFER_USD) {
+    return 0;
+  }
+
+  const solUsdForPrincipal = lastPythSolSample?.usdPrice ?? lastJupiterSolSample?.usdPrice ?? 0;
+  if (!Number.isFinite(solUsdForPrincipal) || solUsdForPrincipal <= 0) {
+    log('info', session.id, 'profit skim deferred: no SOL/USD price for principal-floor check');
+    return 0;
+  }
+
+  const sessionUsdcForPrincipal = await getTokenBalanceAtomic(keypair.publicKey, USDC_MINT, TOKEN_PROGRAM_ID).catch(() => 0);
+  const liquidWalletUsd = (Math.max(0, solBalanceLamports) / 1_000_000_000) * solUsdForPrincipal
+    + (Math.max(0, sessionUsdcForPrincipal) / USDC_ATOMIC_PER_USD);
+  const principalFloorUsd = session.funding.fundingMint === USDC_MINT
+    ? Number(session.funding.startingBalanceAtomic) / USDC_ATOMIC_PER_USD
+    : (Number(session.funding.startingBalanceAtomic) / 1_000_000_000) * solUsdForPrincipal;
+  const principalSafeProfitUsd = Math.max(0, liquidWalletUsd - principalFloorUsd);
+  const principalSafeAvailableProfitUsd = Math.min(availableProfitUsd, principalSafeProfitUsd);
+
+  if (!Number.isFinite(principalSafeAvailableProfitUsd) || principalSafeAvailableProfitUsd < MIN_PROFIT_TRANSFER_USD) {
+    log(
+      'info',
+      session.id,
+      `profit skim deferred: principal floor not cleared (liquid=$${liquidWalletUsd.toFixed(4)} floor=$${principalFloorUsd.toFixed(4)} reportedProfit=$${availableProfitUsd.toFixed(4)})`,
+    );
+    return 0;
+  }
+
+  const ownerPubkey = new PublicKey(session.owner_wallet);
+  const payerPubkey = keypair.publicKey;
+  const nowIso = new Date().toISOString();
+  let transferredUsd = 0;
+
+  if (handling.payoutToken === 'USDC') {
+    const desiredUsdcAtomic = Math.floor(principalSafeAvailableProfitUsd * USDC_ATOMIC_PER_USD);
+    if (desiredUsdcAtomic <= 0) {
+      return 0;
+    }
+
+    const sessionUsdcAta = await getAssociatedTokenAddress(new PublicKey(USDC_MINT), payerPubkey, false, TOKEN_PROGRAM_ID);
+    const ownerUsdcAta = await getAssociatedTokenAddress(new PublicKey(USDC_MINT), ownerPubkey, false, TOKEN_PROGRAM_ID);
+    let sessionUsdcBalance = sessionUsdcForPrincipal;
+
+    // USDC-base exits usually leave realized profit in the wallet as USDC already. Legacy SOL-base
+    // exits or SOL profit slices may still need conversion, so only swap the shortfall not already
+    // held as USDC.
+    if (sessionUsdcBalance < desiredUsdcAtomic) {
+      const shortfallUsdcAtomic = desiredUsdcAtomic - sessionUsdcBalance;
+      const solUsd = lastPythSolSample?.usdPrice ?? lastJupiterSolSample?.usdPrice ?? 0;
+
+      if (!Number.isFinite(solUsd) || solUsd <= 0) {
+        log('info', session.id, 'profit skim deferred: no SOL/USD price to size SOL->USDC profit conversion');
+        return 0;
+      }
+
+      const shortfallUsd = shortfallUsdcAtomic / USDC_ATOMIC_PER_USD;
+      // Add headroom for swap slippage/price impact so the swap yields at least the shortfall.
+      const lamportsForShortfall = Math.ceil((shortfallUsd / solUsd) * 1_000_000_000 * 1.02);
+      const convertibleCeilingLamports = Math.max(
+        0,
+        solBalanceLamports - MIN_SOL_OPERATING_RESERVE_LAMPORTS - TX_FEE_LAMPORTS,
+      );
+      const lamportsToConvert = Math.min(lamportsForShortfall, convertibleCeilingLamports);
+
+      if (lamportsToConvert < MIN_TRADEABLE_LAMPORTS) {
+        log('info', session.id, `profit skim deferred: SOL available for USDC conversion too small (${lamportsToConvert} lamports)`);
+        return 0;
+      }
+
+      const swapped = await convertSolToUsdc(session, keypair, lamportsToConvert);
+      if (!swapped) {
+        log('info', session.id, 'profit skim deferred: SOL->USDC profit conversion did not complete this cycle');
+        return 0;
+      }
+
+      sessionUsdcBalance = await getTokenBalanceAtomic(payerPubkey, USDC_MINT, TOKEN_PROGRAM_ID);
+      solBalanceLamports = await rlGetBalance(payerPubkey).catch(() => solBalanceLamports);
+    }
+
+    const transferUsdcAtomic = Math.min(desiredUsdcAtomic, sessionUsdcBalance);
+
+    if (transferUsdcAtomic <= 0) {
+      return 0;
+    }
+
+    const ownerUsdcAtaExists = await hasTokenAccount(ownerPubkey, USDC_MINT, TOKEN_PROGRAM_ID);
+    const requiredRent = ownerUsdcAtaExists ? 0 : await getUsdcTokenAccountRentLamports();
+    const requiredLamports = TX_FEE_LAMPORTS + requiredRent + MIN_SOL_OPERATING_RESERVE_LAMPORTS;
+    if (solBalanceLamports <= requiredLamports) {
+      log('info', session.id, `profit skim deferred: insufficient SOL for USDC transfer fees/rent (${solBalanceLamports}/${requiredLamports})`);
+      return 0;
+    }
+
+    const instructions: TransactionInstruction[] = [];
+    if (!ownerUsdcAtaExists) {
+      instructions.push(createAssociatedTokenAccountIdempotentInstruction(
+        payerPubkey,
+        ownerUsdcAta,
+        ownerPubkey,
+        new PublicKey(USDC_MINT),
+        TOKEN_PROGRAM_ID,
+      ));
+    }
+
+    instructions.push(createTransferInstruction(
+      sessionUsdcAta,
+      ownerUsdcAta,
+      payerPubkey,
+      BigInt(transferUsdcAtomic),
+      [],
+      TOKEN_PROGRAM_ID,
+    ));
+
+    const { blockhash, lastValidBlockHeight } = await rlGetLatestBlockhash();
+    const tx = new VersionedTransaction(new TransactionMessage({
+      payerKey: payerPubkey,
+      recentBlockhash: blockhash,
+      instructions,
+    }).compileToV0Message());
+    tx.sign([keypair]);
+    const sig = await rlSendRawTransaction(tx.serialize());
+    const confirmation = await rlConfirmTransaction({ signature: sig, blockhash, lastValidBlockHeight });
+    if (confirmation.value.err) {
+      throw new Error(`profit transfer failed: ${JSON.stringify(confirmation.value.err)}`);
+    }
+
+    transferredUsd = transferUsdcAtomic / USDC_ATOMIC_PER_USD;
+    log('info', session.id, `profit skimmed to owner (USDC): ${transferredUsd.toFixed(4)} usd · sig ${sig}`);
+  } else {
+    const solUsd = lastPythSolSample?.usdPrice ?? lastJupiterSolSample?.usdPrice ?? 0;
+    if (!Number.isFinite(solUsd) || solUsd <= 0) {
+      return 0;
+    }
+
+    const desiredLamports = Math.floor((principalSafeAvailableProfitUsd / solUsd) * 1_000_000_000);
+    const transferableLamports = Math.min(
+      desiredLamports,
+      Math.max(0, solBalanceLamports - MIN_SOL_OPERATING_RESERVE_LAMPORTS - TX_FEE_LAMPORTS),
+    );
+
+    if (transferableLamports <= 0) {
+      return 0;
+    }
+
+    const { blockhash, lastValidBlockHeight } = await rlGetLatestBlockhash();
+    const tx = new VersionedTransaction(new TransactionMessage({
+      payerKey: payerPubkey,
+      recentBlockhash: blockhash,
+      instructions: [
+        SystemProgram.transfer({
+          fromPubkey: payerPubkey,
+          toPubkey: ownerPubkey,
+          lamports: transferableLamports,
+        }),
+      ],
+    }).compileToV0Message());
+    tx.sign([keypair]);
+    const sig = await rlSendRawTransaction(tx.serialize());
+    const confirmation = await rlConfirmTransaction({ signature: sig, blockhash, lastValidBlockHeight });
+    if (confirmation.value.err) {
+      throw new Error(`profit transfer failed: ${JSON.stringify(confirmation.value.err)}`);
+    }
+
+    transferredUsd = (transferableLamports / 1_000_000_000) * solUsd;
+    log('info', session.id, `profit skimmed to owner (SOL): ${transferredUsd.toFixed(4)} usd-equivalent · sig ${sig}`);
+  }
+
+  if (transferredUsd > 0) {
+    await persistSchedulingState(session, {
+      transferredProfitUsd: Math.max(0, Number((transferredProfitUsd + transferredUsd).toFixed(6))),
+      lastProfitTransferAt: nowIso,
+    });
+  }
+
+  return transferredUsd;
+};
+
+const EXIT_PROFIT_PAYOUT_REASONS = new Set<NonNullable<SessionPositionState['exitReason']>>([
+  'take_profit',
+  'trailing_stop',
+]);
+
+const maybeMarkPendingExitProfitPayout = async (
+  session: RawSession,
+  tradePlan: TradeExecutionPlan,
+  executionId: string,
+) => {
+  if (tradePlan.direction !== 'exit_long' || !tradePlan.exitReason) {
+    return;
+  }
+
+  if (!EXIT_PROFIT_PAYOUT_REASONS.has(tradePlan.exitReason)) {
+    return;
+  }
+
+  await persistSchedulingState(session, {
+    pendingProfitPayout: {
+      executionId,
+      submittedAt: new Date().toISOString(),
+      preRealizedPnlUsd: session.funding.realizedPnlUsd,
+      exitReason: tradePlan.exitReason,
+      attempts: 0,
+    },
+  });
+};
+
+const clearPendingProfitPayout = async (session: RawSession) => {
+  await persistSchedulingState(session, { pendingProfitPayout: null });
+};
+
+const attemptPendingExitProfitPayout = async (session: RawSession, keypair: Keypair): Promise<void> => {
+  const pending = session.service_control.schedulingState?.pendingProfitPayout;
+  if (!pending) {
+    return;
+  }
+
+  const handling = getSessionProfitHandling(session);
+  if (handling.mode !== 'send_to_owner') {
+    await clearPendingProfitPayout(session);
+    log('info', session.id, `exit profit payout cleared for ${pending.executionId}: profit mode is compound`);
+    return;
+  }
+
+  const reconcile = await apiPost<ReconcileResponse>(`/jupiter/swap/executions/${pending.executionId}/reconcile`, {});
+  if (!reconcile.ok) {
+    await persistSchedulingState(session, {
+      pendingProfitPayout: {
+        ...pending,
+        attempts: pending.attempts + 1,
+      },
+    });
+    log('info', session.id, `exit profit payout waiting for reconcile (${pending.executionId}): ${reconcile.data.error ?? reconcile.status}`);
+    return;
+  }
+
+  const executionStatus = reconcile.data.execution?.status ?? null;
+  if (executionStatus === 'failed') {
+    await clearPendingProfitPayout(session);
+    log('warn', session.id, `exit profit payout cleared: execution ${pending.executionId} failed`);
+    return;
+  }
+
+  if (executionStatus !== 'confirmed') {
+    await persistSchedulingState(session, {
+      pendingProfitPayout: {
+        ...pending,
+        attempts: pending.attempts + 1,
+      },
+    });
+    log('info', session.id, `exit profit payout pending confirmation (${pending.executionId} status=${executionStatus ?? 'unknown'})`);
+    return;
+  }
+
+  const latestSession = await getSessionById(session.id);
+  if (!latestSession) {
+    return;
+  }
+
+  const exitProfitUsd = Number((latestSession.funding.realizedPnlUsd - pending.preRealizedPnlUsd).toFixed(6));
+  if (!Number.isFinite(exitProfitUsd) || exitProfitUsd < MIN_PROFIT_TRANSFER_USD) {
+    await clearPendingProfitPayout(latestSession);
+    log('info', session.id, `exit profit payout skipped: confirmed ${pending.exitReason} delta $${exitProfitUsd.toFixed(6)} below threshold`);
+    return;
+  }
+
+  const latestBalance = await rlGetBalance(keypair.publicKey).catch(() => 0);
+  const transferredUsd = await maybeTransferRealizedProfit(latestSession, keypair, latestBalance, exitProfitUsd);
+  if (transferredUsd > 0) {
+    const afterTransferSession = await getSessionById(session.id);
+    await clearPendingProfitPayout(afterTransferSession ?? latestSession);
+    log('info', session.id, `exit profit payout complete for ${pending.executionId}: $${transferredUsd.toFixed(6)} from ${pending.exitReason}`);
+    return;
+  }
+
+  await persistSchedulingState(latestSession, {
+    pendingProfitPayout: {
+      ...pending,
+      attempts: pending.attempts + 1,
+    },
+  });
 };
 
 const buildTradeEconomics = (params: {
@@ -2878,11 +5280,13 @@ const computeCostBpsFromUsd = (costUsd: number, notionalUsd: number): number => 
 const getLatestObservedDriftBps = () => Math.abs(sharedMarketTape.solUsdDrift.at(-1)?.driftBps ?? 0);
 
 const assessTradeGate = (params: {
+  direction: TradeDirection;
   signalSnapshot: NonNullable<Session['serviceControl']['lastSignal']>;
   economics: PreparedTradeEconomics;
   confidenceBps: number;
   driftBps: number;
   safetyBufferBps: number;
+  entryCostCapBps: number;
 }): TradeGateAssessment => {
   const signalMagnitudeBps = Math.abs(params.signalSnapshot.momentumBps ?? 0);
   const expectedEdgeBps = Math.max(0, signalMagnitudeBps - params.signalSnapshot.thresholdBps);
@@ -2890,13 +5294,41 @@ const assessTradeGate = (params: {
     params.economics.estimatedNetworkCostUsd,
     params.economics.tradeNotionalUsd,
   );
-  const slippageCostBps = computeCostBpsFromUsd(
-    params.economics.worstCaseSlippageUsd,
-    params.economics.tradeNotionalUsd,
-  );
+  const routePriceImpactBps = parseQuotePriceImpactBps(params.economics.priceImpactPct) ?? 0;
+
+  // Conviction-only entries. The bullish + persistence checks already ran before
+  // this trade was prepared, and round-trip profitability is enforced on the EXIT
+  // (take-profit is floored at the full cost floor in computeDynamicExitThresholds).
+  // So the entry gate must NOT re-demand that an instantaneous ~6s momentum velocity
+  // beat the full round-trip cost, and must NOT count oracle confidence/drift as a
+  // spendable cost (those are measurement noise / freshness guards, not a fee paid).
+  // It only guards the ENTRY LEG's own friction (network + route price impact)
+  // against a sane cap; the exit then protects realized profit.
+  if (params.direction === 'enter_long') {
+    const entryLegCostBps = networkCostBps + routePriceImpactBps;
+    const costWithinCap = entryLegCostBps <= params.entryCostCapBps;
+    // EV gate: only enter when the signal's expected edge (velocity above the
+    // strategy threshold) clears the entry-leg friction plus the safety buffer.
+    // Without this the bot bought pure noise on a flat tape (momentum hovering at
+    // 0-2 bps) and every fill just paid fees, building a bag of fee-bleed losers.
+    // In a genuinely flat market the bot now correctly sits out instead.
+    const edgeClearsCost = expectedEdgeBps > entryLegCostBps + params.safetyBufferBps;
+    const allowed = costWithinCap && edgeClearsCost;
+    const reason = !costWithinCap
+      ? 'entry_leg_cost_too_high'
+      : (edgeClearsCost ? 'entry_edge_exceeds_cost' : 'entry_edge_below_cost');
+    return {
+      allowed,
+      reason,
+      expectedEdgeBps,
+      estimatedCostBps: entryLegCostBps,
+      safetyBufferBps: params.safetyBufferBps,
+    };
+  }
+
   const estimatedCostBps =
     networkCostBps +
-    slippageCostBps +
+    routePriceImpactBps +
     Math.abs(params.driftBps) +
     Math.abs(params.confidenceBps);
 
@@ -2934,80 +5366,181 @@ const computeReturnBps = (referencePriceUsd: number | null, currentPriceUsd: num
   return Math.round(((currentPriceUsd - referencePriceUsd) / referencePriceUsd) * 10_000);
 };
 
-const refreshPositionMark = async (
+const computeExitCostFloorBps = (session: RawSession): number => Math.max(
+  positionExitPolicy.exitCostFloorBps,
+  session.risk_limits.maxSlippageBps + session.service_control.platformFeeBps + signalPolicy.edgeSafetyBufferBps,
+);
+
+const computeDynamicExitThresholds = (
   session: RawSession,
   positionState: NonNullable<Session['serviceControl']['positionState']>,
-) => {
-  const markedPriceUsd = lastPythSolSample?.usdPrice ?? null;
-  if (!markedPriceUsd) {
-    return positionState;
-  }
+  signalSnapshot: NonNullable<Session['serviceControl']['lastSignal']>,
+): DynamicExitThresholds => {
+  const costFloorBps = computeExitCostFloorBps(session);
+  const atrBps = positionState.lastComputedAtrBps ?? null;
 
-  const markedAt = new Date().toISOString();
-  const nextPositionState: NonNullable<Session['serviceControl']['positionState']> = {
-    ...positionState,
-    highWaterPriceUsd: positionState.status === 'long_sol'
-      ? (positionState.highWaterPriceUsd === null
-        ? markedPriceUsd
-        : Math.max(positionState.highWaterPriceUsd, markedPriceUsd))
-      : null,
-    lastMarkedPriceUsd: markedPriceUsd,
-    lastMarkedAt: markedAt,
+  // Time-decay take-profit ladder: a fresh position must clear its full target,
+  // but as it ages the required take-profit decays linearly toward the cost
+  // floor (breakeven + fees). This frees capital from stale positions that are
+  // green-but-stuck without ever realizing a take-profit below cost. Stop-loss
+  // and trailing thresholds are unaffected.
+  const entryAtMs = positionState.entryAt ? Date.parse(positionState.entryAt) : NaN;
+  const positionAgeMs = Number.isFinite(entryAtMs) ? Math.max(0, Date.now() - entryAtMs) : 0;
+  const decayStartMs = positionExitPolicy.takeProfitTimeDecayStartMs;
+  const decayFullMs = positionExitPolicy.takeProfitTimeDecayFullMs;
+  const applyTakeProfitTimeDecay = (rawTakeProfitBps: number): number => {
+    if (decayFullMs <= decayStartMs || positionAgeMs <= decayStartMs || rawTakeProfitBps <= costFloorBps) {
+      return rawTakeProfitBps;
+    }
+    const progress = Math.min(1, (positionAgeMs - decayStartMs) / (decayFullMs - decayStartMs));
+    const decayed = Math.round(rawTakeProfitBps - (rawTakeProfitBps - costFloorBps) * progress);
+    return Math.max(costFloorBps, decayed);
   };
 
-  if (
-    nextPositionState.highWaterPriceUsd === positionState.highWaterPriceUsd
-    && nextPositionState.lastMarkedPriceUsd === positionState.lastMarkedPriceUsd
-  ) {
-    return positionState;
+  if (!atrBps || atrBps <= 0) {
+    return {
+      takeProfitBps: applyTakeProfitTimeDecay(Math.max(positionExitPolicy.takeProfitBps, costFloorBps)),
+      stopLossBps: Math.max(positionExitPolicy.stopLossBps, costFloorBps),
+      trailingStopBps: Math.max(positionExitPolicy.trailingStopBps, costFloorBps),
+      atrBps: null,
+      costFloorBps,
+      mode: 'fallback',
+    };
   }
 
-  await persistServiceControl(session, {
-    positionState: nextPositionState,
-  });
+  const signalStrengthBps = Math.abs(signalSnapshot.momentumBps ?? 0);
+  const signalStrengthBoost = Math.min(0.5, signalStrengthBps / 200);
+  return {
+    takeProfitBps: applyTakeProfitTimeDecay(Math.max(
+      costFloorBps,
+      Math.round(atrBps * positionExitPolicy.atrTakeProfitMultiplier * (1 + signalStrengthBoost)),
+    )),
+    stopLossBps: Math.max(
+      costFloorBps,
+      Math.round(atrBps * positionExitPolicy.atrStopLossMultiplier),
+    ),
+    trailingStopBps: Math.max(
+      costFloorBps,
+      Math.round(atrBps * positionExitPolicy.atrTrailingStopMultiplier),
+    ),
+    atrBps,
+    costFloorBps,
+    mode: 'atr',
+  };
+};
 
-  // Compute and persist unrealized P&L
-  if (
-    positionState.status === 'long_sol'
-    && positionState.entryPriceUsd !== null
-    && positionState.quantityAtomic !== null
-    && markedPriceUsd > 0
-  ) {
-    const qty = Number(positionState.quantityAtomic) / 1_000_000_000;
-    const unrealizedPnlUsd = Number(((markedPriceUsd - positionState.entryPriceUsd) * qty).toFixed(6));
-    if (unrealizedPnlUsd !== session.funding.unrealizedPnlUsd) {
-      await mergeFundingPatch(session, { unrealizedPnlUsd });
+const refreshPositionsMarks = async (
+  session: RawSession,
+  positionsState: SessionPositionsState,
+) => {
+  const normalized = normalizePositionsState(positionsState);
+  const nextPositions: SessionPositionsState['positions'] = {};
+  let changed = false;
+  let totalUnrealizedPnlUsd = 0;
+  const strategyConfig = getSessionStrategyConfig(session);
+
+  for (const [mint, positionState] of Object.entries(normalized.positions)) {
+    const markedPriceUsd = mint === SOL_MINT
+      ? (lastPythSolSample?.usdPrice ?? lastJupiterSolSample?.usdPrice ?? null)
+      : (latestJupiterUsdByMint.get(mint) ?? null);
+    const atr = computeAtrFromTape(
+      mint === SOL_MINT
+        ? sharedMarketTape.solUsdPyth
+        : getMomentumTapeForMint(mint),
+      strategyConfig.supertrend,
+    );
+    const markedAt = new Date().toISOString();
+
+    const nextPositionState: SessionPositionState = !markedPriceUsd
+      ? clonePositionState(positionState)
+      : {
+          ...positionState,
+          highWaterPriceUsd: isLongPositionStatus(positionState.status)
+            ? (positionState.highWaterPriceUsd === null
+              ? markedPriceUsd
+              : Math.max(positionState.highWaterPriceUsd, markedPriceUsd))
+            : null,
+          lastMarkedPriceUsd: markedPriceUsd,
+          lastMarkedAt: markedAt,
+          lastComputedAtrUsd: atr?.atrUsd ?? positionState.lastComputedAtrUsd ?? null,
+          lastComputedAtrBps: atr?.atrBps ?? positionState.lastComputedAtrBps ?? null,
+          atrComputedAt: atr ? markedAt : (positionState.atrComputedAt ?? null),
+        };
+
+    if (
+      nextPositionState.highWaterPriceUsd !== positionState.highWaterPriceUsd
+      || nextPositionState.lastMarkedPriceUsd !== positionState.lastMarkedPriceUsd
+      || nextPositionState.lastMarkedAt !== positionState.lastMarkedAt
+      || nextPositionState.lastComputedAtrUsd !== positionState.lastComputedAtrUsd
+      || nextPositionState.lastComputedAtrBps !== positionState.lastComputedAtrBps
+      || nextPositionState.atrComputedAt !== positionState.atrComputedAt
+    ) {
+      changed = true;
+    }
+
+    nextPositions[mint] = nextPositionState;
+
+    if (
+      isLongPositionStatus(nextPositionState.status)
+      && nextPositionState.entryPriceUsd !== null
+      && nextPositionState.quantityAtomic !== null
+      && nextPositionState.lastMarkedPriceUsd !== null
+      && nextPositionState.lastMarkedPriceUsd > 0
+    ) {
+      const qty = toUiAmount(mint, Number(nextPositionState.quantityAtomic), nextPositionState.tokenDecimals ?? undefined);
+      totalUnrealizedPnlUsd += (nextPositionState.lastMarkedPriceUsd - nextPositionState.entryPriceUsd) * qty;
     }
   }
 
-  return nextPositionState;
+  const nextState = normalizePositionsState({
+    activePositionMint: normalized.activePositionMint,
+    positions: nextPositions,
+  });
+
+  if (
+    changed
+    || nextState.activePositionMint !== normalized.activePositionMint
+  ) {
+    await persistPositionsState(session, nextState);
+  }
+
+  const roundedUnrealized = Number(totalUnrealizedPnlUsd.toFixed(6));
+  if (roundedUnrealized !== session.funding.unrealizedPnlUsd) {
+    await mergeFundingPatch(session, { unrealizedPnlUsd: roundedUnrealized });
+  }
+
+  return nextState;
 };
 
 const evaluateExitTrigger = (
+  session: RawSession,
   positionState: NonNullable<Session['serviceControl']['positionState']>,
   signalSnapshot: NonNullable<Session['serviceControl']['lastSignal']>,
 ): ExitTriggerDecision => {
   const markPriceUsd = positionState.lastMarkedPriceUsd ?? null;
   const pnlBps = computeReturnBps(positionState.entryPriceUsd, markPriceUsd);
   const trailingDrawdownBps = computeReturnBps(positionState.highWaterPriceUsd, markPriceUsd);
+  const thresholds = computeDynamicExitThresholds(session, positionState, signalSnapshot);
 
-  if (pnlBps !== null && pnlBps >= positionExitPolicy.takeProfitBps) {
+  if (pnlBps !== null && pnlBps >= thresholds.takeProfitBps) {
     return {
       shouldExit: true,
       reason: 'take_profit',
       markPriceUsd,
       pnlBps,
       trailingDrawdownBps,
+      thresholds,
     };
   }
 
-  if (pnlBps !== null && pnlBps <= -positionExitPolicy.stopLossBps) {
+  if (pnlBps !== null && pnlBps <= -thresholds.stopLossBps) {
     return {
       shouldExit: true,
       reason: 'stop_loss',
       markPriceUsd,
       pnlBps,
       trailingDrawdownBps,
+      thresholds,
     };
   }
 
@@ -3015,7 +5548,7 @@ const evaluateExitTrigger = (
     pnlBps !== null
     && pnlBps > 0
     && trailingDrawdownBps !== null
-    && trailingDrawdownBps <= -positionExitPolicy.trailingStopBps
+    && trailingDrawdownBps <= -thresholds.trailingStopBps
   ) {
     return {
       shouldExit: true,
@@ -3023,16 +5556,23 @@ const evaluateExitTrigger = (
       markPriceUsd,
       pnlBps,
       trailingDrawdownBps,
+      thresholds,
     };
   }
 
-  if (signalSnapshot.regime === 'bearish') {
+  // Signal-reversal exits LOCK IN profit when the trend flips against an open
+  // position. They must never dump an underwater bag at a fee loss -- that path
+  // booked a small realized loss on every reversal. When the position is not yet
+  // profitable we hold and let stop_loss own the downside (it only fires past the
+  // full round-trip cost floor) and take_profit own the upside.
+  if (signalSnapshot.regime === 'bearish' && pnlBps !== null && pnlBps > 0) {
     return {
       shouldExit: true,
       reason: 'signal_reversal',
       markPriceUsd,
       pnlBps,
       trailingDrawdownBps,
+      thresholds,
     };
   }
 
@@ -3042,6 +5582,7 @@ const evaluateExitTrigger = (
     markPriceUsd,
     pnlBps,
     trailingDrawdownBps,
+    thresholds,
   };
 };
 
@@ -3076,6 +5617,86 @@ const getSessionStrategyConfig = (session: RawSession) => {
   };
 };
 
+const buildSessionSignalForStrategy = (
+  strategy: StrategyKey,
+  pythTape: PriceSample[],
+  strategyConfig: ReturnType<typeof getSessionStrategyConfig>,
+): NonNullable<Session['serviceControl']['lastSignal']> => {
+  if (strategy === 'mean_reversion') {
+    const bbSignal = computeBollingerSignal(pythTape, strategyConfig.meanReversion);
+    logSignalEvent({ ...bbSignal.meta, strategy: 'mean_reversion', regime: bbSignal.regime, status: bbSignal.status });
+    return {
+      at: new Date().toISOString(),
+      source: 'pyth-hermes',
+      signal: 'momentum',
+      strategy: 'mean_reversion',
+      status: bbSignal.status,
+      regime: bbSignal.regime,
+      lookbackSamples: strategyConfig.momentum.lookbackSamples,
+      thresholdBps: strategyConfig.momentum.thresholdBps,
+      momentumBps: bbSignal.momentumBps,
+      guardReason: bbSignal.guardReason,
+    };
+  }
+
+  if (strategy === 'supertrend') {
+    const stSignal = computeSupertrendSignal(pythTape, strategyConfig.supertrend);
+    logSignalEvent({ ...stSignal.meta, strategy: 'supertrend', regime: stSignal.regime, status: stSignal.status });
+    return {
+      at: new Date().toISOString(),
+      source: 'pyth-hermes',
+      signal: 'momentum',
+      strategy: 'supertrend',
+      status: stSignal.status,
+      regime: stSignal.regime,
+      lookbackSamples: strategyConfig.momentum.lookbackSamples,
+      thresholdBps: strategyConfig.momentum.thresholdBps,
+      momentumBps: stSignal.momentumBps,
+      guardReason: stSignal.guardReason,
+    };
+  }
+
+  if (!lastPythSolSample) {
+    return {
+      at: new Date().toISOString(),
+      source: 'pyth-hermes',
+      signal: 'momentum',
+      strategy: 'momentum',
+      status: 'warming_up',
+      regime: null,
+      lookbackSamples: strategyConfig.momentum.lookbackSamples,
+      thresholdBps: strategyConfig.momentum.thresholdBps,
+      momentumBps: null,
+      guardReason: null,
+    };
+  }
+
+  const guardReason = getPythGuardReason(lastPythSolSample);
+  const momentumBps = computeMomentumBps(
+    sharedMarketTape.solUsdPyth,
+    strategyConfig.momentum.lookbackSamples,
+  );
+
+  return {
+    at: new Date().toISOString(),
+    source: 'pyth-hermes',
+    signal: 'momentum',
+    strategy: 'momentum',
+    status: guardReason
+      ? 'guarded_off'
+      : momentumBps === null
+        ? 'warming_up'
+        : 'ready',
+    regime: guardReason || momentumBps === null
+      ? null
+      : classifyMomentum(momentumBps, strategyConfig.momentum.thresholdBps),
+    lookbackSamples: strategyConfig.momentum.lookbackSamples,
+    thresholdBps: strategyConfig.momentum.thresholdBps,
+    momentumBps,
+    guardReason,
+  };
+};
+
 const executeTrade = async (session: RawSession): Promise<void> => {
   // Dedup guard: skip if there's an in-flight execution for this wallet.
   // Prevents double-submit if worker restarts between prepare and confirm.
@@ -3099,49 +5720,32 @@ const executeTrade = async (session: RawSession): Promise<void> => {
     return;
   }
 
-  let positionState = await refreshPositionMark(session, getPositionState(session));
+  let positionsState = await refreshPositionsMarks(session, getPositionsState(session));
+  let positionState = summarizePositionsState(positionsState, session.service_control.positionState ?? undefined);
 
   // Recovery guard: older funding flow could incorrectly mark a session as
-  // long_sol before any submitted trade exists. Reset to flat so entry logic
+  // long position before any submitted trade exists. Reset to flat so entry logic
   // can run normally.
   if (
-    positionState.status === 'long_sol'
+    countOpenPositions(positionsState) > 0
     && !session.service_control.schedulingState?.lastTradeSubmittedAt
   ) {
     const markedAt = new Date().toISOString();
     const markedPriceUsd = positionState.lastMarkedPriceUsd ?? lastPythSolSample?.usdPrice ?? null;
 
-    const recoveredPositionState: NonNullable<Session['serviceControl']['positionState']> = {
-      status: 'flat',
-      entryPriceUsd: null,
-      entryAt: null,
-      quantityAtomic: null,
-      highWaterPriceUsd: null,
+    positionsState = await persistPositionsState(session, {
+      activePositionMint: null,
+      positions: {},
+    }, {
       lastMarkedPriceUsd: markedPriceUsd,
       lastMarkedAt: markedAt,
-      pendingExitReason: null,
-      exitReason: null,
-    };
-
-    await persistServiceControl(session, {
-      positionState: recoveredPositionState,
     });
 
-    positionState = recoveredPositionState;
-    log('warn', session.id, 'recovered inconsistent bootstrap position state (long_sol without submitted trade)');
-  }
-
-  if (positionState.status === 'long_sol' && positionState.exitReason !== null) {
-    await persistServiceControl(session, {
-      positionState: {
-        exitReason: null,
-      },
+    positionState = summarizePositionsState(positionsState, {
+      lastMarkedPriceUsd: markedPriceUsd,
+      lastMarkedAt: markedAt,
     });
-
-    positionState = {
-      ...positionState,
-      exitReason: null,
-    };
+    log('warn', session.id, 'recovered inconsistent bootstrap position state (long without submitted trade)');
   }
 
   const strategyConfig = getSessionStrategyConfig(session);
@@ -3150,9 +5754,9 @@ const executeTrade = async (session: RawSession): Promise<void> => {
   const strategyUniverse = session.service_control.strategyUniverse ?? [];
   const enabledStrategies = strategyUniverse
     .filter((strategy) => strategy.enabled)
-    .map((strategy) => strategy.key);
+    .map((strategy) => strategy.key as StrategyKey);
 
-  const configuredActiveStrategy = session.service_control.rotationState?.activeStrategy ?? 'momentum';
+  const configuredActiveStrategy = (session.service_control.rotationState?.activeStrategy ?? 'momentum') as StrategyKey;
   const fallbackStrategy = enabledStrategies[0] ?? 'momentum';
   const activeStrategy = enabledStrategies.includes(configuredActiveStrategy)
     ? configuredActiveStrategy
@@ -3173,135 +5777,29 @@ const executeTrade = async (session: RawSession): Promise<void> => {
     sampledAt: p.sampledAt,
   }));
 
-  // Compute signal based on active strategy
-  let effectiveSignal: NonNullable<Session['serviceControl']['lastSignal']> | null = null;
+  const strategyScanOrder = strategyConfig.autoRotationEnabled
+    ? getStrategyScanOrder(activeStrategy, enabledStrategies)
+    : [activeStrategy];
+  const strategySignalByKey = new Map<StrategyKey, NonNullable<Session['serviceControl']['lastSignal']>>();
+  let runtimeSignal = buildSessionSignalForStrategy(activeStrategy, pythTape, strategyConfig);
+  let selectedEntryStrategy: StrategyKey | null = null;
+  let selectedEntrySignal: NonNullable<Session['serviceControl']['lastSignal']> | null = null;
 
-  if (activeStrategy === 'mean_reversion') {
-    const bbSignal = computeBollingerSignal(pythTape, strategyConfig.meanReversion);
-    effectiveSignal = {
-      at: new Date().toISOString(),
-      source: 'pyth-hermes',
-      signal: 'momentum', // schema field name, reused for all strategies
-      status: bbSignal.status,
-      regime: bbSignal.regime,
-      lookbackSamples: strategyConfig.momentum.lookbackSamples,
-      thresholdBps: strategyConfig.momentum.thresholdBps,
-      momentumBps: bbSignal.momentumBps,
-      guardReason: bbSignal.guardReason,
-    };
-    logSignalEvent({ ...bbSignal.meta, strategy: 'mean_reversion', regime: bbSignal.regime, status: bbSignal.status });
-  } else if (activeStrategy === 'supertrend') {
-    const stSignal = computeSupertrendSignal(pythTape, strategyConfig.supertrend);
-    effectiveSignal = {
-      at: new Date().toISOString(),
-      source: 'pyth-hermes',
-      signal: 'momentum',
-      status: stSignal.status,
-      regime: stSignal.regime,
-      lookbackSamples: strategyConfig.momentum.lookbackSamples,
-      thresholdBps: strategyConfig.momentum.thresholdBps,
-      momentumBps: stSignal.momentumBps,
-      guardReason: stSignal.guardReason,
-    };
-    logSignalEvent({ ...stSignal.meta, strategy: 'supertrend', regime: stSignal.regime, status: stSignal.status });
-  } else {
-    // Session-configured momentum signal
-    if (!lastPythSolSample) {
-      effectiveSignal = {
-        at: new Date().toISOString(),
-        source: 'pyth-hermes',
-        signal: 'momentum',
-        status: 'warming_up',
-        regime: null,
-        lookbackSamples: strategyConfig.momentum.lookbackSamples,
-        thresholdBps: strategyConfig.momentum.thresholdBps,
-        momentumBps: null,
-        guardReason: null,
-      };
-    } else {
-      const guardReason = getPythGuardReason(lastPythSolSample);
-      const momentumBps = computeMomentumBps(
-        sharedMarketTape.solUsdPyth,
-        strategyConfig.momentum.lookbackSamples,
-      );
+  for (const strategy of strategyScanOrder) {
+    const signal = strategy === activeStrategy
+      ? runtimeSignal
+      : buildSessionSignalForStrategy(strategy, pythTape, strategyConfig);
+    strategySignalByKey.set(strategy, signal);
 
-      effectiveSignal = {
-        at: new Date().toISOString(),
-        source: 'pyth-hermes',
-        signal: 'momentum',
-        status: guardReason
-          ? 'guarded_off'
-          : momentumBps === null
-            ? 'warming_up'
-            : 'ready',
-        regime: guardReason || momentumBps === null
-          ? null
-          : classifyMomentum(momentumBps, strategyConfig.momentum.thresholdBps),
-        lookbackSamples: strategyConfig.momentum.lookbackSamples,
-        thresholdBps: strategyConfig.momentum.thresholdBps,
-        momentumBps,
-        guardReason,
-      };
+    if (signal.status === 'ready' && signal.regime === 'bullish') {
+      selectedEntryStrategy = strategy;
+      selectedEntrySignal = signal;
+      runtimeSignal = signal;
+      break;
     }
   }
 
-  // Auto-rotate strategy based on market regime (if rotation is enabled)
-  const recommendation = recommendStrategy(pythTape, strategyConfig.meanReversion);
-  const recommendedStrategy = enabledStrategies.includes(recommendation.recommended)
-    ? recommendation.recommended
-    : activeStrategy;
-  const shouldRotate = recommendedStrategy !== activeStrategy
-    && pythTape.length >= (strategyConfig.meanReversion.length + 1); // only rotate once we have enough data
-  if (strategyConfig.autoRotationEnabled && shouldRotate) {
-    const rotationState = session.service_control.rotationState;
-    const lockedUntil = rotationState?.lockedUntil ? new Date(rotationState.lockedUntil).getTime() : 0;
-    if (Date.now() > lockedUntil) {
-      const rotationIntervalMs = (rotationState?.rotationIntervalMinutes ?? 60) * 60_000;
-      const lastRotatedAt = rotationState?.lastRotatedAt ? new Date(rotationState.lastRotatedAt).getTime() : 0;
-      if (Date.now() - lastRotatedAt > rotationIntervalMs || lastRotatedAt === 0) {
-        await persistServiceControl(session, {
-          rotationState: {
-            activeStrategy: recommendedStrategy,
-            queuedStrategy: recommendedStrategy,
-            rotationIntervalMinutes: rotationState?.rotationIntervalMinutes ?? 60,
-            lastRotatedAt: new Date().toISOString(),
-            lockedUntil: new Date(Date.now() + 60_000).toISOString(), // lock for 1 min to prevent thrashing
-          },
-        } as any);
-        log('info', session.id, `strategy rotation: ${activeStrategy} â†’ ${recommendedStrategy} (${recommendation.reason})`);
-      }
-    }
-  }
-
-  if (!effectiveSignal) {
-    await persistTradeDecision(session, 'blocked', 'signal_not_ready');
-    await persistLastTradeGate(session, {
-      at: new Date().toISOString(),
-      decision: 'blocked',
-      reason: 'signal_not_ready',
-      expectedEdgeBps: null,
-      estimatedCostBps: null,
-      safetyBufferBps: null,
-    });
-    log('info', session.id, `strategy skip: ${activeStrategy} produced no signal`);
-    return;
-  }
-
-  await persistLastSignal(session, effectiveSignal);
-
-  if (effectiveSignal.status !== 'ready') {
-    await persistTradeDecision(session, 'blocked', `signal_${effectiveSignal.status}`);
-    await persistLastTradeGate(session, {
-      at: new Date().toISOString(),
-      decision: 'blocked',
-      reason: 'signal_not_ready',
-      expectedEdgeBps: effectiveSignal.momentumBps ?? null,
-      estimatedCostBps: null,
-      safetyBufferBps: null,
-    });
-    log('info', session.id, `strategy skip: ${activeStrategy} signal not ready (${effectiveSignal.status})`);
-    return;
-  }
+  await persistLastSignal(session, selectedEntrySignal ?? runtimeSignal);
 
   const lastTradeSubmittedMs = getLastTradeSubmittedMs(session);
   const msSinceLastSubmit = lastTradeSubmittedMs > 0 ? (Date.now() - lastTradeSubmittedMs) : Number.POSITIVE_INFINITY;
@@ -3322,10 +5820,10 @@ const executeTrade = async (session: RawSession): Promise<void> => {
     return;
   }
 
-  // Check session wallet balance
+  // Check session wallet balance (subscription-backed cache with RPC revalidation TTL)
   let balance: number;
   try {
-    balance = await rlGetBalance(keypair.publicKey);
+    balance = await getCachedSessionWalletBalance(keypair.publicKey);
   } catch {
     await persistTradeDecision(session, 'error', 'balance_check_failed');
     log('warn', session.id, 'balance check failed before trade');
@@ -3333,18 +5831,76 @@ const executeTrade = async (session: RawSession): Promise<void> => {
   }
 
   try {
+    const fundingBalanceAtomic = session.funding.fundingMint === USDC_MINT
+      ? String(await getTokenBalanceAtomic(keypair.publicKey, USDC_MINT, TOKEN_PROGRAM_ID).catch(() => 0))
+      : String(balance);
     await mergeFundingPatch(session, {
-      currentBalanceAtomic: String(balance),
+      currentBalanceAtomic: fundingBalanceAtomic,
     });
   } catch (err) {
     log('warn', session.id, `failed to persist live balance snapshot: ${String(err)}`);
   }
 
-  const minimumRequiredLamports = positionState.status === 'flat'
-    ? MIN_SOL_OPERATING_RESERVE_LAMPORTS
-    : MIN_TRADEABLE_LAMPORTS;
+  try {
+    await attemptPendingExitProfitPayout(session, keypair);
+  } catch (err) {
+    log('warn', session.id, `pending exit profit payout skipped: ${String(err)}`);
+  }
 
-  if (balance < minimumRequiredLamports) {
+  let openPositions = listOpenPositions(positionsState);
+
+  if (openPositions.length > 0) {
+    const reconciledPositions = { ...positionsState.positions };
+    const droppedMints: string[] = [];
+
+    for (const { mint, position } of openPositions) {
+      const trackedQuantityAtomic = Number(position.quantityAtomic ?? 0);
+      if (!Number.isFinite(trackedQuantityAtomic) || trackedQuantityAtomic <= 0) {
+        continue;
+      }
+
+      const walletInventoryAtomic = mint === SOL_MINT
+        ? Math.max(0, balance - MIN_SOL_OPERATING_RESERVE_LAMPORTS)
+        : await getTokenBalanceAtomic(keypair.publicKey, mint, TOKEN_PROGRAM_ID).catch(() => 0);
+      const minimumExpectedInventoryAtomic = Math.max(1, Math.floor(trackedQuantityAtomic * 0.1));
+
+      if (walletInventoryAtomic < minimumExpectedInventoryAtomic) {
+        delete reconciledPositions[mint];
+        droppedMints.push(`${getPositionSymbol(position)}:${walletInventoryAtomic}/${trackedQuantityAtomic}`);
+      }
+    }
+
+    if (droppedMints.length > 0) {
+      positionsState = await persistPositionsState(session, {
+        activePositionMint: positionsState.activePositionMint && reconciledPositions[positionsState.activePositionMint]
+          ? positionsState.activePositionMint
+          : null,
+        positions: reconciledPositions,
+      });
+      positionState = summarizePositionsState(positionsState, session.service_control.positionState ?? undefined);
+      openPositions = listOpenPositions(positionsState);
+      log('warn', session.id, `reconciled stale position inventory; dropped ${droppedMints.join(', ')}`);
+    }
+  }
+
+  const openPositionMints = new Set(openPositions.map(({ mint }) => mint));
+
+  // Gas keep-alive: if SOL has drained toward the fee floor while the session
+  // still holds USDC working capital, top the tank back up from a small USDC
+  // slice instead of stalling (`insufficient_sol_fee_reserve`) or stopping
+  // (`depleted`) with money still in the wallet. Runs before the depletion gate
+  // below so a refilled session keeps trading this same cycle.
+  balance = await maybeRefillGasFromUsdc(session, keypair, balance);
+
+  // SOL depletion only stops a FLAT session. In the USDC-base model an active
+  // session's capital lives in USDC + open token positions, while SOL is only a
+  // fee reserve. When positions are open we just need enough SOL to pay exit
+  // fees (operating reserve), never the full tradeable size — otherwise a healthy
+  // multi-position session gets killed as "depleted" the moment its SOL is just a
+  // fee reserve. Exit management must stay alive instead of sweeping mid-position.
+  const minimumRequiredLamports = MIN_SOL_OPERATING_RESERVE_LAMPORTS;
+
+  if (openPositions.length === 0 && balance < minimumRequiredLamports) {
     await persistTradeDecision(session, 'stopped', 'insufficient_balance');
     log('warn', session.id, `insufficient balance for trade: ${balance}/${minimumRequiredLamports} lamports`);
     await setSessionStatus(session.id, 'stopping', { stop_reason: 'depleted' }, { expectedStatuses: ['active'] });
@@ -3352,129 +5908,266 @@ const executeTrade = async (session: RawSession): Promise<void> => {
     return;
   }
 
-  // Risk check: session loss limit
-  const { realizedPnlUsd, capturedFeesUsd } = session.funding;
-  const sessionLoss = Math.abs(Math.min(0, realizedPnlUsd));
-  if (sessionLoss >= session.risk_limits.maxSessionLossUsd) {
-    await persistTradeDecision(session, 'stopped', 'risk_limit_hit');
-    await setSessionStatus(session.id, 'stopping', { stop_reason: 'risk_limit_hit' }, { expectedStatuses: ['active'] });
-    log('info', session.id, `risk limit hit (loss $${sessionLoss.toFixed(2)}) â†’ stopping (sweep will run)`);
-    return;
-  }
-
   let tradePlan: TradeExecutionPlan | null = null;
   let useBasicPairEntryFallback = false;
   let basicPairEntryFallbackReason: string | null = null;
 
-  if (positionState.status === 'long_sol') {
-    const exitTrigger = evaluateExitTrigger(positionState, effectiveSignal);
+  if (openPositions.length > 0) {
+    const exitReasonPriority = {
+      stop_loss: 0,
+      trailing_stop: 1,
+      signal_reversal: 2,
+      take_profit: 3,
+    } satisfies Record<NonNullable<SessionPositionState['exitReason']>, number>;
+    const nextPositions = { ...positionsState.positions };
+    let positionsChanged = false;
+    const exitCandidates: Array<{
+      mint: string;
+      position: SessionPositionState;
+      signal: NonNullable<Session['serviceControl']['lastSignal']>;
+      trigger: ExitTriggerDecision;
+    }> = [];
 
-    if (!exitTrigger.shouldExit) {
-      await persistTradeDecision(session, 'blocked', 'no_exit_trigger');
-      if (positionState.pendingExitReason !== null) {
-        await persistServiceControl(session, {
-          positionState: {
+    for (const { mint, position } of openPositions) {
+      const positionStrategy = position.entryStrategy && enabledStrategies.includes(position.entryStrategy)
+        ? position.entryStrategy
+        : activeStrategy;
+      const signalForPosition = mint === SOL_MINT
+        ? (strategySignalByKey.get(positionStrategy) ?? buildSessionSignalForStrategy(positionStrategy, pythTape, strategyConfig))
+        : buildRuntimeSignalForMint(mint, positionStrategy, strategyConfig);
+      const exitTrigger = evaluateExitTrigger(session, position, signalForPosition);
+
+      if (!exitTrigger.shouldExit) {
+        if (position.pendingExitReason !== null) {
+          nextPositions[mint] = {
+            ...position,
             pendingExitReason: null,
+          };
+          positionsChanged = true;
+        }
+        continue;
+      }
+
+      exitCandidates.push({
+        mint,
+        position,
+        signal: signalForPosition,
+        trigger: exitTrigger,
+      });
+    }
+
+    if (positionsChanged) {
+      positionsState = await persistPositionsState(session, {
+        activePositionMint: positionsState.activePositionMint,
+        positions: nextPositions,
+      });
+      positionState = summarizePositionsState(positionsState, session.service_control.positionState ?? undefined);
+    }
+
+    if (exitCandidates.length > 0) {
+      exitCandidates.sort((left, right) => {
+        const priorityDiff = exitReasonPriority[left.trigger.reason] - exitReasonPriority[right.trigger.reason];
+        if (priorityDiff !== 0) return priorityDiff;
+        return (right.trigger.pnlBps ?? Number.NEGATIVE_INFINITY) - (left.trigger.pnlBps ?? Number.NEGATIVE_INFINITY);
+      });
+
+      const selectedExit = exitCandidates[0];
+      // Post-stop-loss cooldown: lock the stopped token's correlation cluster
+      // from new entries so the bot does not immediately re-buy what it just
+      // stopped out of (e.g. SOL stops out -> don't rebuy JitoSOL/mSOL/bSOL).
+      if (selectedExit.trigger.reason === 'stop_loss') {
+        try {
+          await recordStopLossClusterLock(session, selectedExit.mint, Date.now());
+        } catch (err) {
+          log('warn', session.id, `failed to record stop-loss cluster lock for ${selectedExit.mint}: ${String(err)}`);
+        }
+      }
+      const nextSelectedPosition: SessionPositionState = {
+        ...selectedExit.position,
+        pendingExitReason: selectedExit.trigger.reason,
+      };
+
+      if (
+        positionsState.activePositionMint !== selectedExit.mint
+        || selectedExit.position.pendingExitReason !== selectedExit.trigger.reason
+      ) {
+        positionsState = await persistPositionsState(session, {
+          activePositionMint: selectedExit.mint,
+          positions: {
+            ...positionsState.positions,
+            [selectedExit.mint]: nextSelectedPosition,
           },
         });
       }
 
+      positionState = positionsState.positions[selectedExit.mint] ?? nextSelectedPosition;
+
+      const positionMint = getPositionMint(positionState);
+      const positionSymbol = getPositionSymbol(positionState);
+      const sizing = computeTradeAmountLamports({
+        balanceLamports: balance,
+        thresholds: fundingThresholds,
+        policy: sizingPolicy,
+      });
+      const exitReserveAtomic = positionMint === SOL_MINT ? sizing.reserveLamports : 0;
+      const exitTokenBalanceSnapshot = positionMint === SOL_MINT
+        ? null
+        : await getTokenBalanceSnapshot(keypair.publicKey, positionMint);
+      const exitWalletBalanceAtomic = positionMint === SOL_MINT
+        ? sizing.balanceLamports
+        : exitTokenBalanceSnapshot?.balanceAtomic ?? 0;
+      if (exitTokenBalanceSnapshot && exitWalletBalanceAtomic <= 0 && Number(positionState.quantityAtomic ?? 0) > 0) {
+        log(
+          'warn',
+          session.id,
+          `exit inventory lookup returned zero for ${positionSymbol} (${positionMint}) despite tracked quantity=${positionState.quantityAtomic}; source=${exitTokenBalanceSnapshot.source} tokenAccount=${exitTokenBalanceSnapshot.tokenAccount ?? 'none'} program=${exitTokenBalanceSnapshot.programId ?? 'none'} attemptedPrograms=${exitTokenBalanceSnapshot.attemptedPrograms.join(',')}`,
+        );
+      }
+      const exitTradableAtomic = Math.max(0, exitWalletBalanceAtomic - exitReserveAtomic);
+      const exitAmountLamports = computeFullExitAmountAtomic({
+        walletBalanceAtomic: exitWalletBalanceAtomic,
+        reserveAtomic: exitReserveAtomic,
+        positionQuantityAtomic: positionState.quantityAtomic,
+      });
+
+      const sellInventory: TradeInventoryContext = {
+        inputMint: positionMint,
+        inputSymbol: positionSymbol,
+        outputMint: USDC_MINT,
+        outputSymbol: 'USDC',
+        balanceAtomic: exitWalletBalanceAtomic,
+        reserveAtomic: exitReserveAtomic,
+        tradableAtomic: exitTradableAtomic,
+        targetAtomic: exitAmountLamports,
+        minTradeAtomic: exitAmountLamports,
+        maxTradeAtomic: exitAmountLamports,
+        amountAtomic: exitAmountLamports > 0 ? exitAmountLamports : null,
+        riskAdjustedAmountAtomic: null,
+      };
+
+      if ((positionMint === SOL_MINT && sizing.skip) || exitAmountLamports <= 0) {
+        try {
+          await persistLastSizing(session, {
+            at: new Date().toISOString(),
+            decision: 'skipped',
+            reason: (positionMint === SOL_MINT && sizing.skip) ? sizing.reason : 'no_exit_inventory',
+            balanceLamports: String(exitWalletBalanceAtomic),
+            reserveLamports: String(exitReserveAtomic),
+            tradableLamports: String(exitTradableAtomic),
+            fractionBps: 10000,
+            targetLamports: String(exitAmountLamports),
+            minTradeLamports: String(exitAmountLamports),
+            maxTradeLamports: String(exitAmountLamports),
+            amountLamports: null,
+            remainingRiskBudgetUsd: null,
+            quotedOutAmountAtomic: null,
+            minimumOutputAtomic: null,
+            priceImpactPct: null,
+            estimatedNetworkCostLamports: null,
+            estimatedNetworkCostOutputAtomic: null,
+            worstCaseSlippageOutputAtomic: null,
+            totalWorstCaseCostOutputAtomic: null,
+            riskAdjustedAmountLamports: null,
+            tradeContext: buildSizingTradeContext(sellInventory),
+          });
+        } catch (err) {
+          log('warn', session.id, `failed to persist lastSizing: ${String(err)}`);
+        }
+
+        log(
+          'info',
+          session.id,
+          `sizing skip (${(positionMint === SOL_MINT && sizing.skip) ? sizing.reason : 'no_exit_inventory'}): ${positionSymbol} balance=${exitWalletBalanceAtomic} reserve=${exitReserveAtomic} tradable=${exitTradableAtomic} exitAmount=${exitAmountLamports}`,
+        );
+        return;
+      }
+
+      tradePlan = {
+        direction: 'exit_long',
+        inventory: sellInventory,
+        exitReason: selectedExit.trigger.reason,
+        signalSnapshot: selectedExit.signal,
+        scannerStrategy: activeStrategy,
+        entryStrategy: selectedExit.position.entryStrategy ?? null,
+        exitStrategy: selectedExit.position.entryStrategy ?? activeStrategy,
+      };
+    }
+  }
+
+  if (!tradePlan) {
+    const { realizedPnlUsd } = session.funding;
+    const sessionLoss = Math.abs(Math.min(0, realizedPnlUsd));
+    const circuitBreakerReason = getRiskCircuitBreakerReason(session, sessionLoss);
+    if (circuitBreakerReason) {
+      const riskState = getSessionRiskState(session);
+      await persistTradeDecision(session, 'blocked', circuitBreakerReason);
       await persistLastTradeGate(session, {
         at: new Date().toISOString(),
         decision: 'blocked',
-        reason: 'no_exit_trigger',
-        expectedEdgeBps: exitTrigger.pnlBps,
+        reason: circuitBreakerReason,
+        expectedEdgeBps: runtimeSignal.momentumBps,
         estimatedCostBps: null,
         safetyBufferBps: null,
       });
-      log('info', session.id, `strategy skip: no exit trigger (mark=${exitTrigger.markPriceUsd} pnlBps=${exitTrigger.pnlBps} trail=${exitTrigger.trailingDrawdownBps} regime=${effectiveSignal.regime})`);
-      return;
-    }
-
-    const nextPositionState: NonNullable<Session['serviceControl']['positionState']> = {
-      ...positionState,
-      pendingExitReason: exitTrigger.reason,
-    };
-
-    if (nextPositionState.pendingExitReason !== positionState.pendingExitReason) {
-      await persistServiceControl(session, {
-        positionState: nextPositionState,
-      });
-    }
-
-    const sizing = computeTradeAmountLamports({
-      balanceLamports: balance,
-      thresholds: fundingThresholds,
-      policy: sizingPolicy,
-    });
-    const outputUsdcAtaExists = await hasTokenAccount(keypair.publicKey, USDC_MINT);
-    const outputUsdcAtaRentLamports = outputUsdcAtaExists ? 0 : await getUsdcTokenAccountRentLamports();
-    const exitReserveLamports = sizing.reserveLamports + outputUsdcAtaRentLamports;
-    const exitTradableLamports = Math.max(0, sizing.balanceLamports - exitReserveLamports);
-    const exitAmountLamports = computeFullExitAmountAtomic({
-      walletBalanceAtomic: sizing.balanceLamports,
-      reserveAtomic: exitReserveLamports,
-      positionQuantityAtomic: positionState.quantityAtomic,
-    });
-
-    const sellInventory: TradeInventoryContext = {
-      inputMint: SOL_MINT,
-      inputSymbol: 'SOL',
-      outputMint: USDC_MINT,
-      outputSymbol: 'USDC',
-      balanceAtomic: sizing.balanceLamports,
-      reserveAtomic: exitReserveLamports,
-      tradableAtomic: exitTradableLamports,
-      targetAtomic: exitAmountLamports,
-      minTradeAtomic: exitAmountLamports,
-      maxTradeAtomic: exitAmountLamports,
-      amountAtomic: exitAmountLamports > 0 ? exitAmountLamports : null,
-      riskAdjustedAmountAtomic: null,
-    };
-
-    if (sizing.skip || exitAmountLamports <= 0) {
-      try {
-        await persistLastSizing(session, {
-          at: new Date().toISOString(),
-          decision: 'skipped',
-          reason: sizing.skip ? sizing.reason : 'no_exit_inventory',
-          balanceLamports: String(sizing.balanceLamports),
-          reserveLamports: String(sizing.reserveLamports),
-          tradableLamports: String(sizing.tradableLamports),
-          fractionBps: 10000,
-          targetLamports: String(exitAmountLamports),
-          minTradeLamports: String(exitAmountLamports),
-          maxTradeLamports: String(exitAmountLamports),
-          amountLamports: null,
-          remainingRiskBudgetUsd: null,
-          quotedOutAmountAtomic: null,
-          minimumOutputAtomic: null,
-          priceImpactPct: null,
-          estimatedNetworkCostLamports: null,
-          estimatedNetworkCostOutputAtomic: null,
-          worstCaseSlippageOutputAtomic: null,
-          totalWorstCaseCostOutputAtomic: null,
-          riskAdjustedAmountLamports: null,
-          tradeContext: buildSizingTradeContext(sellInventory),
-        });
-      } catch (err) {
-        log('warn', session.id, `failed to persist lastSizing: ${String(err)}`);
-      }
-
       log(
         'info',
         session.id,
-        `sizing skip (${sizing.skip ? sizing.reason : 'no_exit_inventory'}): balance=${sizing.balanceLamports} reserve=${sizing.reserveLamports} tradable=${sizing.tradableLamports} exitAmount=${exitAmountLamports}`,
+        `risk entry gate blocked new entry (${circuitBreakerReason}): sessionLoss=$${sessionLoss.toFixed(2)} dailyPnl=$${riskState.dailyRealizedPnlUsd.toFixed(4)} consecutiveLosses=${riskState.consecutiveLosses} badFillStreak=${riskState.badFillStreak}; session remains active for scanning, holding, and exits`,
       );
       return;
     }
 
-    tradePlan = {
-      direction: 'exit_long_sol',
-      inventory: sellInventory,
-      exitReason: exitTrigger.reason,
-    };
-  } else {
+    if (!liveEntriesEnabled) {
+      const reason = 'deployment_entries_disabled';
+      await persistTradeDecision(session, 'blocked', reason);
+      await persistLastTradeGate(session, {
+        at: new Date().toISOString(),
+        decision: 'blocked',
+        reason,
+        expectedEdgeBps: runtimeSignal.momentumBps,
+        estimatedCostBps: null,
+        safetyBufferBps: null,
+      });
+      log(
+        'info',
+        session.id,
+        `entry blocked: deployment entry lock active${liveMaintenanceReason ? ` (${liveMaintenanceReason})` : ''}`,
+      );
+      return;
+    }
+
+    // Fleet-mode position cap can only tighten the session's own risk limit, never loosen it.
+    // Surge (maxOpenPositions === null) applies no extra clamp.
+    const fleetMaxOpenPositions = getLiveSpeedProfile().maxOpenPositions;
+    const effectiveMaxOpenPositions = fleetMaxOpenPositions === null
+      ? session.risk_limits.maxOpenPositions
+      : Math.min(session.risk_limits.maxOpenPositions, fleetMaxOpenPositions);
+
+    if (openPositions.length >= effectiveMaxOpenPositions) {
+      const limitedByFleet = fleetMaxOpenPositions !== null
+        && fleetMaxOpenPositions < session.risk_limits.maxOpenPositions;
+      await persistTradeDecision(
+        session,
+        'blocked',
+        limitedByFleet ? 'fleet_mode_position_cap' : 'max_open_positions_reached',
+      );
+      await persistLastTradeGate(session, {
+        at: new Date().toISOString(),
+        decision: 'blocked',
+        reason: 'max_open_positions_reached',
+        expectedEdgeBps: runtimeSignal.momentumBps,
+        estimatedCostBps: null,
+        safetyBufferBps: strategyConfig.momentum.edgeSafetyBufferBps,
+      });
+      log(
+        'info',
+        session.id,
+        `entry blocked: ${openPositions.length}/${effectiveMaxOpenPositions} positions already open`
+          + (limitedByFleet ? ` (fleet ${getLiveSpeedProfile().name} cap ${fleetMaxOpenPositions})` : ''),
+      );
+      return;
+    }
+
     const universeEngineAgeMs = lastTokenUniverseEngineAppliedAt > 0
       ? (Date.now() - lastTokenUniverseEngineAppliedAt)
       : Number.POSITIVE_INFINITY;
@@ -3497,52 +6190,13 @@ const executeTrade = async (session: RawSession): Promise<void> => {
       );
     }
 
-    if (effectiveSignal.regime !== 'bullish') {
-      await persistTradeDecision(session, 'blocked', 'no_bullish_entry_signal');
-      await persistLastTradeGate(session, {
-        at: new Date().toISOString(),
-        decision: 'blocked',
-        reason: 'no_bullish_entry_signal',
-        expectedEdgeBps: effectiveSignal.momentumBps,
-        estimatedCostBps: null,
-        safetyBufferBps: null,
-      });
-      log('info', session.id, `strategy skip: regime=${effectiveSignal.regime} momentum=${effectiveSignal.momentumBps}`);
-      return;
-    }
-
-    const persistentBullishRegime = hasMomentumRegimePersistence({
-      samples: sharedMarketTape.solUsdPyth,
-      lookbackSamples: strategyConfig.momentum.lookbackSamples,
-      thresholdBps: strategyConfig.momentum.thresholdBps,
-      regime: 'bullish',
-      requiredSamples: MIN_ENTRY_SIGNAL_PERSISTENCE_SAMPLES,
-    });
-    if (!persistentBullishRegime) {
-      await persistTradeDecision(session, 'blocked', 'regime_not_persistent');
-      await persistLastTradeGate(session, {
-        at: new Date().toISOString(),
-        decision: 'blocked',
-        reason: 'regime_not_persistent',
-        expectedEdgeBps: effectiveSignal.momentumBps,
-        estimatedCostBps: null,
-        safetyBufferBps: strategyConfig.momentum.edgeSafetyBufferBps,
-      });
-      log(
-        'info',
-        session.id,
-        `entry blocked: bullish regime not persistent (${MIN_ENTRY_SIGNAL_PERSISTENCE_SAMPLES} samples required)`,
-      );
-      return;
-    }
-
     if (balance < MIN_SOL_OPERATING_RESERVE_LAMPORTS) {
       await persistTradeDecision(session, 'blocked', 'insufficient_sol_fee_reserve');
       await persistLastTradeGate(session, {
         at: new Date().toISOString(),
         decision: 'blocked',
         reason: 'insufficient_sol_fee_reserve',
-        expectedEdgeBps: effectiveSignal.momentumBps,
+        expectedEdgeBps: runtimeSignal.momentumBps,
         estimatedCostBps: null,
         safetyBufferBps: null,
       });
@@ -3550,34 +6204,148 @@ const executeTrade = async (session: RawSession): Promise<void> => {
       return;
     }
 
-    const usdcBalanceAtomic = await getTokenBalanceAtomic(keypair.publicKey, USDC_MINT);
+    const usdcBalanceAtomic = await getTokenBalanceAtomic(keypair.publicKey, USDC_MINT, TOKEN_PROGRAM_ID);
     const usdcSizing = computeUsdcTradeAmountAtomic({
       balanceAtomic: usdcBalanceAtomic,
-        maxPositionUsd: getLiveSpeedProfile().maxSolEntryUsd,
+      maxPositionUsd: session.risk_limits.maxPositionSizeUsd,
+      maxOpenPositions: effectiveMaxOpenPositions,
+      openPositionsCount: openPositions.length,
     });
+    const solSizing = computeTradeAmountLamports({
+      balanceLamports: balance,
+      thresholds: fundingThresholds,
+      policy: sizingPolicy,
+    });
+    const canUseUsdcEntry = !usdcSizing.skip;
+    const canUseSolEntry = !openPositionMints.has(SOL_MINT) && !solSizing.skip;
+
+    // Honor the session's base-capital (funding) mint when picking entry inventory,
+    // but do not let idle USDC sit unused. A SOL-funded session deploys its SOL
+    // capital first (SOL->token via the scout); once SOL capital is already working
+    // in an open position, leftover USDC becomes a SECOND inventory that funds an
+    // additional concurrent position instead of sitting idle. This both puts the
+    // "dust" to work and enables genuine multi-position behaviour.
+    //
+    // The old failure mode (a $1.10 micro-trade whose ~$0.0137 fee is ~124bps and
+    // can never clear a 30bps take-profit) only occurred when USDC was split across
+    // every open slot while the session was FLAT (0 open -> 3-way split). Gating USDC
+    // entry on `openPositions.length > 0` means the split denominator is small
+    // (<= remaining slots), so each USDC chunk is a viable size, and the conviction
+    // entry gate remains the final viability arbiter for true micro-dust.
+    const fundingIsUsdc = session.funding.fundingMint === USDC_MINT;
+    const useUsdcEntry = canUseUsdcEntry && (
+      fundingIsUsdc
+      || !canUseSolEntry
+      || openPositions.length > 0
+    );
+
+    if (usdcSizing.skip && openPositionMints.has(SOL_MINT)) {
+      log(
+        'info',
+        session.id,
+        `entry base conversion blocked: SOL is an open position; not converting tracked SOL to USDC (usdc=${usdcBalanceAtomic}/${MIN_USDC_ENTRY_ATOMIC})`,
+      );
+    }
 
     const entryInventory: TradeInventoryContext = {
-      inputMint: USDC_MINT,
-      inputSymbol: 'USDC',
-      outputMint: SOL_MINT,
-      outputSymbol: 'SOL',
-      balanceAtomic: usdcSizing.balanceAtomic,
-      reserveAtomic: usdcSizing.reserveAtomic,
-      tradableAtomic: usdcSizing.tradableAtomic,
-      targetAtomic: usdcSizing.targetAtomic,
-      minTradeAtomic: usdcSizing.minTradeAtomic,
-      maxTradeAtomic: usdcSizing.maxTradeAtomic,
-      amountAtomic: usdcSizing.skip ? null : usdcSizing.amountAtomic,
+      inputMint: useUsdcEntry ? USDC_MINT : SOL_MINT,
+      inputSymbol: useUsdcEntry ? 'USDC' : 'SOL',
+      outputMint: useUsdcEntry ? SOL_MINT : USDC_MINT,
+      outputSymbol: useUsdcEntry ? 'SOL' : 'USDC',
+      balanceAtomic: useUsdcEntry ? usdcSizing.balanceAtomic : solSizing.balanceLamports,
+      reserveAtomic: useUsdcEntry ? usdcSizing.reserveAtomic : solSizing.reserveLamports,
+      tradableAtomic: useUsdcEntry ? usdcSizing.tradableAtomic : solSizing.tradableLamports,
+      targetAtomic: useUsdcEntry ? usdcSizing.targetAtomic : solSizing.targetLamports,
+      minTradeAtomic: useUsdcEntry ? usdcSizing.minTradeAtomic : sizingPolicy.minTradeLamports,
+      maxTradeAtomic: useUsdcEntry ? usdcSizing.maxTradeAtomic : sizingPolicy.maxTradeLamports,
+      amountAtomic: useUsdcEntry ? usdcSizing.amountAtomic : (canUseSolEntry ? solSizing.amountLamports : null),
       riskAdjustedAmountAtomic: null,
     };
 
-    if (usdcSizing.skip) {
-      await persistTradeDecision(session, 'blocked', usdcSizing.reason ?? 'entry_inventory_blocked');
+    if (!canUseUsdcEntry && !canUseSolEntry && openPositionMints.has(SOL_MINT) && openPositions.length < effectiveMaxOpenPositions) {
+      const solPosition = positionsState.positions[SOL_MINT] ?? null;
+      const trackedSolAtomic = Number(solPosition?.quantityAtomic ?? 0);
+      const targetSolAtomic = Math.floor(solSizing.tradableLamports / Math.max(1, effectiveMaxOpenPositions));
+      const maxSellableTrackedSolAtomic = Math.max(0, Math.min(trackedSolAtomic, solSizing.tradableLamports));
+      const rebalanceAmountLamports = Math.max(
+        0,
+        Math.min(maxSellableTrackedSolAtomic, trackedSolAtomic - targetSolAtomic),
+      );
+
+      if (solPosition && rebalanceAmountLamports >= sizingPolicy.minTradeLamports) {
+        positionsState = await persistPositionsState(session, {
+          activePositionMint: SOL_MINT,
+          positions: {
+            ...positionsState.positions,
+            [SOL_MINT]: {
+              ...solPosition,
+              pendingExitReason: 'signal_reversal',
+            },
+          },
+        });
+        positionState = positionsState.positions[SOL_MINT] ?? solPosition;
+
+        const rebalanceInventory: TradeInventoryContext = {
+          inputMint: SOL_MINT,
+          inputSymbol: 'SOL',
+          outputMint: USDC_MINT,
+          outputSymbol: 'USDC',
+          balanceAtomic: solSizing.balanceLamports,
+          reserveAtomic: solSizing.reserveLamports,
+          tradableAtomic: solSizing.tradableLamports,
+          targetAtomic: rebalanceAmountLamports,
+          minTradeAtomic: sizingPolicy.minTradeLamports,
+          maxTradeAtomic: rebalanceAmountLamports,
+          amountAtomic: rebalanceAmountLamports,
+          riskAdjustedAmountAtomic: null,
+        };
+
+        tradePlan = {
+          direction: 'exit_long',
+          inventory: rebalanceInventory,
+          exitReason: 'signal_reversal',
+          signalSnapshot: selectedEntrySignal ?? runtimeSignal,
+          scannerStrategy: selectedEntryStrategy ?? activeStrategy,
+          entryStrategy: solPosition.entryStrategy ?? null,
+          exitStrategy: solPosition.entryStrategy ?? selectedEntryStrategy ?? activeStrategy,
+        };
+
+        log(
+          'info',
+          session.id,
+          `portfolio rebalance: selling ${rebalanceAmountLamports} SOL lamports to restore USDC entry inventory (tracked=${trackedSolAtomic}, targetSol=${targetSolAtomic}, open=${openPositions.length}/${effectiveMaxOpenPositions})`,
+        );
+      }
+    }
+
+    if (!tradePlan && (!selectedEntryStrategy || !selectedEntrySignal)) {
+      await persistTradeDecision(session, 'blocked', 'no_strategy_entry_signal');
       await persistLastTradeGate(session, {
         at: new Date().toISOString(),
         decision: 'blocked',
-        reason: usdcSizing.reason ?? 'entry_inventory_blocked',
-        expectedEdgeBps: effectiveSignal.momentumBps,
+        reason: 'no_strategy_entry_signal',
+        expectedEdgeBps: runtimeSignal.momentumBps,
+        estimatedCostBps: null,
+        safetyBufferBps: null,
+      });
+      log(
+        'info',
+        session.id,
+        `strategy scan blocked entry: no bullish trigger order=${strategyScanOrder.join('>')} last=${runtimeSignal.regime}/${runtimeSignal.momentumBps}`,
+      );
+      return;
+    }
+
+    if (!tradePlan && !canUseUsdcEntry && !canUseSolEntry) {
+      const blockedReason = openPositionMints.has(SOL_MINT)
+        ? 'entry_inventory_allocated_to_open_sol_position'
+        : (usdcSizing.reason ?? (solSizing.skip ? solSizing.reason : null) ?? 'entry_inventory_blocked');
+      await persistTradeDecision(session, 'blocked', blockedReason);
+      await persistLastTradeGate(session, {
+        at: new Date().toISOString(),
+        decision: 'blocked',
+        reason: blockedReason,
+        expectedEdgeBps: runtimeSignal.momentumBps,
         estimatedCostBps: null,
         safetyBufferBps: null,
       });
@@ -3608,87 +6376,347 @@ const executeTrade = async (session: RawSession): Promise<void> => {
       } catch (err) {
         log('warn', session.id, `failed to persist lastSizing: ${String(err)}`);
       }
-      log('info', session.id, `entry sizing skip (${usdcSizing.reason}): usdcBalance=${usdcSizing.balanceAtomic} target=${usdcSizing.targetAtomic} min=${usdcSizing.minTradeAtomic}`);
+      log(
+        'info',
+        session.id,
+        `entry sizing skip (${blockedReason}): usdcBalance=${usdcSizing.balanceAtomic} solBalance=${solSizing.balanceLamports} usdcTarget=${usdcSizing.targetAtomic} solTarget=${solSizing.targetLamports}`,
+      );
       return;
     }
 
-    if (WORKER_UNIVERSE_SCOUT_ENABLED && !useBasicPairEntryFallback) {
-      const scout = await scoutEntryUniverse({
-        amountAtomic: usdcSizing.amountAtomic,
-        takerWallet: session.session_wallet,
-        slippageBps: session.risk_limits.maxSlippageBps,
-      });
-
-      if (scout.solRank === null) {
-        await persistTradeDecision(session, 'blocked', 'universe_scout_no_sol_route');
+    if (!tradePlan) {
+      const entryStrategyForPlan = selectedEntryStrategy;
+      const entrySignalForPlan = selectedEntrySignal;
+      if (!entryStrategyForPlan || !entrySignalForPlan) {
+        await persistTradeDecision(session, 'blocked', 'no_strategy_entry_signal');
         await persistLastTradeGate(session, {
           at: new Date().toISOString(),
           decision: 'blocked',
-          reason: 'universe_scout_no_sol_route',
-          expectedEdgeBps: effectiveSignal.momentumBps,
+          reason: 'no_strategy_entry_signal',
+          expectedEdgeBps: runtimeSignal.momentumBps,
           estimatedCostBps: null,
-          safetyBufferBps: strategyConfig.momentum.edgeSafetyBufferBps,
+          safetyBufferBps: null,
         });
         log(
           'info',
           session.id,
-          `universe scout blocked entry: no SOL route (candidates=${scout.candidates.length} best=${scout.bestMint})`,
+          `strategy scan blocked entry: no bullish trigger order=${strategyScanOrder.join('>')} last=${runtimeSignal.regime}/${runtimeSignal.momentumBps}`,
+        );
+        return;
+      }
+
+      let selectedEntryMint = entryInventory.inputMint === SOL_MINT ? USDC_MINT : SOL_MINT;
+      let tokenEntrySignal = entrySignalForPlan;
+    // Note: selectedEntrySignal may be updated if universe scout selects a different token,
+    // but it maintains the strategy-specific signal basis (momentum/Bollinger/Supertrend) for SOL.
+    // For alt tokens, we separately check if they are bullish via buildMintMomentumSignal.
+    if (WORKER_UNIVERSE_SCOUT_ENABLED) {
+      // Diversification + post-loss cooldown: exclude any correlation cluster
+      // that is already at its open-position cap, and any cluster still locked
+      // from a recent stop_loss, before the scout ranks candidates.
+      const cappedClusters = new Set<string>();
+      const clusterOpenCounts = new Map<string, number>();
+      for (const { mint } of openPositions) {
+        const clusterId = getClusterForMint(mint);
+        const nextCount = (clusterOpenCounts.get(clusterId) ?? 0) + 1;
+        clusterOpenCounts.set(clusterId, nextCount);
+        if (nextCount >= WORKER_MAX_OPEN_PER_CLUSTER) {
+          cappedClusters.add(clusterId);
+        }
+      }
+      const lockedClusters = getActiveStopLossLockedClusters(session, Date.now());
+      const excludedClusters = new Set<string>([...cappedClusters, ...lockedClusters]);
+
+      const scout = await scoutEntryUniverse({
+        inputMint: entryInventory.inputMint,
+        inputSymbol: entryInventory.inputSymbol,
+        amountAtomic: entryInventory.amountAtomic ?? 0,
+        takerWallet: session.session_wallet,
+        slippageBps: session.risk_limits.maxSlippageBps,
+        activeStrategy: entryStrategyForPlan,
+        strategyConfig,
+        lookbackSamples: strategyConfig.momentum.lookbackSamples,
+        thresholdBps: strategyConfig.momentum.thresholdBps,
+        requiredSignalSamples: MIN_ENTRY_SIGNAL_PERSISTENCE_SAMPLES,
+        excludedMints: openPositionMints,
+        excludedClusters,
+        useTrustedFallback: useBasicPairEntryFallback,
+      });
+
+      if (!scout.bestMint) {
+        const scoutSnapshot = buildUniverseScoutGateSnapshot(scout);
+        const scoutBlockedReason = scoutSnapshot.routeFoundCount > 0
+          ? 'universe_scout_no_bullish_candidate'
+          : 'universe_scout_no_route';
+        await persistTradeDecision(session, 'blocked', scoutBlockedReason);
+        await persistLastTradeGate(session, {
+          at: new Date().toISOString(),
+          decision: 'blocked',
+          reason: scoutBlockedReason,
+          expectedEdgeBps: runtimeSignal.momentumBps,
+          estimatedCostBps: null,
+          safetyBufferBps: strategyConfig.momentum.edgeSafetyBufferBps,
+          scout: scoutSnapshot,
+        });
+        log(
+          'info',
+          session.id,
+          scoutBlockedReason === 'universe_scout_no_bullish_candidate'
+            ? `universe scout blocked entry: no bullish candidate (routes=${scoutSnapshot.routeFoundCount}/${scoutSnapshot.candidateCount}, bullish=${scoutSnapshot.bullishRouteCount})`
+            : `universe scout blocked entry: no route (candidates=${scout.candidates.length})`,
         );
         return;
       }
 
       if (
-        scout.solPriceImpactBps !== null
-        && scout.solPriceImpactBps > WORKER_UNIVERSE_SCOUT_MAX_SOL_PRICE_IMPACT_BPS
+        scout.bestPriceImpactBps !== null
+        && scout.bestPriceImpactBps > WORKER_UNIVERSE_SCOUT_MAX_ENTRY_PRICE_IMPACT_BPS
       ) {
-        await persistTradeDecision(session, 'blocked', 'universe_scout_sol_impact_too_high');
+        await persistTradeDecision(session, 'blocked', 'universe_scout_entry_impact_too_high');
         await persistLastTradeGate(session, {
           at: new Date().toISOString(),
           decision: 'blocked',
-          reason: 'universe_scout_sol_impact_too_high',
-          expectedEdgeBps: effectiveSignal.momentumBps,
-          estimatedCostBps: scout.solPriceImpactBps,
+          reason: 'universe_scout_entry_impact_too_high',
+          expectedEdgeBps: runtimeSignal.momentumBps,
+          estimatedCostBps: scout.bestPriceImpactBps,
           safetyBufferBps: strategyConfig.momentum.edgeSafetyBufferBps,
+          scout: buildUniverseScoutGateSnapshot(scout),
         });
         log(
           'info',
           session.id,
-          `universe scout blocked entry: SOL impact=${scout.solPriceImpactBps}bps max=${WORKER_UNIVERSE_SCOUT_MAX_SOL_PRICE_IMPACT_BPS}bps rank=${scout.solRank} best=${scout.bestMint}`,
+          `universe scout blocked entry: impact=${scout.bestPriceImpactBps}bps max=${WORKER_UNIVERSE_SCOUT_MAX_ENTRY_PRICE_IMPACT_BPS}bps best=${scout.bestMint}`,
         );
         return;
       }
 
-      if (scout.solRank > Math.max(1, WORKER_UNIVERSE_SCOUT_MIN_SOL_RANK)) {
-        await persistTradeDecision(session, 'blocked', 'universe_scout_sol_rank_too_low');
+      // Flat-regime suppression: when the only viable pick is a routed-fallback
+      // candidate (no persistent bullish signal anywhere), the tape is flat and
+      // any entry would be momentum noise. Skip it instead of buying chop.
+      if (scout.bestUsesRoutedFallback && WORKER_FLAT_REGIME_SUPPRESS_FALLBACK) {
+        await persistTradeDecision(session, 'blocked', 'flat_regime_routed_fallback_suppressed');
         await persistLastTradeGate(session, {
           at: new Date().toISOString(),
           decision: 'blocked',
-          reason: 'universe_scout_sol_rank_too_low',
-          expectedEdgeBps: effectiveSignal.momentumBps,
-          estimatedCostBps: scout.solPriceImpactBps,
+          reason: 'flat_regime_routed_fallback_suppressed',
+          expectedEdgeBps: runtimeSignal.momentumBps,
+          estimatedCostBps: scout.bestPriceImpactBps,
           safetyBufferBps: strategyConfig.momentum.edgeSafetyBufferBps,
+          scout: buildUniverseScoutGateSnapshot(scout),
         });
         log(
           'info',
           session.id,
-          `universe scout blocked entry: SOL rank=${scout.solRank} minRequiredTop=${WORKER_UNIVERSE_SCOUT_MIN_SOL_RANK} best=${scout.bestMint} impact=${scout.solPriceImpactBps}`,
+          `flat regime: suppressed routed-fallback entry for ${resolveTokenSymbol(scout.bestMint)} (${scout.bestMint}); no persistent bullish candidate`,
         );
         return;
+      }
+
+      selectedEntryMint = scout.bestMint;
+      const scoutUsedRoutedFallback = scout.bestUsesRoutedFallback;
+      if (selectedEntryMint !== SOL_MINT) {
+        const candidateSignal = buildRuntimeSignalForMint(selectedEntryMint, entryStrategyForPlan, strategyConfig);
+        tokenEntrySignal = scoutUsedRoutedFallback
+          && (candidateSignal.status !== 'ready' || candidateSignal.regime !== 'bullish')
+          ? entrySignalForPlan
+          : candidateSignal;
+        if (scoutUsedRoutedFallback && tokenEntrySignal === entrySignalForPlan) {
+          log(
+            'info',
+            session.id,
+            `universe scout using routed fallback for ${resolveTokenSymbol(selectedEntryMint)} (${selectedEntryMint}); token signal=${candidateSignal.status}/${candidateSignal.regime ?? 'none'} sessionSignal=${entrySignalForPlan.status}/${entrySignalForPlan.regime ?? 'none'}`,
+          );
+        }
       }
     }
 
-    tradePlan = {
-      direction: 'enter_long_sol',
+    if (selectedEntryMint === entryInventory.inputMint) {
+      await persistTradeDecision(session, 'blocked', 'entry_same_input_output');
+      await persistLastTradeGate(session, {
+        at: new Date().toISOString(),
+        decision: 'blocked',
+        reason: 'entry_same_input_output',
+        expectedEdgeBps: tokenEntrySignal.momentumBps,
+        estimatedCostBps: null,
+        safetyBufferBps: strategyConfig.momentum.edgeSafetyBufferBps,
+      });
+      log('info', session.id, `entry blocked: selected mint equals input mint ${entryInventory.inputSymbol}`);
+      return;
+    }
+
+    if (openPositionMints.has(selectedEntryMint)) {
+      await persistTradeDecision(session, 'blocked', 'entry_mint_already_open');
+      await persistLastTradeGate(session, {
+        at: new Date().toISOString(),
+        decision: 'blocked',
+        reason: 'entry_mint_already_open',
+        expectedEdgeBps: tokenEntrySignal.momentumBps,
+        estimatedCostBps: null,
+        safetyBufferBps: strategyConfig.momentum.edgeSafetyBufferBps,
+      });
+      log('info', session.id, `entry blocked: ${resolveTokenSymbol(selectedEntryMint)} already open in portfolio`);
+      return;
+    }
+
+    if (tokenEntrySignal.status !== 'ready' || tokenEntrySignal.regime !== 'bullish') {
+      await persistTradeDecision(session, 'blocked', 'entry_token_signal_not_bullish');
+      await persistLastTradeGate(session, {
+        at: new Date().toISOString(),
+        decision: 'blocked',
+        reason: 'entry_token_signal_not_bullish',
+        expectedEdgeBps: tokenEntrySignal.momentumBps,
+        estimatedCostBps: null,
+        safetyBufferBps: strategyConfig.momentum.edgeSafetyBufferBps,
+      });
+      log('info', session.id, `entry blocked: token signal not bullish for ${resolveTokenSymbol(selectedEntryMint)} (${selectedEntryMint})`);
+      return;
+    }
+
+    const persistentBullishRegime = selectedEntryStrategy !== 'momentum' || hasMomentumRegimePersistence({
+      samples: getMomentumTapeForMint(selectedEntryMint),
+      lookbackSamples: strategyConfig.momentum.lookbackSamples,
+      thresholdBps: strategyConfig.momentum.thresholdBps,
+      regime: 'bullish',
+      requiredSamples: MIN_ENTRY_SIGNAL_PERSISTENCE_SAMPLES,
+    });
+    if (!persistentBullishRegime) {
+      await persistTradeDecision(session, 'blocked', 'entry_token_regime_not_persistent');
+      await persistLastTradeGate(session, {
+        at: new Date().toISOString(),
+        decision: 'blocked',
+        reason: 'entry_token_regime_not_persistent',
+        expectedEdgeBps: tokenEntrySignal.momentumBps,
+        estimatedCostBps: null,
+        safetyBufferBps: strategyConfig.momentum.edgeSafetyBufferBps,
+      });
+      log(
+        'info',
+        session.id,
+        `entry blocked: ${resolveTokenSymbol(selectedEntryMint)} momentum not persistent (${MIN_ENTRY_SIGNAL_PERSISTENCE_SAMPLES} samples required)`,
+      );
+      return;
+    }
+
+    entryInventory.outputMint = selectedEntryMint;
+    entryInventory.outputSymbol = resolveTokenSymbol(selectedEntryMint);
+
+    const volatilitySizing = applyVolatilityEntrySizing({
+      mint: selectedEntryMint,
       inventory: entryInventory,
-      exitReason: null,
-    };
+    });
+
+    if (volatilitySizing.blocked) {
+      await persistTradeDecision(session, 'blocked', volatilitySizing.reason ?? 'volatility_sizing_blocked');
+      await persistLastTradeGate(session, {
+        at: new Date().toISOString(),
+        decision: 'blocked',
+        reason: volatilitySizing.reason ?? 'volatility_sizing_blocked',
+        expectedEdgeBps: tokenEntrySignal.momentumBps,
+        estimatedCostBps: volatilitySizing.volatilityBps,
+        safetyBufferBps: strategyConfig.momentum.edgeSafetyBufferBps,
+      });
+      try {
+        await persistLastSizing(session, {
+          at: new Date().toISOString(),
+          decision: 'skipped',
+          reason: volatilitySizing.reason,
+          balanceLamports: String(balance),
+          reserveLamports: String(MIN_SOL_OPERATING_RESERVE_LAMPORTS),
+          tradableLamports: String(Math.max(0, balance - MIN_SOL_OPERATING_RESERVE_LAMPORTS)),
+          fractionBps: volatilitySizing.sizeScaleBps,
+          targetLamports: String(entryInventory.targetAtomic),
+          minTradeLamports: String(entryInventory.minTradeAtomic),
+          maxTradeLamports: String(entryInventory.maxTradeAtomic),
+          amountLamports: null,
+          remainingRiskBudgetUsd: null,
+          quotedOutAmountAtomic: null,
+          minimumOutputAtomic: null,
+          priceImpactPct: null,
+          estimatedNetworkCostLamports: null,
+          estimatedNetworkCostOutputAtomic: null,
+          worstCaseSlippageOutputAtomic: null,
+          totalWorstCaseCostOutputAtomic: null,
+          riskAdjustedAmountLamports: volatilitySizing.adjustedAmountAtomic !== null ? String(volatilitySizing.adjustedAmountAtomic) : null,
+          tradeContext: buildSizingTradeContext(entryInventory),
+        });
+      } catch (err) {
+        log('warn', session.id, `failed to persist lastSizing: ${String(err)}`);
+      }
+      log(
+        'info',
+        session.id,
+        `entry blocked: volatility sizing below minimum for ${entryInventory.outputSymbol} vol=${volatilitySizing.volatilityBps}bps scale=${volatilitySizing.sizeScaleBps}bps adjusted=${volatilitySizing.adjustedAmountAtomic}`,
+      );
+      return;
+    }
+
+    if (
+      volatilitySizing.adjustedAmountAtomic !== null
+      && volatilitySizing.adjustedAmountAtomic > 0
+      && volatilitySizing.adjustedAmountAtomic < (entryInventory.amountAtomic ?? 0)
+    ) {
+      const originalAmount = entryInventory.amountAtomic ?? 0;
+      entryInventory.amountAtomic = volatilitySizing.adjustedAmountAtomic;
+      entryInventory.riskAdjustedAmountAtomic = volatilitySizing.adjustedAmountAtomic;
+      log(
+        'info',
+        session.id,
+        `entry size reduced by volatility: ${entryInventory.outputSymbol} amount ${originalAmount} â†’ ${volatilitySizing.adjustedAmountAtomic} scale=${volatilitySizing.sizeScaleBps}bps vol=${volatilitySizing.volatilityBps}bps`,
+      );
+    }
+
+    const routeStability = await assessEntryRouteStability({
+      inputMint: entryInventory.inputMint,
+      outputMint: entryInventory.outputMint,
+      amountAtomic: entryInventory.amountAtomic ?? 0,
+      takerWallet: session.session_wallet,
+      slippageBps: session.risk_limits.maxSlippageBps,
+    });
+
+    if (!routeStability.stable) {
+      await persistTradeDecision(session, 'blocked', routeStability.reason);
+      await persistLastTradeGate(session, {
+        at: new Date().toISOString(),
+        decision: 'blocked',
+        reason: routeStability.reason,
+        expectedEdgeBps: tokenEntrySignal.momentumBps,
+        estimatedCostBps: routeStability.maxPriceImpactBps,
+        safetyBufferBps: strategyConfig.momentum.edgeSafetyBufferBps,
+      });
+      log(
+        'info',
+        session.id,
+        `entry blocked: route unstable for ${entryInventory.outputSymbol} reason=${routeStability.reason} samples=${routeStability.sampleCount} outDrift=${routeStability.outputDriftBps ?? 'n/a'}bps impactDrift=${routeStability.impactDriftBps ?? 'n/a'}bps maxImpact=${routeStability.maxPriceImpactBps ?? 'n/a'}bps`,
+      );
+      return;
+    }
+
+    positionsState = await persistPositionsState(session, {
+      activePositionMint: selectedEntryMint,
+      positions: positionsState.positions,
+    });
+    positionState = summarizePositionsState(positionsState, session.service_control.positionState ?? undefined);
+
+      tradePlan = {
+        direction: 'enter_long',
+        inventory: entryInventory,
+        exitReason: null,
+        signalSnapshot: tokenEntrySignal,
+        scannerStrategy: entryStrategyForPlan,
+        entryStrategy: entryStrategyForPlan,
+        exitStrategy: null,
+      };
+    }
   }
 
   if (!tradePlan) {
     return;
   }
 
-  const remainingRiskBudgetUsd = Math.max(0, session.risk_limits.maxSessionLossUsd - sessionLoss);
+  const remainingRiskBudgetUsd = Math.max(
+    0,
+    session.risk_limits.maxSessionLossUsd - Math.abs(Math.min(0, session.funding.realizedPnlUsd)),
+  );
   const baseTradeAmount = tradePlan.inventory.amountAtomic ?? 0;
   let tradeAmount = baseTradeAmount;
   let prepare: { ok: boolean; status: number; data: PrepareResponse } | null = null;
@@ -3702,7 +6730,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
     log(
       'info',
       session.id,
-      `preparing swap: ${tradeAmount} ${tradePlan.inventory.inputSymbol} atomic ${tradePlan.inventory.inputSymbol} â†’ ${tradePlan.inventory.outputSymbol} (tradable=${tradePlan.inventory.tradableAtomic} fraction=${tradePlan.direction === 'enter_long_sol' ? 10000 : sizingPolicy.tradeFractionBps}bps attempt=${attempt})`,
+      `preparing swap: ${tradeAmount} ${tradePlan.inventory.inputSymbol} atomic ${tradePlan.inventory.inputSymbol} â†’ ${tradePlan.inventory.outputSymbol} (tradable=${tradePlan.inventory.tradableAtomic} fraction=${tradePlan.direction === 'enter_long' ? 10000 : sizingPolicy.tradeFractionBps}bps attempt=${attempt})`,
     );
 
     prepare = await apiPost<PrepareResponse>('/jupiter/swap/prepare', {
@@ -3710,9 +6738,14 @@ const executeTrade = async (session: RawSession): Promise<void> => {
       outputMint:     tradePlan.inventory.outputMint,
       amount:         String(tradeAmount),
       taker:          session.session_wallet,
-      feeTokenSymbol: 'USDC',
+      feeTokenSymbol: tradePlan.inventory.inputMint === USDC_MINT || tradePlan.inventory.outputMint === USDC_MINT ? 'USDC' : 'SOL',
       slippageBps:    String(session.risk_limits.maxSlippageBps),
-    }, { limiter: jupiterLimiter });
+      scannerStrategy: tradePlan.scannerStrategy,
+      entryStrategy:   tradePlan.entryStrategy ?? undefined,
+      exitStrategy:    tradePlan.exitStrategy ?? undefined,
+      exitReason:      tradePlan.exitReason ?? undefined,
+    });
+    // USDC-base entries/exits capture platform fees in the USDC fee account; stop liquidation still uses SOL.
 
     if (!prepare.ok || !prepare.data.preparedTransactionBase64 || !prepare.data.executionId) {
       break;
@@ -3722,14 +6755,28 @@ const executeTrade = async (session: RawSession): Promise<void> => {
       break;
     }
 
-    if (tradePlan.direction === 'exit_long_sol') {
+    // Post-exit SOL reserve protection only applies when the INPUT being sold is
+    // SOL: trimming the SOL amount sold is what preserves gas. For a token->USDC
+    // exit, gas is paid separately in SOL and the position must fully liquidate,
+    // so trimming the token amount does nothing for the SOL reserve (it only
+    // strands the position). Worse, the API's estimatedNetworkCostLamports bakes
+    // in worst-case new-account (ATA) rent (~2.04M lamports) even when the output
+    // token account already exists, producing a false "reserve shortfall" that
+    // cancel-retries forever and traps the position. Let on-chain simulation be
+    // the real affordability arbiter for token exits instead of pre-cancelling.
+    if (shouldApplyPostExitSolReserveProtection({
+      direction: tradePlan.direction,
+      inputMint: tradePlan.inventory.inputMint,
+      solMint: SOL_MINT,
+    })) {
       const setupReserveLamports = Math.max(
         0,
         tradePlan.inventory.reserveAtomic - MIN_SOL_OPERATING_RESERVE_LAMPORTS,
       );
       const estimatedNetworkCostLamports = prepare.data.costs?.estimatedNetworkCostLamports ?? 0;
+      const inputLamportsSpent = tradePlan.inventory.inputMint === SOL_MINT ? tradeAmount : 0;
       const expectedPostExitLamports =
-        balance - tradeAmount - setupReserveLamports - estimatedNetworkCostLamports;
+        balance - inputLamportsSpent - setupReserveLamports - estimatedNetworkCostLamports;
       const reserveShortfallLamports = Math.max(
         0,
         MIN_SOL_OPERATING_RESERVE_LAMPORTS - expectedPostExitLamports,
@@ -3747,6 +6794,20 @@ const executeTrade = async (session: RawSession): Promise<void> => {
         tradePlan.inventory.amountAtomic = adjustedAmount;
         tradePlan.inventory.riskAdjustedAmountAtomic = adjustedAmount;
         sizingReason = 'post_exit_reserve_shortfall';
+        // Cancel the execution we just prepared before re-preparing with the
+        // reduced amount. The API enforces a single in-flight execution per
+        // taker, so skipping this leaves an orphaned `prepared` row that blocks
+        // every future cycle with `in_flight_execution`.
+        if (prepare.data.executionId) {
+          try {
+            await apiPost(`/jupiter/swap/executions/${prepare.data.executionId}/cancel`, {
+              stage: 'worker_cancel',
+              reason: 'post_exit_reserve_shortfall_retry',
+            });
+          } catch (err) {
+            log('warn', session.id, `cancel prepared execution before retry failed: ${String(err)}`);
+          }
+        }
         continue;
       }
     }
@@ -3778,11 +6839,13 @@ const executeTrade = async (session: RawSession): Promise<void> => {
       direction: tradePlan.direction,
       exitReason: tradePlan.exitReason,
       assessment: assessTradeGate({
-      signalSnapshot: effectiveSignal,
+      direction: tradePlan.direction,
+      signalSnapshot: tradePlan.signalSnapshot,
       economics,
       confidenceBps: lastPythSolSample?.confidenceBps ?? signalPolicy.maxPythConfidenceBps,
       driftBps: getLatestObservedDriftBps(),
       safetyBufferBps: strategyConfig.momentum.edgeSafetyBufferBps,
+      entryCostCapBps: MAX_QUOTE_PRICE_IMPACT_BPS,
       }),
     });
 
@@ -3825,7 +6888,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
       at: new Date().toISOString(),
       decision: 'blocked',
       reason: sizingReason ?? 'economics_blocked',
-      expectedEdgeBps: tradeGate?.expectedEdgeBps ?? effectiveSignal.momentumBps ?? null,
+      expectedEdgeBps: tradeGate?.expectedEdgeBps ?? runtimeSignal.momentumBps ?? null,
       estimatedCostBps: tradeGate?.estimatedCostBps ?? null,
       safetyBufferBps: tradeGate?.safetyBufferBps ?? strategyConfig.momentum.edgeSafetyBufferBps,
     });
@@ -3837,7 +6900,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
         balanceLamports: String(balance),
         reserveLamports: String(positionState.status === 'flat' ? MIN_SOL_OPERATING_RESERVE_LAMPORTS : tradePlan.inventory.reserveAtomic),
         tradableLamports: String(positionState.status === 'flat' ? Math.max(0, balance - MIN_SOL_OPERATING_RESERVE_LAMPORTS) : tradePlan.inventory.tradableAtomic),
-        fractionBps: tradePlan.direction === 'enter_long_sol' || tradePlan.direction === 'exit_long_sol' ? 10000 : sizingPolicy.tradeFractionBps,
+        fractionBps: tradePlan.direction === 'enter_long' || tradePlan.direction === 'exit_long' ? 10000 : sizingPolicy.tradeFractionBps,
         targetLamports: String(positionState.status === 'flat' ? 0 : tradePlan.inventory.targetAtomic),
         minTradeLamports: String(positionState.status === 'flat' ? 0 : tradePlan.inventory.minTradeAtomic),
         maxTradeLamports: String(positionState.status === 'flat' ? 0 : tradePlan.inventory.maxTradeAtomic),
@@ -3895,7 +6958,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
         balanceLamports: String(balance),
         reserveLamports: String(positionState.status === 'flat' ? MIN_SOL_OPERATING_RESERVE_LAMPORTS : tradePlan.inventory.reserveAtomic),
         tradableLamports: String(positionState.status === 'flat' ? Math.max(0, balance - MIN_SOL_OPERATING_RESERVE_LAMPORTS) : tradePlan.inventory.tradableAtomic),
-        fractionBps: tradePlan.direction === 'enter_long_sol' || tradePlan.direction === 'exit_long_sol' ? 10000 : sizingPolicy.tradeFractionBps,
+        fractionBps: tradePlan.direction === 'enter_long' || tradePlan.direction === 'exit_long' ? 10000 : sizingPolicy.tradeFractionBps,
         targetLamports: String(positionState.status === 'flat' ? 0 : tradePlan.inventory.targetAtomic),
         minTradeLamports: String(positionState.status === 'flat' ? 0 : tradePlan.inventory.minTradeAtomic),
         maxTradeLamports: String(positionState.status === 'flat' ? 0 : tradePlan.inventory.maxTradeAtomic),
@@ -3938,7 +7001,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
       at: new Date().toISOString(),
       decision: 'blocked',
       reason: sizingReason,
-      expectedEdgeBps: tradeGate?.expectedEdgeBps ?? effectiveSignal.momentumBps ?? null,
+      expectedEdgeBps: tradeGate?.expectedEdgeBps ?? runtimeSignal.momentumBps ?? null,
       estimatedCostBps: tradeGate?.estimatedCostBps ?? null,
       safetyBufferBps: tradeGate?.safetyBufferBps ?? strategyConfig.momentum.edgeSafetyBufferBps,
     });
@@ -3970,16 +7033,25 @@ const executeTrade = async (session: RawSession): Promise<void> => {
     await persistTradeDecision(session, 'blocked', 'prepare_failed');
     log('warn', session.id, `prepare failed (${prepare.status}): ${prepare.data.error ?? JSON.stringify(prepare.data)}`);
     if (prepare.data.shortfall) {
-      await setSessionStatus(session.id, 'stopping', { stop_reason: 'depleted' }, { expectedStatuses: ['active'] });
+      await releaseTradeWindowReservation(session);
+      await persistTradeDecision(session, 'blocked', 'route_setup_shortfall');
+      await persistLastTradeGate(session, {
+        at: new Date().toISOString(),
+        decision: 'blocked',
+        reason: 'route_setup_shortfall',
+        expectedEdgeBps: tradeGate?.expectedEdgeBps ?? runtimeSignal.momentumBps ?? null,
+        estimatedCostBps: tradeGate?.estimatedCostBps ?? null,
+        safetyBufferBps: tradeGate?.safetyBufferBps ?? strategyConfig.momentum.edgeSafetyBufferBps,
+      });
       log(
         'info',
         session.id,
-        `route setup shortfall: have ${prepare.data.shortfall.availableLamports}, need ${prepare.data.shortfall.requiredLamports} (gap ${prepare.data.shortfall.gapLamports}) â†’ stopping (sweep will run)`,
+        `route setup shortfall: have ${prepare.data.shortfall.availableLamports}, need ${prepare.data.shortfall.requiredLamports} (gap ${prepare.data.shortfall.gapLamports}) â†’ blocked; preserving session funds`,
       );
       return;
     }
     const freshBal = await rlGetBalance(keypair.publicKey).catch(() => 0);
-    if (freshBal < minimumRequiredLamports) {
+    if (openPositions.length === 0 && freshBal < minimumRequiredLamports) {
       await setSessionStatus(session.id, 'stopping', { stop_reason: 'depleted' }, { expectedStatuses: ['active'] });
       log('info', session.id, `balance ${freshBal} lamports after prepare failure â†’ stopping (sweep will run)`);
     } else {
@@ -3997,16 +7069,25 @@ const executeTrade = async (session: RawSession): Promise<void> => {
     await persistTradeDecision(session, 'blocked', 'simulation_error');
     log('warn', session.id, `simulation error: ${JSON.stringify(prepare.data.simulation.err)}`);
     if (prepare.data.shortfall) {
-      await setSessionStatus(session.id, 'stopping', { stop_reason: 'depleted' }, { expectedStatuses: ['active'] });
+      await releaseTradeWindowReservation(session);
+      await persistTradeDecision(session, 'blocked', 'route_setup_shortfall');
+      await persistLastTradeGate(session, {
+        at: new Date().toISOString(),
+        decision: 'blocked',
+        reason: 'route_setup_shortfall',
+        expectedEdgeBps: tradeGate?.expectedEdgeBps ?? runtimeSignal.momentumBps ?? null,
+        estimatedCostBps: tradeGate?.estimatedCostBps ?? null,
+        safetyBufferBps: tradeGate?.safetyBufferBps ?? strategyConfig.momentum.edgeSafetyBufferBps,
+      });
       log(
         'info',
         session.id,
-        `simulation exposed route shortfall: have ${prepare.data.shortfall.availableLamports}, need ${prepare.data.shortfall.requiredLamports} (gap ${prepare.data.shortfall.gapLamports}) â†’ stopping (sweep will run)` ,
+        `simulation exposed route shortfall: have ${prepare.data.shortfall.availableLamports}, need ${prepare.data.shortfall.requiredLamports} (gap ${prepare.data.shortfall.gapLamports}) â†’ blocked; preserving session funds` ,
       );
       return;
     }
     const freshBal = await rlGetBalance(keypair.publicKey).catch(() => 0);
-    if (freshBal < minimumRequiredLamports) {
+    if (openPositions.length === 0 && freshBal < minimumRequiredLamports) {
       await setSessionStatus(session.id, 'stopping', { stop_reason: 'depleted' }, { expectedStatuses: ['active'] });
       log('info', session.id, `balance ${freshBal} lamports after simulation error â†’ stopping (sweep will run)`);
     } else {
@@ -4038,11 +7119,11 @@ const executeTrade = async (session: RawSession): Promise<void> => {
       balanceLamports: String(balance),
       reserveLamports: String(positionState.status === 'flat' ? MIN_SOL_OPERATING_RESERVE_LAMPORTS : tradePlan.inventory.reserveAtomic),
       tradableLamports: String(positionState.status === 'flat' ? Math.max(0, balance - MIN_SOL_OPERATING_RESERVE_LAMPORTS) : tradePlan.inventory.tradableAtomic),
-      fractionBps: tradePlan.direction === 'enter_long_sol' || tradePlan.direction === 'exit_long_sol' ? 10000 : sizingPolicy.tradeFractionBps,
+      fractionBps: tradePlan.direction === 'enter_long' || tradePlan.direction === 'exit_long' ? 10000 : sizingPolicy.tradeFractionBps,
       targetLamports: String(positionState.status === 'flat' ? 0 : tradePlan.inventory.targetAtomic),
       minTradeLamports: String(positionState.status === 'flat' ? 0 : tradePlan.inventory.minTradeAtomic),
       maxTradeLamports: String(positionState.status === 'flat' ? 0 : tradePlan.inventory.maxTradeAtomic),
-      amountLamports: positionState.status === 'long_sol' ? String(tradeAmount) : null,
+      amountLamports: isLongPositionStatus(positionState.status) ? String(tradeAmount) : null,
       remainingRiskBudgetUsd: economics?.remainingRiskBudgetUsd ?? remainingRiskBudgetUsd,
       quotedOutAmountAtomic: economics ? String(economics.quotedOutAmountAtomic) : null,
       minimumOutputAtomic: economics ? String(economics.minimumOutputAtomic) : null,
@@ -4051,7 +7132,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
       estimatedNetworkCostOutputAtomic: economics ? String(economics.estimatedNetworkCostOutputAtomic) : null,
       worstCaseSlippageOutputAtomic: economics ? String(economics.worstCaseSlippageOutputAtomic) : null,
       totalWorstCaseCostOutputAtomic: economics ? String(economics.totalWorstCaseCostOutputAtomic) : null,
-      riskAdjustedAmountLamports: positionState.status === 'long_sol' && tradeAmount !== baseTradeAmount
+      riskAdjustedAmountLamports: isLongPositionStatus(positionState.status) && tradeAmount !== baseTradeAmount
         ? String(tradeAmount)
         : null,
       tradeContext: buildSizingTradeContext({
@@ -4106,11 +7187,20 @@ const executeTrade = async (session: RawSession): Promise<void> => {
     }
 
     if (submit.data.shortfall) {
-      await setSessionStatus(session.id, 'stopping', { stop_reason: 'depleted' }, { expectedStatuses: ['active'] });
+      await releaseTradeWindowReservation(session);
+      await persistTradeDecision(session, 'blocked', 'route_setup_shortfall');
+      await persistLastTradeGate(session, {
+        at: new Date().toISOString(),
+        decision: 'blocked',
+        reason: 'route_setup_shortfall',
+        expectedEdgeBps: tradeGate?.expectedEdgeBps ?? runtimeSignal.momentumBps ?? null,
+        estimatedCostBps: tradeGate?.estimatedCostBps ?? null,
+        safetyBufferBps: tradeGate?.safetyBufferBps ?? strategyConfig.momentum.edgeSafetyBufferBps,
+      });
       log(
         'info',
         session.id,
-        `submit exposed route shortfall: have ${submit.data.shortfall.availableLamports}, need ${submit.data.shortfall.requiredLamports} (gap ${submit.data.shortfall.gapLamports}) â†’ stopping (sweep will run)`,
+        `submit exposed route shortfall: have ${submit.data.shortfall.availableLamports}, need ${submit.data.shortfall.requiredLamports} (gap ${submit.data.shortfall.gapLamports}) â†’ blocked; preserving session funds`,
       );
     }
     return;
@@ -4121,6 +7211,25 @@ const executeTrade = async (session: RawSession): Promise<void> => {
 
   await persistTradeDecision(session, 'submitted', submit.data.status ?? 'submitted');
 
+  if (tradePlan.direction === 'enter_long') {
+    const nextScannerStrategy = getNextStrategyInSequence(
+      tradePlan.entryStrategy ?? tradePlan.scannerStrategy,
+      enabledStrategies,
+    );
+    await persistServiceControl(session, {
+      rotationState: {
+        activeStrategy: nextScannerStrategy,
+        queuedStrategy: nextScannerStrategy,
+        rotationIntervalMinutes: session.service_control.rotationState?.rotationIntervalMinutes ?? DEFAULT_ROTATION_INTERVAL_MINUTES,
+        lastRotatedAt: new Date().toISOString(),
+        lockedUntil: null,
+      },
+    } as any);
+    log('info', session.id, `strategy scanner advanced after entry: ${tradePlan.entryStrategy ?? tradePlan.scannerStrategy} → ${nextScannerStrategy}`);
+  }
+
+  await maybeMarkPendingExitProfitPayout(session, tradePlan, prepare.data.executionId);
+
   try {
     await persistSchedulingState(session, {
       lastTradeSubmittedAt: new Date().toISOString(),
@@ -4130,10 +7239,17 @@ const executeTrade = async (session: RawSession): Promise<void> => {
   }
 
   const postSubmitBalance = await rlGetBalance(keypair.publicKey).catch(() => balance - tradeAmount);
+  // Keep the subscription-backed cache coherent with the post-trade balance immediately,
+  // rather than waiting for the onAccountChange notification on the next cycle.
+  setCachedSessionBalance(keypair.publicKey.toBase58(), postSubmitBalance);
 
-  // Update session funding (rough PnL tracking â€” will be reconciled later)
+  const postSubmitFundingBalanceAtomic = session.funding.fundingMint === USDC_MINT
+    ? String(await getTokenBalanceAtomic(keypair.publicKey, USDC_MINT, TOKEN_PROGRAM_ID).catch(() => 0))
+    : String(postSubmitBalance);
+
+  // Update session funding (rough balance tracking — exact PnL will be reconciled later)
   await mergeFundingPatch(session, {
-    currentBalanceAtomic: String(postSubmitBalance),
+    currentBalanceAtomic: postSubmitFundingBalanceAtomic,
   });
 };
 
@@ -4167,6 +7283,14 @@ const getLastTradeAttemptMs = (session: RawSession): number => {
   return persisted;
 };
 
+const hasExceededTargetDuration = (session: RawSession): boolean => {
+  const targetDurationMinutes = session.user_control?.targetDurationMinutes;
+  if (!targetDurationMinutes || targetDurationMinutes <= 0) return false;
+
+  const startedAtMs = session.started_at?.getTime() ?? session.requested_at.getTime();
+  return Date.now() - startedAtMs >= targetDurationMinutes * 60_000;
+};
+
 const getLastTradeSubmittedMs = (session: RawSession): number => {
   const submittedAt = session.service_control.schedulingState?.lastTradeSubmittedAt;
   if (!submittedAt) return 0;
@@ -4181,13 +7305,56 @@ const persistSchedulingState = async (
 ) => {
   const latestSession = await getSessionById(session.id);
   const baseServiceControl = latestSession?.service_control ?? session.service_control;
+  const baseSchedulingState = baseServiceControl.schedulingState;
   const schedulingState = {
-    lastTradeAttemptedAt: baseServiceControl.schedulingState?.lastTradeAttemptedAt ?? null,
-    lastTradeSubmittedAt: baseServiceControl.schedulingState?.lastTradeSubmittedAt ?? null,
+    lastTradeAttemptedAt: baseSchedulingState?.lastTradeAttemptedAt ?? null,
+    lastTradeSubmittedAt: baseSchedulingState?.lastTradeSubmittedAt ?? null,
+    lastDecisionAt: baseSchedulingState?.lastDecisionAt ?? null,
+    lastDecisionOutcome: baseSchedulingState?.lastDecisionOutcome ?? null,
+    lastDecisionReason: baseSchedulingState?.lastDecisionReason ?? null,
+    lastBlockedAt: baseSchedulingState?.lastBlockedAt ?? null,
+    lastBlockedReason: baseSchedulingState?.lastBlockedReason ?? null,
+    blockedReasonCounts: baseSchedulingState?.blockedReasonCounts ?? {},
+    lastProfitTransferAt: baseSchedulingState?.lastProfitTransferAt ?? null,
+    transferredProfitUsd: baseSchedulingState?.transferredProfitUsd ?? 0,
+    pendingProfitPayout: baseSchedulingState?.pendingProfitPayout ?? null,
+    recentStopLossLocks: baseSchedulingState?.recentStopLossLocks ?? {},
     ...schedulingStatePatch,
   };
 
   await mergeServiceControlPatch(session, { schedulingState });
+};
+
+// Returns the set of correlation-cluster ids currently locked from new entries
+// because of a recent stop_loss. Expired locks are ignored.
+const getActiveStopLossLockedClusters = (session: RawSession, nowMs: number): Set<string> => {
+  const locks = session.service_control.schedulingState?.recentStopLossLocks ?? {};
+  const active = new Set<string>();
+  for (const [clusterId, expiryIso] of Object.entries(locks)) {
+    const expiryMs = Date.parse(expiryIso);
+    if (Number.isFinite(expiryMs) && expiryMs > nowMs) {
+      active.add(clusterId);
+    }
+  }
+  return active;
+};
+
+// Records a post-stop-loss cooldown lock for the stopped token's correlation
+// cluster and prunes any expired locks so the map stays bounded.
+const recordStopLossClusterLock = async (session: RawSession, mint: string, nowMs: number) => {
+  if (WORKER_STOP_LOSS_LOCK_MS <= 0) {
+    return;
+  }
+  const clusterId = getClusterForMint(mint);
+  const existing = { ...(session.service_control.schedulingState?.recentStopLossLocks ?? {}) };
+  for (const [key, expiryIso] of Object.entries(existing)) {
+    const expiryMs = Date.parse(expiryIso);
+    if (!(Number.isFinite(expiryMs) && expiryMs > nowMs)) {
+      delete existing[key];
+    }
+  }
+  existing[clusterId] = new Date(nowMs + WORKER_STOP_LOSS_LOCK_MS).toISOString();
+  await persistSchedulingState(session, { recentStopLossLocks: existing });
 };
 
 const BLOCKED_REASON_COUNTER_LIMIT = 20;
@@ -4198,6 +7365,124 @@ const trimBlockedReasonCounts = (counts: Record<string, number>) => {
     .slice(0, BLOCKED_REASON_COUNTER_LIMIT);
 
   return Object.fromEntries(nextEntries);
+};
+
+type SessionHealthPatch = NonNullable<SessionServiceControlPatch['healthState']>;
+
+const marketWaitReasons = new Set([
+  'flat_regime_routed_fallback_suppressed',
+  'no_strategy_entry_signal',
+  'universe_scout_no_bullish_candidate',
+  'universe_scout_no_route',
+  'entry_token_signal_not_bullish',
+  'entry_token_regime_not_persistent',
+]);
+
+const gasDangerReasons = new Set([
+  'insufficient_sol_fee_reserve',
+  'route_setup_shortfall',
+]);
+
+const exitBlockedReasons = new Set([
+  'prepare_failed',
+  'simulation_error',
+  'submit_failed',
+  'post_exit_reserve_shortfall',
+  'post_exit_reserve_shortfall_retry',
+]);
+
+const buildSessionHealthState = ({
+  session,
+  outcome,
+  reason,
+  blockedReasonCounts,
+  updatedAt,
+}: {
+  session: RawSession;
+  outcome: NonNullable<NonNullable<Session['serviceControl']['schedulingState']>['lastDecisionOutcome']>;
+  reason: string | null;
+  blockedReasonCounts: Record<string, number>;
+  updatedAt: string;
+}): SessionHealthPatch => {
+  const blockerCount = reason ? (blockedReasonCounts[reason] ?? 0) : 0;
+  const hasOpenPositions = listOpenPositions(getPositionsState(session)).length > 0;
+
+  if (session.service_control.residualRecovery) {
+    return {
+      state: 'recovery_required',
+      severity: 'error',
+      reason: 'residual_recovery_required',
+      detail: 'Session stopped with residual token account(s) that require fee-sponsored recovery.',
+      updatedAt,
+      blockerCount,
+    };
+  }
+
+  if (session.status === 'stopping') {
+    return { state: 'stopping', severity: 'warn', reason, detail: 'Stop requested; worker is unwinding and sweeping funds.', updatedAt, blockerCount };
+  }
+
+  if (session.status === 'stopped') {
+    return { state: 'stopped', severity: 'info', reason, detail: 'Session is closed.', updatedAt, blockerCount };
+  }
+
+  if (outcome === 'error') {
+    return { state: 'error', severity: 'error', reason, detail: 'Worker hit an execution/runtime error.', updatedAt, blockerCount };
+  }
+
+  if (outcome === 'stopped') {
+    return { state: 'stopping', severity: 'warn', reason, detail: 'Worker requested session stop.', updatedAt, blockerCount };
+  }
+
+  if (outcome === 'submitted') {
+    return { state: 'active_trading', severity: 'info', reason, detail: 'Trade submitted; awaiting reconciliation.', updatedAt, blockerCount };
+  }
+
+  if (outcome === 'attempted') {
+    return { state: 'active_trading', severity: 'info', reason, detail: 'Worker is attempting a trade decision.', updatedAt, blockerCount };
+  }
+
+  if (reason && gasDangerReasons.has(reason)) {
+    return {
+      state: 'gas_danger',
+      severity: 'error',
+      reason,
+      detail: 'Session fee reserve is too low for safe trading/exits. Entries are unsafe until gas is restored or session is stopped.',
+      updatedAt,
+      blockerCount,
+    };
+  }
+
+  if (reason && (exitBlockedReasons.has(reason) || hasOpenPositions)) {
+    return {
+      state: 'exit_blocked',
+      severity: blockerCount >= 3 ? 'error' : 'warn',
+      reason,
+      detail: 'Exit or execution path is blocked; user controls and recovery should stay prioritized over new entries.',
+      updatedAt,
+      blockerCount,
+    };
+  }
+
+  if (reason && marketWaitReasons.has(reason)) {
+    return {
+      state: 'waiting_market',
+      severity: blockerCount >= 50 ? 'warn' : 'info',
+      reason,
+      detail: 'Bot is intentionally not entering because market/signal conditions are not acceptable.',
+      updatedAt,
+      blockerCount,
+    };
+  }
+
+  return {
+    state: 'blocked',
+    severity: blockerCount >= 20 ? 'error' : blockerCount >= 5 ? 'warn' : 'info',
+    reason,
+    detail: 'Worker is active but trading is blocked by a risk, queue, route, or provider condition.',
+    updatedAt,
+    blockerCount,
+  };
 };
 
 const persistTradeDecision = async (
@@ -4223,13 +7508,23 @@ const persistTradeDecision = async (
       lastBlockedReason: reason,
       blockedReasonCounts: nextCounts,
     });
+    await mergeServiceControlPatch(session, {
+      healthState: buildSessionHealthState({ session, outcome, reason, blockedReasonCounts: nextCounts, updatedAt: nowIso }),
+    });
     return;
   }
 
+  const latestSession = await getSessionById(session.id);
+  const currentCounts = latestSession?.service_control?.schedulingState?.blockedReasonCounts
+    ?? session.service_control.schedulingState?.blockedReasonCounts
+    ?? {};
   await persistSchedulingState(session, {
     lastDecisionAt: nowIso,
     lastDecisionOutcome: outcome,
     lastDecisionReason: reason,
+  });
+  await mergeServiceControlPatch(session, {
+    healthState: buildSessionHealthState({ session, outcome, reason, blockedReasonCounts: currentCounts, updatedAt: nowIso }),
   });
 };
 
@@ -4267,31 +7562,20 @@ const persistLastTradeGate = async (
   await mergeServiceControlPatch(session, { lastTradeGate });
 };
 
-const getPositionState = (session: RawSession): NonNullable<Session['serviceControl']['positionState']> =>
-  session.service_control.positionState ?? {
-    status: 'flat',
-    entryPriceUsd: null,
-    entryAt: null,
-    quantityAtomic: null,
-    highWaterPriceUsd: null,
-    lastMarkedPriceUsd: null,
-    lastMarkedAt: null,
-    pendingExitReason: null,
-    exitReason: null,
-  };
+const getPositionState = (session: RawSession): SessionPositionState =>
+  summarizePositionsState(getPositionsState(session), session.service_control.positionState ?? undefined);
 
 const buildStoppedPositionState = (
-  positionState: NonNullable<Session['serviceControl']['positionState']>,
-): NonNullable<Session['serviceControl']['positionState']> => ({
-  status: 'flat',
-  entryPriceUsd: null,
-  entryAt: null,
-  quantityAtomic: null,
-  highWaterPriceUsd: null,
+  positionState: SessionPositionState,
+): SessionPositionState => buildFlatSessionPositionState({
   lastMarkedPriceUsd: positionState.lastMarkedPriceUsd,
   lastMarkedAt: positionState.lastMarkedAt,
-  pendingExitReason: null,
   exitReason: positionState.pendingExitReason ?? positionState.exitReason,
+});
+
+const buildStoppedPositionsState = (): SessionPositionsState => ({
+  activePositionMint: null,
+  positions: {},
 });
 
 const nextSessionEvaluationAt = new Map<string, number>();
@@ -4323,7 +7607,7 @@ const getSessionCadenceMs = (session: RawSession): number => {
       }
 
       const positionState = getPositionState(session);
-      if (positionState.status === 'long_sol') {
+      if (isLongPositionStatus(positionState.status)) {
         return cadence.activeInPosition;
       }
 
@@ -4377,6 +7661,39 @@ const orderSessionsForTick = (sessions: RawSession[]): RawSession[] =>
 
     return a.id.localeCompare(b.id);
   });
+
+const processExecutionQueue = async () => {
+  const claimedItems = await claimExecutionQueueItems();
+  if (claimedItems.length === 0) {
+    return 0;
+  }
+
+  console.log(JSON.stringify({
+    service: 'roguezero-worker',
+    kind: 'execution_queue_claim',
+    workerInstanceId: WORKER_INSTANCE_ID,
+    count: claimedItems.length,
+    ts: new Date().toISOString(),
+  }));
+
+  for (const item of claimedItems) {
+    const session = await getSessionById(item.session_id);
+    if (!session || session.status !== 'active') {
+      await completeExecutionQueueItem(item.id);
+      continue;
+    }
+
+    try {
+      await executeTrade(session);
+      await completeExecutionQueueItem(item.id);
+    } catch (err) {
+      log('error', item.session_id, `queued execution failed: ${String(err)}`);
+      await failExecutionQueueItem(item.id, err);
+    }
+  }
+
+  return claimedItems.length;
+};
 
 // â”€â”€ Sweep funds back to owner on session stop â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
@@ -4483,11 +7800,6 @@ const waitForPostSweepSnapshot = async (
 
   return latestSnapshot;
 };
-
-const hasResidualWalletState = (snapshot: SweepResult): boolean =>
-  snapshot.solBalance > 0
-  || snapshot.tokenProgramAccounts.length > 0
-  || snapshot.token2022Accounts.length > 0;
 
 const sweepFunds = async (session: RawSession): Promise<SweepResult> => {
   const ownerWallet = session.owner_wallet;
@@ -4632,8 +7944,29 @@ const sweepFunds = async (session: RawSession): Promise<SweepResult> => {
 
   // â”€â”€ SOL sweep â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   // Base fee for 1-signature versioned tx = 5,000 lamports (no priority fee).
-  // Session wallet must land at exactly 0, not between 0 and rent-exempt.
-  const solToSend = solBalance - ownerAtaCreationCost - TX_FEE_LAMPORTS;
+  //
+  // FUND-SAFETY INVARIANT: never drain the session wallet's SOL to zero while a
+  // VALUED token position remains unswept (mayLeaveResidualState). The session
+  // wallet is the fee payer for every future recovery action (liquidation swap,
+  // token transfer, ATA creation). A 0-SOL wallet is bricked: the orphaned token
+  // can then only be recovered by re-funding the wallet with SOL. Instead, retain
+  // the remaining SOL in place as recovery gas so a later sweep/liquidation (once
+  // the owner ATA exists or the route is affordable) can complete the return path.
+  // Only drain to exactly zero when nothing valued is being left behind.
+  const solToSend = computeSessionSolSweepLamports({
+    solBalance,
+    ownerAtaCreationCost,
+    txFeeLamports: TX_FEE_LAMPORTS,
+    mayLeaveResidualState,
+  });
+
+  if (mayLeaveResidualState) {
+    log(
+      'warn',
+      session.id,
+      `retaining ${Math.max(0, solBalance - ownerAtaCreationCost - TX_FEE_LAMPORTS)} lamports as recovery gas â€” a valued token position could not be swept home; not draining SOL to zero to avoid orphaning it`,
+    );
+  }
 
   if (solToSend > 0) {
     ixs.push(SystemProgram.transfer({
@@ -4696,25 +8029,224 @@ const sweepFunds = async (session: RawSession): Promise<SweepResult> => {
 
 // â”€â”€ Stopping â†’ stopped â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
+const LIQUIDATION_MIN_SLIPPAGE_BPS = 300;
+const LIQUIDATION_CONFIRM_ATTEMPTS = 8;
+const LIQUIDATION_CONFIRM_WAIT_MS = 1500;
+
+const getSessionStopDisposition = (session: RawSession): 'return_tokens' | 'liquidate' =>
+  session.user_control?.stopDisposition === 'liquidate' ? 'liquidate' : 'return_tokens';
+
+// Sell every open (non-SOL) SPL position held by the session wallet back to SOL before the final
+// sweep. Used when the user chooses to prematurely close positions on stop. Best-effort: any leg
+// that cannot be liquidated is left in place and swept home as a raw token, so funds always
+// return to the owner (fail toward return).
+const liquidateOpenPositionsToBase = async (session: RawSession): Promise<void> => {
+  const keypair = await getKeypair(session.id);
+  if (!keypair) {
+    log('warn', session.id, 'liquidation skipped â€” no keypair found; positions will be swept as raw tokens');
+    return;
+  }
+
+  const sessionPubkey = keypair.publicKey;
+  const tokenAccounts = await getSessionTokenAccounts(sessionPubkey);
+  const liquidatable = tokenAccounts.filter((acct) => (
+    !acct.account.isNative
+    && !acct.account.isFrozen
+    && acct.account.amount > 0n
+    && acct.account.mint.toBase58() !== SOL_MINT
+    && (!acct.account.closeAuthority || acct.account.closeAuthority.equals(sessionPubkey))
+  ));
+
+  if (liquidatable.length === 0) {
+    log('info', session.id, 'liquidation: no open token positions to close â€” proceeding to sweep');
+    return;
+  }
+
+  const slippageBps = Math.max(session.risk_limits.maxSlippageBps, LIQUIDATION_MIN_SLIPPAGE_BPS);
+
+  for (const acct of liquidatable) {
+    const mint = acct.account.mint.toBase58();
+    const symbol = resolveTokenSymbol(mint);
+    const amount = acct.account.amount.toString();
+
+    try {
+      const prepare = await apiPost<PrepareResponse>('/jupiter/swap/prepare', {
+        inputMint: mint,
+        outputMint: SOL_MINT,
+        amount,
+        taker: session.session_wallet,
+        feeTokenSymbol: 'SOL',
+        slippageBps: String(slippageBps),
+      });
+
+      if (
+        !prepare.ok
+        || !prepare.data.preparedTransactionBase64
+        || !prepare.data.executionId
+        || prepare.data.simulation?.err
+      ) {
+        log(
+          'warn',
+          session.id,
+          `liquidation prepare failed for ${symbol} (${mint}): ${prepare.data.error ?? JSON.stringify(prepare.data.simulation?.err ?? prepare.status)} â€” will sweep as raw token`,
+        );
+        if (prepare.data.executionId) {
+          await apiPost(`/jupiter/swap/executions/${prepare.data.executionId}/cancel`, {
+            stage: 'worker_cancel',
+            reason: 'liquidation_prepare_failed',
+          }).catch(() => {});
+        }
+        continue;
+      }
+
+      let tx: VersionedTransaction;
+      try {
+        tx = VersionedTransaction.deserialize(Buffer.from(prepare.data.preparedTransactionBase64, 'base64'));
+        tx.sign([keypair]);
+      } catch (err) {
+        log('warn', session.id, `liquidation sign failed for ${symbol}: ${String(err)} â€” will sweep as raw token`);
+        await apiPost(`/jupiter/swap/executions/${prepare.data.executionId}/cancel`, {
+          stage: 'worker_cancel',
+          reason: 'liquidation_sign_failed',
+        }).catch(() => {});
+        continue;
+      }
+
+      const submit = await apiPost<SubmitResponse>('/jupiter/swap/submit', {
+        executionId: prepare.data.executionId,
+        signedTransactionBase64: Buffer.from(tx.serialize()).toString('base64'),
+        blockhash: prepare.data.blockhash,
+        lastValidBlockHeight: prepare.data.lastValidBlockHeight,
+      });
+
+      if (!submit.ok) {
+        log(
+          'warn',
+          session.id,
+          `liquidation submit failed for ${symbol}: ${submit.data.error ?? submit.status} â€” will sweep as raw token`,
+        );
+        continue;
+      }
+
+      log(
+        'info',
+        session.id,
+        `liquidation submitted for ${symbol} (${mint}) amount ${amount} â†’ SOL, sig ${submit.data.signature ?? 'pending'}`,
+      );
+
+      // Wait for the token balance to actually clear before sweeping, otherwise the sweep would
+      // grab the still-held token as a raw transfer and defeat the liquidation.
+      for (let attempt = 1; attempt <= LIQUIDATION_CONFIRM_ATTEMPTS; attempt++) {
+        const remaining = await getTokenBalanceAtomic(sessionPubkey, mint, acct.programId).catch(() => 0);
+        if (remaining === 0) {
+          log('info', session.id, `liquidation confirmed for ${symbol} â€” position closed to SOL`);
+          break;
+        }
+        if (attempt === LIQUIDATION_CONFIRM_ATTEMPTS) {
+          log(
+            'warn',
+            session.id,
+            `liquidation for ${symbol} not confirmed after ${LIQUIDATION_CONFIRM_ATTEMPTS} checks (remaining ${remaining}) â€” will sweep remainder as raw token`,
+          );
+          break;
+        }
+        await new Promise<void>((resolve) => setTimeout(resolve, LIQUIDATION_CONFIRM_WAIT_MS));
+      }
+    } catch (err) {
+      log('warn', session.id, `liquidation error for ${symbol} (${mint}): ${String(err)} â€” will sweep as raw token`);
+    }
+  }
+};
+
 const finalizeStop = async (session: RawSession): Promise<void> => {
+  if (getSessionStopDisposition(session) === 'liquidate') {
+    log('info', session.id, 'stop disposition = liquidate â€” closing open positions to SOL before sweep');
+    try {
+      await liquidateOpenPositionsToBase(session);
+    } catch (err) {
+      log('warn', session.id, `liquidation pass failed: ${String(err)} â€” falling back to raw token sweep`);
+    }
+  }
+
   const sweepResult = await sweepFunds(session);
   const latestSession = await getSessionById(session.id);
   const latestPositionState = getPositionState(latestSession ?? session);
 
+  // A residual remains if any token account or SOL is still in the session wallet.
+  // There are two very different cases:
+  //   1) RETRYABLE: solBalance >= TX_FEE_LAMPORTS â€” the wallet can still pay a fee,
+  //      so a future sweep tick may clear the residual (transient RPC/route failure,
+  //      owner ATA created later, etc). Stay in `stopping` and retry.
+  //   2) BRICKED/UNRECOVERABLE: solBalance < TX_FEE_LAMPORTS while tokens remain â€”
+  //      the session wallet is the fee payer for any move and has no gas, so NO
+  //      sweep can EVER succeed. Looping in `stopping` forever traps the session and
+  //      hides the trapped funds. Finalize to `stopped`, record the residual token
+  //      accounts for owner/admin-sponsored recovery, and stop looping.
   if (hasResidualWalletState(sweepResult)) {
+    const residualTokens = getResidualTokenAccounts(sweepResult);
+    const walletBricked = isBrickedResidualWallet(sweepResult, TX_FEE_LAMPORTS);
+
+    if (!walletBricked) {
+      const updatedFunding: Session['funding'] = {
+        ...(latestSession?.funding ?? session.funding),
+        currentBalanceAtomic: String(sweepResult.solBalance),
+      };
+
+      await setSessionStatus(session.id, 'stopping', {
+        funding: updatedFunding,
+      }, { expectedStatuses: ['stopping'] });
+
+      log(
+        'warn',
+        session.id,
+        `residual wallet state remains after sweep attempt â€” staying in stopping: SOL=${sweepResult.solBalance} token=${sweepResult.tokenProgramAccounts.length} token2022=${sweepResult.token2022Accounts.length}`,
+      );
+      return;
+    }
+
+    // Bricked wallet: finalize to stopped and flag residual for recovery so the
+    // session is no longer stuck and the trapped funds are visible to admin/owner.
     const updatedFunding: Session['funding'] = {
       ...(latestSession?.funding ?? session.funding),
       currentBalanceAtomic: String(sweepResult.solBalance),
     };
+    const detectedAt = new Date().toISOString();
+    const updatedServiceControl = mergeSessionServiceControl(
+      latestSession?.service_control ?? session.service_control,
+      {
+        positionsState: buildStoppedPositionsState(),
+        positionState: buildStoppedPositionState(latestPositionState),
+        healthState: {
+          state: 'recovery_required',
+          severity: 'error',
+          reason: 'residual_recovery_required',
+          detail: 'Session stopped with residual token account(s) and insufficient SOL to self-recover.',
+          updatedAt: detectedAt,
+          blockerCount: residualTokens.length,
+        },
+        residualRecovery: {
+          state: 'unrecoverable_zero_gas',
+          sessionWallet: session.session_wallet,
+          ownerWallet: session.owner_wallet,
+          solBalance: sweepResult.solBalance,
+          residualTokenAccounts: residualTokens,
+          detectedAt,
+          note: 'Session wallet has insufficient SOL to pay any transaction fee; residual token(s) require owner/admin fee-sponsored recovery.',
+        },
+      },
+    );
 
-    await setSessionStatus(session.id, 'stopping', {
+    await setSessionStatus(session.id, 'stopped', {
+      ended_at: new Date().toISOString(),
+      stop_reason: 'operator_stop',
       funding: updatedFunding,
+      service_control: updatedServiceControl,
     }, { expectedStatuses: ['stopping'] });
 
     log(
-      'warn',
+      'error',
       session.id,
-      `residual wallet state remains after sweep attempt â€” staying in stopping: SOL=${sweepResult.solBalance} token=${sweepResult.tokenProgramAccounts.length} token2022=${sweepResult.token2022Accounts.length}`,
+      `session wallet bricked (SOL=${sweepResult.solBalance} < tx fee) with residual tokens [${residualTokens.join(', ')}] â€” finalized to stopped and flagged for fee-sponsored recovery instead of looping`,
     );
     return;
   }
@@ -4726,13 +8258,14 @@ const finalizeStop = async (session: RawSession): Promise<void> => {
   const updatedServiceControl = mergeSessionServiceControl(
     latestSession?.service_control ?? session.service_control,
     {
+      positionsState: buildStoppedPositionsState(),
       positionState: buildStoppedPositionState(latestPositionState),
     },
   );
 
   await setSessionStatus(session.id, 'stopped', {
     ended_at: new Date().toISOString(),
-    stop_reason: session.stop_reason ?? 'user_requested',
+    stop_reason: session.stop_reason ?? 'worker_stop',
     funding: updatedFunding,
     service_control: updatedServiceControl,
   }, { expectedStatuses: ['stopping'] });
@@ -4754,6 +8287,7 @@ const log = (level: 'info' | 'warn' | 'error', sessionId: string, msg: string) =
 
 const tick = async (): Promise<number> => {
   await refreshLiveRuntimeControl();
+  await evaluateFleetAutoShift();
   let sessions: RawSession[];
   try {
     sessions = await querySessions(['awaiting_funding', 'ready', 'starting', 'active', 'stopping']);
@@ -4763,6 +8297,7 @@ const tick = async (): Promise<number> => {
   }
 
   syncFundingSubscriptions(sessions);
+  syncActiveBalanceSubscriptions(sessions);
 
   sessions = orderSessionsForTick(sessions);
 
@@ -4799,24 +8334,41 @@ const tick = async (): Promise<number> => {
     try {
       switch (session.status) {
         case 'awaiting_funding':
+          {
+            const waitingMs = Date.now() - session.requested_at.getTime();
+            const waitingLimitMs = Math.max(1, AWAITING_FUNDING_TIMEOUT_MINUTES) * 60_000;
+            if (waitingMs > waitingLimitMs) {
+              await setSessionStatus(
+                session.id,
+                'stopping',
+                { stop_reason: 'funding_timeout' },
+                { expectedStatuses: ['awaiting_funding'] },
+              );
+              unsubscribeFundingSession(session.id);
+              log(
+                'warn',
+                session.id,
+                `awaiting funding timeout (${AWAITING_FUNDING_TIMEOUT_MINUTES}min) exceeded → stopping`,
+              );
+              nextCadenceMs = Math.min(nextCadenceMs, getLiveSpeedProfile().cadenceMs.stopping);
+              break;
+            }
+          }
+
           if (shouldRunFundingFallbackCheck(session.id)) {
             await runFundingCheck(session.id);
           }
           break;
         case 'ready':
-          await activateSession(session);
-          nextCadenceMs = Math.min(nextCadenceMs, getLiveSpeedProfile().cadenceMs.activeFlat);
+          log('info', session.id, 'funded and ready; waiting for user start/profit-mode confirmation');
           break;
         case 'starting':
           await activateSession(session);
           break;
         case 'active': {
-          // Auto-stop: exceeded target duration
-          const startedAtMs = session.started_at ? new Date(session.started_at).getTime() : 0;
-          const targetMs = (session.user_control.targetDurationMinutes ?? 60) * 60_000;
-          if (startedAtMs > 0 && (Date.now() - startedAtMs) > targetMs) {
-            await setSessionStatus(session.id, 'stopping', { stop_reason: 'user_requested' }, { expectedStatuses: ['active'] });
-            log('info', session.id, `target duration ${session.user_control.targetDurationMinutes}min exceeded â†’ stopping`);
+          if (hasExceededTargetDuration(session)) {
+            await setSessionStatus(session.id, 'stopping', { stop_reason: 'duration_exceeded' }, { expectedStatuses: ['active'] });
+            log('warn', session.id, `target duration ${session.user_control.targetDurationMinutes}min exceeded → stopping`);
             nextCadenceMs = Math.min(nextCadenceMs, getLiveSpeedProfile().cadenceMs.stopping);
             break;
           }
@@ -4824,15 +8376,22 @@ const tick = async (): Promise<number> => {
           // Auto-stop: stale session (no trade attempt for too long)
           const lastAttemptMs = getLastTradeAttemptMs(session);
           const staleLimitMs = STALE_SESSION_MINUTES * 60_000;
-          if (lastAttemptMs > 0 && (Date.now() - lastAttemptMs) > staleLimitMs) {
-            await setSessionStatus(session.id, 'stopping', { stop_reason: 'runtime_error' }, { expectedStatuses: ['active'] });
+          if (STALE_SESSION_MINUTES > 0 && lastAttemptMs > 0 && (Date.now() - lastAttemptMs) > staleLimitMs) {
+            await setSessionStatus(session.id, 'stopping', { stop_reason: 'stale_no_trade_attempts' }, { expectedStatuses: ['active'] });
             log('warn', session.id, `no trade attempt for ${STALE_SESSION_MINUTES}min â†’ stale auto-stop`);
             nextCadenceMs = Math.min(nextCadenceMs, getLiveSpeedProfile().cadenceMs.stopping);
             break;
           }
 
           if (await reserveTradeWindow(session)) {
-            await executeTrade(session);
+            const queued = await enqueueExecutionIntent(session, {
+              priority: isLongPositionStatus(getPositionState(session).status) ? 50 : 0,
+              reason: 'active_trade_window',
+            });
+
+            if (!queued) {
+              await persistTradeDecision(session, 'blocked', 'execution_already_queued');
+            }
           } else {
             const last = getLastTradeAttemptMs(session);
             const remainingCooldown = Math.max(0, session.risk_limits.cooldownMs - (Date.now() - last));
@@ -4850,6 +8409,8 @@ const tick = async (): Promise<number> => {
       nextSessionEvaluationAt.set(session.id, Date.now() + applyCadenceJitter(nextCadenceMs));
     }
   }
+
+  const claimedExecutionCount = await processExecutionQueue();
 
   for (const sessionId of [...nextSessionEvaluationAt.keys()]) {
     if (!activeSessionIds.has(sessionId)) {
@@ -4872,6 +8433,7 @@ const tick = async (): Promise<number> => {
       sessions: sessions.length,
       processed: cadenceTelemetry.processed,
       deferred: cadenceTelemetry.deferred,
+      queuedExecutionsClaimed: claimedExecutionCount,
       nextDelayMs,
       byStatus: cadenceTelemetry.byStatus,
     }));
@@ -4887,8 +8449,20 @@ const scheduleNextTick = (delayMs: number) => {
 };
 
 const runLoop = async (): Promise<void> => {
-  const nextDelayMs = await tick();
-  scheduleNextTick(nextDelayMs);
+  try {
+    const nextDelayMs = await tick();
+    scheduleNextTick(nextDelayMs);
+  } catch (err) {
+    console.error(JSON.stringify({
+      level: 'error',
+      service: 'roguezero-worker',
+      kind: 'loop_error',
+      msg: String(err),
+      retryDelayMs: POLL_MS,
+      ts: new Date().toISOString(),
+    }));
+    scheduleNextTick(POLL_MS);
+  }
 };
 
 // â”€â”€ Boot â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -4896,12 +8470,12 @@ const runLoop = async (): Promise<void> => {
 console.log(JSON.stringify({
   service: 'roguezero-worker',
   status: 'starting',
+  deployCanary: DEPLOY_CANARY,
   configReady: configReport.readyForLiveIntegration,
   missingLiveValues: configReport.missingLiveValues,
   pollIntervalMs: POLL_MS,
   minLoopIntervalMs: MIN_LOOP_MS,
   speedProfile: liveSpeedProfile.name,
-  maxSolEntryUsd: liveSpeedProfile.maxSolEntryUsd,
   concurrentCapacity: liveSpeedProfile.concurrentCapacity,
   cadenceMs: {
     readyStarting: liveSpeedProfile.cadenceMs.readyStarting,
@@ -4918,6 +8492,7 @@ console.log(JSON.stringify({
     jupiterGeneralBurst: JUPITER_GENERAL_BURST,
     heliusRpcRps: HELIUS_RPC_RPS,
     heliusRpcBurst: HELIUS_RPC_BURST,
+    awaitingFundingTimeoutMinutes: AWAITING_FUNDING_TIMEOUT_MINUTES,
     fundingPollFallbackMs: FUNDING_POLL_FALLBACK_MS,
     minTradeableLamports: MIN_TRADEABLE_LAMPORTS,
     maxRouteSetupLamports: MAX_ROUTE_SETUP_LAMPORTS,
@@ -4955,8 +8530,21 @@ console.log(JSON.stringify({
     tokenUniverseEvictionRankBuffer: TOKEN_UNIVERSE_EVICTION_RANK_BUFFER,
     universeScoutEnabled: WORKER_UNIVERSE_SCOUT_ENABLED,
     universeScoutMaxCandidates: WORKER_UNIVERSE_SCOUT_MAX_CANDIDATES,
-    universeScoutMaxSolPriceImpactBps: WORKER_UNIVERSE_SCOUT_MAX_SOL_PRICE_IMPACT_BPS,
-    universeScoutMinSolRank: WORKER_UNIVERSE_SCOUT_MIN_SOL_RANK,
+    universeScoutCoreOnlyEntries: WORKER_ENTRY_CORE_UNIVERSE_ONLY,
+    universeScoutBlockPumpMintEntries: WORKER_BLOCK_PUMP_MINT_ENTRIES,
+    universeScoutRequirePersistentBullish: WORKER_UNIVERSE_SCOUT_REQUIRE_PERSISTENT_BULLISH,
+    universeScoutMaxEntryPriceImpactBps: WORKER_UNIVERSE_SCOUT_MAX_ENTRY_PRICE_IMPACT_BPS,
+    maxConsecutiveLosses: WORKER_MAX_CONSECUTIVE_LOSSES,
+    maxBadFillStreak: WORKER_MAX_BAD_FILL_STREAK,
+    volatilitySizingEnabled: WORKER_VOLATILITY_SIZING_ENABLED,
+    volatilityLookbackSamples: WORKER_VOLATILITY_LOOKBACK_SAMPLES,
+    volatilityTargetBps: WORKER_VOLATILITY_TARGET_BPS,
+    volatilityMinSizeBps: WORKER_VOLATILITY_MIN_SIZE_BPS,
+    routeStabilityEnabled: WORKER_ROUTE_STABILITY_ENABLED,
+    routeStabilitySamples: WORKER_ROUTE_STABILITY_SAMPLES,
+    routeStabilityDelayMs: WORKER_ROUTE_STABILITY_DELAY_MS,
+    routeStabilityMaxOutputDriftBps: WORKER_ROUTE_STABILITY_MAX_OUTPUT_DRIFT_BPS,
+    routeStabilityMaxImpactDriftBps: WORKER_ROUTE_STABILITY_MAX_IMPACT_DRIFT_BPS,
   },
   exits: {
     takeProfitBps: positionExitPolicy.takeProfitBps,
@@ -4977,10 +8565,88 @@ getPool().query('SELECT 1').then(() => {
   console.error('[worker] DB connection failed:', String(err));
 });
 
+let tokenAdmissionRunInFlight = false;
+
+const resolveTokenAdmissionScriptPath = (): string | null => {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const candidates = [
+    // dist runtime: services/worker/dist -> repo root is three levels up
+    path.resolve(here, '../../../scripts/admit-token-candidates.mjs'),
+    // tsx/dev runtime: services/worker/src -> repo root is three levels up
+    path.resolve(here, '../../../scripts/admit-token-candidates.mjs'),
+    // fallback to current working directory (Railway sets cwd to repo root)
+    path.resolve(process.cwd(), 'scripts/admit-token-candidates.mjs'),
+  ];
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return null;
+};
+
+const runTokenAdmissionDiscovery = async (): Promise<void> => {
+  if (tokenAdmissionRunInFlight) {
+    console.warn('[worker] token-admission run skipped: previous run still in flight');
+    return;
+  }
+  const scriptPath = resolveTokenAdmissionScriptPath();
+  if (!scriptPath) {
+    console.error('[worker] token-admission feeder script not found in deploy; scheduled discovery disabled');
+    return;
+  }
+  tokenAdmissionRunInFlight = true;
+  const startedAt = Date.now();
+  console.log('[worker] token-admission discovery starting (additive-only)', JSON.stringify({ scriptPath }));
+  await new Promise<void>((resolve) => {
+    const child = spawn(process.execPath, [scriptPath], {
+      cwd: path.dirname(path.dirname(path.dirname(scriptPath))),
+      env: {
+        ...process.env,
+        // Additive-only: add/enable new admits, never disable existing rows.
+        TOKEN_ADMISSION_APPLY_TO_UNIVERSE: 'true',
+        TOKEN_ADMISSION_ADDITIVE_ONLY: 'true',
+        // Allow pump-origin memes through (same as the vetted manual refresh); the
+        // script's safety screens (verified, liquidity, holders, exit routes) still apply.
+        TOKEN_ADMISSION_BLOCK_PUMP_MINTS: 'false',
+      },
+      stdio: ['ignore', 'inherit', 'inherit'],
+    });
+    child.on('error', (err) => {
+      console.error('[worker] token-admission discovery spawn error:', String(err));
+      resolve();
+    });
+    child.on('close', (code) => {
+      console.log('[worker] token-admission discovery finished', JSON.stringify({
+        exitCode: code,
+        durationMs: Date.now() - startedAt,
+      }));
+      resolve();
+    });
+  });
+  tokenAdmissionRunInFlight = false;
+};
+
+const startTokenAdmissionSchedule = (): void => {
+  if (!TOKEN_ADMISSION_SCHEDULE_ENABLED) {
+    console.log('[worker] token-admission schedule disabled by env');
+    return;
+  }
+  console.log('[worker] token-admission schedule enabled', JSON.stringify({
+    intervalMs: TOKEN_ADMISSION_SCHEDULE_INTERVAL_MS,
+    initialDelayMs: TOKEN_ADMISSION_SCHEDULE_INITIAL_DELAY_MS,
+  }));
+  setTimeout(() => {
+    void runTokenAdmissionDiscovery();
+    setInterval(() => {
+      void runTokenAdmissionDiscovery();
+    }, Math.max(60_000, TOKEN_ADMISSION_SCHEDULE_INTERVAL_MS));
+  }, Math.max(0, TOKEN_ADMISSION_SCHEDULE_INITIAL_DELAY_MS));
+};
+
 const boot = async () => {
   try {
     await refreshLiveRuntimeControl(true);
     await ensureWorkerRuntimeStateStore();
+    await reclaimOwnExecutionQueueLocksOnBoot();
     await loadPersistedMarketTapeState();
     await refreshTokenUniverseMints(true);
   } catch (err) {
@@ -4988,6 +8654,7 @@ const boot = async () => {
   }
 
   startPriceLoops();
+  startTokenAdmissionSchedule();
   await runLoop();
 };
 

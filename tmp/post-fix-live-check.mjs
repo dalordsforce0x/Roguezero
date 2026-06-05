@@ -1,0 +1,12 @@
+﻿import "dotenv/config";
+import pg from "pg";
+const u = new URL(process.env.DATABASE_PRIVATE_URL.trim());
+u.searchParams.delete("sslmode");
+const pool = new pg.Pool({ connectionString: u.toString(), ssl: { rejectUnauthorized: false } });
+const sid = "3951496c-5459-4298-8369-fb873e2ef613";
+const s = await pool.query(`select status,funding,service_control from sessions where id=$1`, [sid]);
+console.log('session', JSON.stringify({status:s.rows[0].status, funding:s.rows[0].funding, scheduling:s.rows[0].service_control?.schedulingState, positions:s.rows[0].service_control?.positionsState, lastSignal:s.rows[0].service_control?.lastSignal, rotation:s.rows[0].service_control?.rotationState}, null, 2));
+const ex = await pool.query(`select status,input_mint,output_mint,amount,signature,confirmation_status,created_at,confirmed_at,last_error,metadata from swap_executions where taker=$1 order by created_at desc limit 6`, ['DFcBDWuR4jr8Z4LMH2j2UWs5axKpC3ja7WL4TrQMJxJb']);
+console.log('recent executions');
+for (const r of ex.rows) console.log(r.created_at.toISOString(), r.status, r.input_mint.slice(0,4)+'->'+r.output_mint.slice(0,4), r.signature?.slice(0,12), r.confirmation_status, JSON.stringify(r.metadata), r.last_error ? JSON.stringify(r.last_error) : '');
+await pool.end();

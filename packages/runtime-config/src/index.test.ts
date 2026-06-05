@@ -1,11 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  computeSolEntryCapLamports,
   computeTradeAmountLamports,
+  getDatabaseConnectionUrl,
   getHeliusRpcUrl,
+  getRuntimeConfigReport,
   getRuntimeSpeedProfile,
   getWorkerFundingThresholds,
+  getWorkerPositionExitPolicy,
   getWorkerSizingPolicy,
 } from './index.js';
 
@@ -23,6 +25,7 @@ const baseEnv = {
   KEYAUTH_APP_SECRET: 'secret',
   DATABASE_PROVIDER: 'tigerdata',
   DATABASE_URL: 'postgresql://postgres:postgres@localhost:5432/postgres',
+  DATABASE_PRIVATE_URL: 'postgresql://postgres:postgres@private.local:5432/postgres',
   NEXT_PUBLIC_APP_NAME: 'RogueZero',
   NEXT_PUBLIC_SOLANA_NETWORK: 'mainnet-beta',
 } satisfies NodeJS.ProcessEnv;
@@ -134,16 +137,77 @@ test('computeTradeAmountLamports skips when balance cannot cover reserve', () =>
   }
 });
 
-test('getRuntimeSpeedProfile derives entry caps and capacity', () => {
+test('getRuntimeSpeedProfile derives capacity per profile', () => {
   const glide = getRuntimeSpeedProfile('glide', baseEnv);
   const pulse = getRuntimeSpeedProfile('pulse', baseEnv);
   const surge = getRuntimeSpeedProfile('surge', baseEnv);
 
-  assert.equal(glide.maxSolEntryUsd, 1500);
-  assert.equal(glide.concurrentCapacity, 120);
-  assert.equal(pulse.maxSolEntryUsd, 4500);
-  assert.equal(pulse.concurrentCapacity, 60);
-  assert.equal(surge.maxSolEntryUsd, 10000);
-  assert.equal(surge.concurrentCapacity, 40);
-  assert.equal(computeSolEntryCapLamports({ profileName: 'surge', solUsdPrice: 200, env: baseEnv }), 50_000_000_000);
+  // 350-bot fleet base capacity is preserved across all profiles; cadence/position rules throttle behavior.
+  assert.equal(glide.concurrentCapacity, 350);
+  assert.equal(pulse.concurrentCapacity, 350);
+  assert.equal(surge.concurrentCapacity, 350);
+
+  // Per-bot max open positions per fleet mode (Surge = dynamic / bot-decided).
+  assert.equal(glide.maxOpenPositions, 3);
+  assert.equal(pulse.maxOpenPositions, 10);
+  assert.equal(surge.maxOpenPositions, null);
+});
+
+test('getWorkerPositionExitPolicy exposes safe ATR exit defaults', () => {
+  const policy = getWorkerPositionExitPolicy(baseEnv);
+
+  assert.equal(policy.takeProfitBps, 30);
+  assert.equal(policy.stopLossBps, 20);
+  assert.equal(policy.trailingStopBps, 15);
+  assert.equal(policy.atrTakeProfitMultiplier, 1.8);
+  assert.equal(policy.atrStopLossMultiplier, 1.0);
+  assert.equal(policy.atrTrailingStopMultiplier, 0.8);
+  assert.equal(policy.exitCostFloorBps, 60);
+});
+
+test('getWorkerPositionExitPolicy reads ATR exit env overrides', () => {
+  const policy = getWorkerPositionExitPolicy({
+    ...baseEnv,
+    WORKER_ATR_TP_MULT: '2.5',
+    WORKER_ATR_SL_MULT: '1.4',
+    WORKER_ATR_TRAIL_MULT: '1.1',
+    WORKER_EXIT_COST_FLOOR_BPS: '95',
+  });
+
+  assert.equal(policy.atrTakeProfitMultiplier, 2.5);
+  assert.equal(policy.atrStopLossMultiplier, 1.4);
+  assert.equal(policy.atrTrailingStopMultiplier, 1.1);
+  assert.equal(policy.exitCostFloorBps, 95);
+});
+
+test('blank optional env values do not make public database URL live-ready', () => {
+  const report = getRuntimeConfigReport({
+    ...baseEnv,
+    DATABASE_PRIVATE_URL: '',
+    PYTH_API_KEY: '',
+    PYTH_HERMES_URL: '',
+    JUPITER_SWAP_DEXES: '',
+    JUPITER_SWAP_EXCLUDE_DEXES: '',
+  });
+
+  assert.equal(report.schemaValid, true);
+  assert.equal(report.readyForLiveIntegration, false);
+  assert.deepEqual(report.missingLiveValues, ['DATABASE_PRIVATE_URL']);
+  assert.equal(report.databaseConnection.activeTarget, 'public');
+});
+
+test('runtime database access refuses public fallback unless explicitly allowed', () => {
+  assert.throws(
+    () => getDatabaseConnectionUrl({ ...baseEnv, DATABASE_PRIVATE_URL: '' }),
+    /DATABASE_PRIVATE_URL must be configured/,
+  );
+
+  assert.equal(
+    getDatabaseConnectionUrl({
+      ...baseEnv,
+      DATABASE_PRIVATE_URL: '',
+      ALLOW_PUBLIC_DATABASE_URL_FALLBACK: 'true',
+    }),
+    baseEnv.DATABASE_URL,
+  );
 });

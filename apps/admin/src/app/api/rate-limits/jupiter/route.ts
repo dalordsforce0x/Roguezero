@@ -22,6 +22,18 @@ export async function GET() {
   }
 
   const start = Date.now();
+  const providerCap = {
+    generalRps: 150,
+    executeRps: 100,
+    txSubmitRps: 100,
+  } as const;
+  const fleetTarget = {
+    generalRps: Number(process.env.JUPITER_GENERAL_RPS ?? 135),
+    generalBurst: Number(process.env.JUPITER_GENERAL_BURST ?? Math.min(20, Number(process.env.JUPITER_GENERAL_RPS ?? 135))),
+  } as const;
+  const monthlyRequestsBudget = Number(process.env.JUPITER_MONTHLY_REQUEST_LIMIT ?? 500_000_000);
+  const monthlyBudgetEnforced = process.env.JUPITER_MONTHLY_BUDGET_ENFORCE === 'true';
+
   try {
     const res = await fetch(`${BASE_URL}/order?${ORDER_PARAMS}`, {
       headers: { 'x-api-key': apiKey, Accept: 'application/json' },
@@ -62,14 +74,14 @@ export async function GET() {
       router:         data.router         ?? null,
       mode:           data.mode           ?? null,
       feeBps:         data.feeBps         ?? null,
-      currentPlan: 'developer',
+      currentPlan: 'pro',
       plan: {
-        // Rates are per-second (new Developer Platform structure)
-        free:       '1 req/s  ·  unlimited credits',
-        developer:  '10 req/s ·  25M credits/mo  ($25)',
-        launch:     '50 req/s ·  100M credits/mo ($100)',
-        pro:        '150 req/s · 500M credits/mo ($500)',
-        executeRps: '100 RPS dedicated bucket (/execute)',
+        name: 'Pro (yearly)',
+        providerCap,
+        fleetTarget,
+        includedCreditsPerYear: 6_000_000_000,
+        monthlyRequestsBudget,
+        monthlyBudgetEnforced,
       },
     });
   } catch (err) {

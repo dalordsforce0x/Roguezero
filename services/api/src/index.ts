@@ -3,29 +3,41 @@ import rateLimit from '@fastify/rate-limit';
 import bs58 from 'bs58';
 import dotenv from 'dotenv';
 import { randomUUID } from 'node:crypto';
-import { createSharedTokenBucket, getExponentialBackoffDelayMs } from '@roguezero/provider-governor';
+import {
+  createMonthlyBudgetGovernor,
+  createSharedTokenBucket,
+  getExponentialBackoffDelayMs,
+} from '@roguezero/provider-governor';
 import {
   AddressLookupTableAccount,
   ComputeBudgetProgram,
   Connection,
   Keypair,
   PublicKey,
+  type SignatureStatus,
+  SystemProgram,
+  Transaction,
   TransactionInstruction,
   TransactionMessage,
   VersionedTransaction,
 } from '@solana/web3.js';
 import {
-  getHeliusRpcUrl,
+  createRoundRobinKeySelector,
+  getHeliusRpcUrls,
   getJupiterSwapBuildConfig,
+  getPythPriceConfig,
   getRuntimeSpeedProfile,
   getRuntimeConfigReport,
+  getWorkerSignalPolicy,
   getWorkerFundingThresholds,
   type JupiterFeeToken,
 } from '@roguezero/runtime-config';
 import {
   createPreparedExecution,
   executionStoreReady,
+  getActiveExecutionByTaker,
   getExecutionById,
+  isSwapExecutionUniqueViolation,
   listExecutionsByStatus,
   markExecutionFailed,
   updateSubmittedExecution,
@@ -63,11 +75,18 @@ import {
   runtimeControlStoreReady,
 } from './runtimeControlStore.js';
 import {
+  DEFAULT_ROTATION_INTERVAL_MINUTES,
+  buildFlatSessionPositionState,
   schemaVersion,
   sessionActionValues,
   sessionStatusValues,
   strategyKeyValues,
   createSessionRequestSchema,
+  summarizePositionsState,
+  type SessionPositionState,
+  type SessionPositionsState,
+  type SessionServiceControlPatch,
+  type SwapExecution,
 } from '@roguezero/session-schema';
 import {
   buildPriorityFeeEstimateRequest,
@@ -76,11 +95,16 @@ import {
   parsePriorityFeeEstimateResponse,
   parseSenderSignature,
 } from './lib/heliusTrading.js';
+import {
+  computeSolInputEntryPriceUsd,
+  computeTokenToSolRealizedPnlUsd,
+} from './lib/pnlAccounting.js';
 
 dotenv.config({ path: '../../.env' });
 
 const app = Fastify({ logger: true });
-const port = Number(process.env.API_PORT || 4000);
+const port = Number(process.env.PORT || process.env.API_PORT || 4000);
+const DEPLOY_CANARY = process.env.DEPLOY_CANARY ?? 'rz-canary-2026-06-01-03';
 const internalApiSecret = process.env.RZ_INTERNAL_SECRET?.trim() || null;
 const webPublicOriginRaw = process.env.WEB_PUBLIC_ORIGIN ?? process.env.FRONTEND_ORIGIN;
 if (!webPublicOriginRaw) {
@@ -89,20 +113,48 @@ if (!webPublicOriginRaw) {
 const webPublicOrigin = webPublicOriginRaw;
 const internalSecretBypassPaths = new Set(['/health']);
 const configReport = getRuntimeConfigReport(process.env);
-const JUPITER_GENERAL_RPS = Number(process.env.JUPITER_GENERAL_RPS ?? 8);
-const JUPITER_GENERAL_BURST = Number(process.env.JUPITER_GENERAL_BURST ?? JUPITER_GENERAL_RPS);
-const HELIUS_RPC_RPS = Number(process.env.HELIUS_RPC_RPS ?? 40);
-const HELIUS_RPC_BURST = Number(process.env.HELIUS_RPC_BURST ?? Math.min(10, HELIUS_RPC_RPS));
+// Shared DB-backed fleet buckets (same keys in worker + API). Defaults are the
+// real provider 90%-of-cap fleet ceilings for 350 bots:
+//   Jupiter Pro general: 150 RPS cap -> 135 RPS (90%)
+//   Helius Business RPC: 200 RPS cap -> 180 RPS (90%)
+const JUPITER_GENERAL_RPS = Number(process.env.JUPITER_GENERAL_RPS ?? 135);
+const JUPITER_GENERAL_BURST = Number(process.env.JUPITER_GENERAL_BURST ?? Math.min(20, JUPITER_GENERAL_RPS));
+const HELIUS_RPC_RPS = Number(process.env.HELIUS_RPC_RPS ?? 180);
+const HELIUS_RPC_BURST = Number(process.env.HELIUS_RPC_BURST ?? Math.min(20, HELIUS_RPC_RPS));
+const HELIUS_MONTHLY_CREDIT_LIMIT = Number(process.env.HELIUS_MONTHLY_CREDIT_LIMIT ?? 100_000_000);
+const HELIUS_MONTHLY_BUDGET_ENFORCE = process.env.HELIUS_MONTHLY_BUDGET_ENFORCE !== 'false';
+const EXECUTION_BAD_FILL_THRESHOLD_BPS = Number(process.env.RZ_BAD_FILL_THRESHOLD_BPS ?? process.env.WORKER_BAD_FILL_THRESHOLD_BPS ?? 50);
+// Jupiter Pro yearly includes 6B credits/year (~500M/month equivalent).
+const JUPITER_MONTHLY_REQUEST_LIMIT = Number(process.env.JUPITER_MONTHLY_REQUEST_LIMIT ?? 500_000_000);
+const JUPITER_MONTHLY_BUDGET_ENFORCE = process.env.JUPITER_MONTHLY_BUDGET_ENFORCE === 'true';
+const INTERNAL_SWAP_PREPARE_RATE_LIMIT_PER_MINUTE = Number(process.env.INTERNAL_SWAP_PREPARE_RATE_LIMIT_PER_MINUTE ?? 600);
+const INTERNAL_SWAP_SUBMIT_RATE_LIMIT_PER_MINUTE = Number(process.env.INTERNAL_SWAP_SUBMIT_RATE_LIMIT_PER_MINUTE ?? 600);
 const SUBMITTED_EXECUTION_SYNC_INTERVAL_MS = Number(process.env.SUBMITTED_EXECUTION_SYNC_INTERVAL_MS ?? 15000);
 const SUBMITTED_EXECUTION_STALE_MS = Number(process.env.SUBMITTED_EXECUTION_STALE_MS ?? 30000);
 const jupiterSwapBuildConfig = configReport.readyForLiveIntegration
   ? getJupiterSwapBuildConfig(process.env)
   : null;
+const jupiterApiKeySelector = jupiterSwapBuildConfig
+  ? createRoundRobinKeySelector(jupiterSwapBuildConfig.apiKeys)
+  : null;
 const heliusTradingConfig = getHeliusTradingConfig(process.env);
 const workerFundingThresholds = getWorkerFundingThresholds(process.env);
-const heliusConnection = configReport.readyForLiveIntegration
-  ? new Connection(getHeliusRpcUrl(process.env), 'confirmed')
-  : null;
+const workerSignalPolicy = getWorkerSignalPolicy(process.env);
+const heliusRpcConnections = configReport.readyForLiveIntegration
+  ? getHeliusRpcUrls(process.env).map((rpcUrl) => new Connection(rpcUrl, 'confirmed'))
+  : [];
+const heliusConnection = heliusRpcConnections[0] ?? null;
+let heliusRpcConnectionCursor = 0;
+const getHeliusRpcConnection = () => {
+  if (!heliusConnection || heliusRpcConnections.length === 0) {
+    throw new Error('Solana integration is not ready');
+  }
+
+  const connection = heliusRpcConnections[heliusRpcConnectionCursor % heliusRpcConnections.length];
+  heliusRpcConnectionCursor = (heliusRpcConnectionCursor + 1) % heliusRpcConnections.length;
+  return connection;
+};
+const pythPriceConfig = getPythPriceConfig(process.env);
 
 const publicKeyPattern = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const atomicAmountPattern = /^\d+$/;
@@ -112,6 +164,8 @@ const maxComputeUnitLimit = 1_400_000;
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 const USDT_MINT = 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB';
+const LAMPORTS_PER_SOL = 1_000_000_000;
+const FUNDING_FEE_CUSHION_LAMPORTS = 50_000;
 
 const sharedRatePool = getPool();
 const jupiterLimiter = createSharedTokenBucket({
@@ -129,11 +183,299 @@ const heliusLimiter = createSharedTokenBucket({
 const senderLimiter = createSharedTokenBucket({
   pool: sharedRatePool,
   key: 'helius-sender',
-  maxTokens: 50,
-  refillRatePerSec: 50,
+  maxTokens: 45,
+  refillRatePerSec: 45,
+});
+const heliusMonthlyBudget = createMonthlyBudgetGovernor({
+  pool: sharedRatePool,
+  key: 'helius-credits',
+  monthlyLimitUnits: HELIUS_MONTHLY_CREDIT_LIMIT,
+  enforceLimit: HELIUS_MONTHLY_BUDGET_ENFORCE,
+});
+const jupiterMonthlyBudget = createMonthlyBudgetGovernor({
+  pool: sharedRatePool,
+  key: 'jupiter-requests',
+  monthlyLimitUnits: JUPITER_MONTHLY_REQUEST_LIMIT,
+  enforceLimit: JUPITER_MONTHLY_BUDGET_ENFORCE,
 });
 const submittedExecutionWatchers = new Map<string, { signature: string; listenerId: number }>();
 const executionReconcilesInFlight = new Set<string>();
+
+type ProviderLaneName = 'helius-rpc' | 'helius-sender' | 'jupiter-general' | 'helius-rpc-cache-hit';
+
+type ProviderLaneStats = {
+  requests: number;
+  creditUnits: number;
+  lastUsedAt: string | null;
+};
+
+const providerLaneStats = new Map<ProviderLaneName, ProviderLaneStats>();
+
+const recordProviderLaneUse = (lane: ProviderLaneName, creditUnits: number) => {
+  const previous = providerLaneStats.get(lane) ?? {
+    requests: 0,
+    creditUnits: 0,
+    lastUsedAt: null,
+  };
+
+  providerLaneStats.set(lane, {
+    requests: previous.requests + 1,
+    creditUnits: previous.creditUnits + creditUnits,
+    lastUsedAt: new Date().toISOString(),
+  });
+};
+
+const getProviderLaneStatsSnapshot = () => Object.fromEntries(
+  Array.from(providerLaneStats.entries()).map(([lane, stats]) => [lane, { ...stats }]),
+) as Record<ProviderLaneName, ProviderLaneStats>;
+
+class ProviderBudgetExceededError extends Error {
+  constructor(
+    message: string,
+    readonly provider: 'helius' | 'jupiter',
+    readonly budget: { remainingUnits: number; usageRatio: number; pressure: string },
+  ) {
+    super(message);
+    this.name = 'ProviderBudgetExceededError';
+  }
+}
+
+const reserveProviderBudget = async (params: {
+  provider: 'helius' | 'jupiter';
+  units?: number;
+  governor: { reserve: (units?: number) => Promise<{ granted: boolean; pressure: string; remainingUnits: number; usageRatio: number }> };
+}) => {
+  const budget = await params.governor.reserve(params.units ?? 1);
+
+  if (budget.pressure === 'watch' || budget.pressure === 'throttle') {
+    app.log.warn({
+      provider: params.provider,
+      pressure: budget.pressure,
+      remainingUnits: budget.remainingUnits,
+      usageRatio: budget.usageRatio,
+    }, 'provider monthly budget pressure');
+  }
+
+  if (!budget.granted) {
+    throw new ProviderBudgetExceededError(
+      `${params.provider} monthly budget exhausted`,
+      params.provider,
+      {
+        remainingUnits: budget.remainingUnits,
+        usageRatio: budget.usageRatio,
+        pressure: budget.pressure,
+      },
+    );
+  }
+};
+
+const reserveHeliusRpc = async (units = 1) => {
+  await reserveProviderBudget({ provider: 'helius', governor: heliusMonthlyBudget, units });
+  await heliusLimiter.acquire();
+  recordProviderLaneUse('helius-rpc', units);
+};
+
+const reserveHeliusSender = async () => {
+  await senderLimiter.acquire();
+  recordProviderLaneUse('helius-sender', 0);
+};
+
+const reserveJupiterRequest = async () => {
+  await reserveProviderBudget({ provider: 'jupiter', governor: jupiterMonthlyBudget, units: 1 });
+  await jupiterLimiter.acquire();
+  recordProviderLaneUse('jupiter-general', 1);
+};
+
+const getProviderBudgetSnapshot = async () => {
+  const [helius, jupiter] = await Promise.all([
+    heliusMonthlyBudget.reserve(0),
+    jupiterMonthlyBudget.reserve(0),
+  ]);
+
+  return {
+    timestamp: new Date().toISOString(),
+    budgets: {
+      helius: {
+        key: 'helius-credits',
+        enforceLimit: HELIUS_MONTHLY_BUDGET_ENFORCE,
+        monthlyLimitUnits: HELIUS_MONTHLY_CREDIT_LIMIT,
+        pressure: helius.pressure,
+        usedUnits: helius.usedUnits,
+        remainingUnits: helius.remainingUnits,
+        usageRatio: helius.usageRatio,
+        elapsedRatio: helius.elapsedRatio,
+        projectedUsageRatio: helius.projectedUsageRatio,
+      },
+      jupiter: {
+        key: 'jupiter-requests',
+        enforceLimit: JUPITER_MONTHLY_BUDGET_ENFORCE,
+        monthlyLimitUnits: JUPITER_MONTHLY_REQUEST_LIMIT,
+        pressure: jupiter.pressure,
+        usedUnits: jupiter.usedUnits,
+        remainingUnits: jupiter.remainingUnits,
+        usageRatio: jupiter.usageRatio,
+        elapsedRatio: jupiter.elapsedRatio,
+        projectedUsageRatio: jupiter.projectedUsageRatio,
+      },
+    },
+    lanes: getProviderLaneStatsSnapshot(),
+  };
+};
+
+const isLongPositionStatus = (status: SessionPositionState['status']) =>
+  status === 'long' || status === 'long_sol';
+  
+const getUtcDayKey = (date: Date = new Date()): string => date.toISOString().slice(0, 10);
+
+const parseQuotePriceImpactBps = (priceImpactPct: string | null | undefined): number | null => {
+  if (!priceImpactPct) return null;
+  const parsed = Number(priceImpactPct);
+  return Number.isFinite(parsed) ? Math.round(parsed * 10_000) : null;
+};
+
+const computeOutputDeltaBps = (actualOutputAtomic: number | null, expectedOutputAtomic: number | null): number | null => {
+  if (actualOutputAtomic === null || expectedOutputAtomic === null || expectedOutputAtomic <= 0) {
+    return null;
+  }
+
+  return Math.round(((actualOutputAtomic - expectedOutputAtomic) / expectedOutputAtomic) * 10_000);
+};
+
+const normalizePositionsState = (
+  positionsState: SessionPositionsState | null | undefined,
+  legacyPositionState: SessionPositionState | null | undefined,
+): SessionPositionsState => {
+  if (positionsState) {
+    const positions = Object.fromEntries(
+      Object.entries(positionsState.positions ?? {}).filter(([, position]) => (
+        !!position
+        && isLongPositionStatus(position.status)
+        && typeof position.positionMint === 'string'
+      )),
+    ) as SessionPositionsState['positions'];
+
+    return {
+      activePositionMint: positionsState.activePositionMint && positions[positionsState.activePositionMint]
+        ? positionsState.activePositionMint
+        : (Object.keys(positions)[0] ?? null),
+      positions,
+    };
+  }
+
+  if (legacyPositionState && isLongPositionStatus(legacyPositionState.status)) {
+    const mint = legacyPositionState.positionMint ?? SOL_MINT;
+    return {
+      activePositionMint: mint,
+      positions: {
+        [mint]: {
+          ...legacyPositionState,
+          positionMint: mint,
+          positionSymbol: legacyPositionState.positionSymbol ?? (mint === SOL_MINT ? 'SOL' : null),
+        },
+      },
+    };
+  }
+
+  return {
+    activePositionMint: null,
+    positions: {},
+  };
+};
+
+const getPositionUiAmount = (mint: string, quantityAtomic: number, decimals?: number | null) =>
+  quantityAtomic / (10 ** (decimals ?? (mint === SOL_MINT ? 9 : 6)));
+
+const upsertPositionEntry = (params: {
+  existingPosition: SessionPositionState | null;
+  mint: string;
+  symbol: string | null;
+  quantityAtomic: number;
+  entryPriceUsd: number | null;
+  tokenDecimals: number | null;
+  entryStrategy: SessionPositionState['entryStrategy'];
+  confirmedAt: string;
+  markedPriceUsd: number | null;
+  status: SessionPositionState['status'];
+}): SessionPositionState => {
+  const nextQuantityAtomic = Math.max(0, params.quantityAtomic);
+  const existingQuantityAtomic = params.existingPosition?.quantityAtomic
+    ? Number(params.existingPosition.quantityAtomic)
+    : 0;
+  const totalQuantityAtomic = existingQuantityAtomic + nextQuantityAtomic;
+  const existingUiQuantity = params.existingPosition?.positionMint
+    ? getPositionUiAmount(params.existingPosition.positionMint, existingQuantityAtomic, params.existingPosition.tokenDecimals ?? null)
+    : 0;
+  const nextUiQuantity = getPositionUiAmount(params.mint, nextQuantityAtomic, params.tokenDecimals);
+  const weightedEntryPriceUsd = params.entryPriceUsd !== null && (existingUiQuantity + nextUiQuantity) > 0
+    ? (((params.existingPosition?.entryPriceUsd ?? 0) * existingUiQuantity) + (params.entryPriceUsd * nextUiQuantity)) / (existingUiQuantity + nextUiQuantity)
+    : (params.existingPosition?.entryPriceUsd ?? params.entryPriceUsd ?? null);
+
+  return {
+    status: params.status,
+    positionMint: params.mint,
+    positionSymbol: params.symbol,
+    entryStrategy: params.existingPosition?.entryStrategy ?? params.entryStrategy ?? null,
+    entryPriceUsd: weightedEntryPriceUsd,
+    entryAt: params.existingPosition?.entryAt ?? params.confirmedAt,
+    quantityAtomic: String(totalQuantityAtomic),
+    tokenDecimals: params.existingPosition?.tokenDecimals ?? params.tokenDecimals ?? null,
+    highWaterPriceUsd: params.existingPosition?.highWaterPriceUsd ?? params.entryPriceUsd ?? params.markedPriceUsd,
+    lastMarkedPriceUsd: params.markedPriceUsd ?? params.existingPosition?.lastMarkedPriceUsd ?? null,
+    lastMarkedAt: params.markedPriceUsd ? params.confirmedAt : params.existingPosition?.lastMarkedAt ?? null,
+    lastComputedAtrUsd: params.existingPosition?.lastComputedAtrUsd ?? null,
+    lastComputedAtrBps: params.existingPosition?.lastComputedAtrBps ?? null,
+    atrComputedAt: params.existingPosition?.atrComputedAt ?? null,
+    pendingExitReason: null,
+    exitReason: null,
+  };
+};
+
+const applyPositionExit = (params: {
+  existingPosition: SessionPositionState | null;
+  soldAtomic: number;
+  exitReason: SessionPositionState['exitReason'];
+  fallbackMarkedPriceUsd: number | null;
+  fallbackMarkedAt: string | null;
+}) => {
+  if (!params.existingPosition?.quantityAtomic) {
+    return {
+      remainingPosition: null,
+      summaryFallback: buildFlatSessionPositionState({
+        lastMarkedPriceUsd: params.fallbackMarkedPriceUsd,
+        lastMarkedAt: params.fallbackMarkedAt,
+        exitReason: params.exitReason,
+      }),
+    };
+  }
+
+  const existingAtomic = Number(params.existingPosition.quantityAtomic);
+  const remainingAtomic = Math.max(0, existingAtomic - Math.max(0, params.soldAtomic));
+
+  if (remainingAtomic === 0) {
+    return {
+      remainingPosition: null,
+      summaryFallback: buildFlatSessionPositionState({
+        lastMarkedPriceUsd: params.existingPosition.lastMarkedPriceUsd ?? params.fallbackMarkedPriceUsd,
+        lastMarkedAt: params.existingPosition.lastMarkedAt ?? params.fallbackMarkedAt,
+        exitReason: params.exitReason,
+      }),
+    };
+  }
+
+  return {
+    remainingPosition: {
+      ...params.existingPosition,
+      quantityAtomic: String(remainingAtomic),
+      pendingExitReason: null,
+      exitReason: null,
+    },
+    summaryFallback: buildFlatSessionPositionState({
+      lastMarkedPriceUsd: params.existingPosition.lastMarkedPriceUsd ?? params.fallbackMarkedPriceUsd,
+      lastMarkedAt: params.existingPosition.lastMarkedAt ?? params.fallbackMarkedAt,
+      exitReason: params.exitReason,
+    }),
+  };
+};
 
 type JupiterBuildRequestBody = {
   inputMint?: unknown;
@@ -142,6 +484,10 @@ type JupiterBuildRequestBody = {
   taker?: unknown;
   feeTokenSymbol?: unknown;
   slippageBps?: unknown;
+  scannerStrategy?: unknown;
+  entryStrategy?: unknown;
+  exitStrategy?: unknown;
+  exitReason?: unknown;
 };
 
 type ValidatedJupiterBuildRequest = {
@@ -151,6 +497,10 @@ type ValidatedJupiterBuildRequest = {
   taker: string;
   feeTokenSymbol: JupiterFeeToken;
   slippageBps?: string;
+  scannerStrategy?: typeof strategyKeyValues[number];
+  entryStrategy?: typeof strategyKeyValues[number];
+  exitStrategy?: typeof strategyKeyValues[number];
+  exitReason?: NonNullable<SessionPositionState['exitReason']>;
 };
 
 type JupiterSubmitRequestBody = {
@@ -205,6 +555,20 @@ type JupiterRouteControlOverrides = {
   maxAccounts?: number;
   dexes?: string;
   excludeDexes?: string;
+};
+
+type FundingQuoteRequestBody = {
+  requestedUsd?: unknown;
+  requestedLamports?: unknown;
+  requestedFundingPct?: unknown;
+};
+
+type PythQuoteSample = {
+  usdPrice: number;
+  confidenceUsd: number;
+  confidenceBps: number;
+  publishTime: number;
+  sampledAt: string;
 };
 
 const asOptionalString = (value: unknown) =>
@@ -330,6 +694,22 @@ const asOptionalBps = (value: unknown) => {
     : undefined;
 };
 
+const isStrategyKey = (value: unknown): value is typeof strategyKeyValues[number] => (
+  value === 'momentum' || value === 'mean_reversion' || value === 'supertrend'
+);
+
+const asOptionalStrategyKey = (value: unknown) => (
+  value === undefined ? undefined : (isStrategyKey(value) ? value : undefined)
+);
+
+const isExitReason = (value: unknown): value is NonNullable<SessionPositionState['exitReason']> => (
+  value === 'take_profit' || value === 'stop_loss' || value === 'trailing_stop' || value === 'signal_reversal'
+);
+
+const asOptionalExitReason = (value: unknown) => (
+  value === undefined ? undefined : (isExitReason(value) ? value : undefined)
+);
+
 const asOptionalNonNegativeInteger = (value: unknown) => {
   if (value === undefined) {
     return undefined;
@@ -339,6 +719,97 @@ const asOptionalNonNegativeInteger = (value: unknown) => {
   return Number.isInteger(parsed) && parsed >= 0 ? parsed : undefined;
 };
 
+const asOptionalPositiveInt = (value: unknown) => {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  const parsed = typeof value === 'number' ? value : Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
+};
+
+const asOptionalNonNegativeNumber = (value: unknown) => {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  const parsed = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
+};
+
+const asOptionalPositiveNumber = (value: unknown) => {
+  const parsed = asOptionalNonNegativeNumber(value);
+  return parsed !== undefined && parsed > 0 ? parsed : undefined;
+};
+
+const asOptionalNumber = (value: unknown) => {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  const parsed = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+};
+
+const asOptionalBoolean = (value: unknown) => {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  return typeof value === 'boolean' ? value : undefined;
+};
+
+const asOptionalProfitMode = (value: unknown) => {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  return value === 'send_to_owner' || value === 'compound'
+    ? value
+    : undefined;
+};
+
+const asOptionalProfitPayoutToken = (value: unknown) => {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  return value === 'SOL' || value === 'USDC'
+    ? value
+    : undefined;
+};
+
+const asOptionalStopDisposition = (value: unknown) => {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  return value === 'return_tokens' || value === 'liquidate'
+    ? value
+    : undefined;
+};
+
+const buildDefaultStrategyConfig = () => ({
+  autoRotationEnabled: true,
+  momentum: {
+    lookbackSamples: workerSignalPolicy.momentumLookbackSamples,
+    thresholdBps: workerSignalPolicy.momentumThresholdBps,
+    edgeSafetyBufferBps: workerSignalPolicy.edgeSafetyBufferBps,
+  },
+  meanReversion: {
+    length: 20,
+    stdMultiplier: 2,
+    minBandWidthFraction: 0.006,
+    entryThreshold: 0,
+    exitThreshold: 0.5,
+  },
+  supertrend: {
+    candleSamples: 10,
+    atrPeriod: 10,
+    multiplier: 3,
+  },
+});
+
 const parseJupiterBuildRequest = (body: JupiterBuildRequestBody) => {
   const inputMint = asOptionalString(body.inputMint);
   const outputMint = asOptionalString(body.outputMint);
@@ -346,6 +817,10 @@ const parseJupiterBuildRequest = (body: JupiterBuildRequestBody) => {
   const taker = asOptionalString(body.taker);
   const feeTokenSymbol = asOptionalFeeToken(body.feeTokenSymbol);
   const slippageBps = asOptionalBps(body.slippageBps);
+  const scannerStrategy = asOptionalStrategyKey(body.scannerStrategy);
+  const entryStrategy = asOptionalStrategyKey(body.entryStrategy);
+  const exitStrategy = asOptionalStrategyKey(body.exitStrategy);
+  const exitReason = asOptionalExitReason(body.exitReason);
 
   const errors = [
     !inputMint || !publicKeyPattern.test(inputMint) ? 'inputMint must be a Solana public key' : null,
@@ -354,6 +829,10 @@ const parseJupiterBuildRequest = (body: JupiterBuildRequestBody) => {
     !taker || !publicKeyPattern.test(taker) ? 'taker must be a Solana public key' : null,
     !feeTokenSymbol ? 'feeTokenSymbol must be one of SOL, USDC, USDT' : null,
     body.slippageBps !== undefined && !slippageBps ? 'slippageBps must be an integer between 0 and 10000' : null,
+    body.scannerStrategy !== undefined && !scannerStrategy ? 'scannerStrategy must be a known strategy key' : null,
+    body.entryStrategy !== undefined && !entryStrategy ? 'entryStrategy must be a known strategy key' : null,
+    body.exitStrategy !== undefined && !exitStrategy ? 'exitStrategy must be a known strategy key' : null,
+    body.exitReason !== undefined && !exitReason ? 'exitReason must be one of take_profit, stop_loss, trailing_stop, signal_reversal' : null,
   ].filter((value): value is string => value !== null);
 
   if (errors.length > 0) {
@@ -367,6 +846,10 @@ const parseJupiterBuildRequest = (body: JupiterBuildRequestBody) => {
     taker: taker!,
     feeTokenSymbol: feeTokenSymbol!,
     slippageBps,
+    scannerStrategy,
+    entryStrategy,
+    exitStrategy,
+    exitReason,
   };
 
   return {
@@ -429,6 +912,7 @@ const retriableStatusCodes = new Set([408, 429, 500, 502, 503, 504]);
 const fetchJsonWithRetry = async (options: {
   label: string;
   limiter?: { acquire: () => Promise<void> };
+  budget?: { reserve: () => Promise<void> };
   request: () => Promise<Response>;
   maxAttempts?: number;
 }) => {
@@ -437,6 +921,10 @@ const fetchJsonWithRetry = async (options: {
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
+      if (options.budget) {
+        await options.budget.reserve();
+      }
+
       if (options.limiter) {
         await options.limiter.acquire();
       }
@@ -459,6 +947,10 @@ const fetchJsonWithRetry = async (options: {
         responseText,
       };
     } catch (error) {
+      if (error instanceof ProviderBudgetExceededError) {
+        throw error;
+      }
+
       lastError = error;
 
       if (attempt === maxAttempts) {
@@ -476,14 +968,57 @@ const fetchJsonWithRetry = async (options: {
 
 const rlGetAddressLookupTable = async (lookupTableAddress: PublicKey) => {
   if (!heliusConnection) throw new Error('Solana integration is not ready');
-  await heliusLimiter.acquire();
-  return heliusConnection.getAddressLookupTable(lookupTableAddress);
+  await reserveHeliusRpc();
+  return getHeliusRpcConnection().getAddressLookupTable(lookupTableAddress);
+};
+
+// Address lookup tables are effectively stable for routing within a short window.
+// Caching them removes the largest per-trade Helius RPC cost (~2-4 calls/trade at 350-bot scale).
+const ALT_CACHE_TTL_MS = Number(process.env.API_ALT_CACHE_TTL_MS ?? 300_000);
+const lookupTableAccountCache = new Map<string, { value: AddressLookupTableAccount; expiresAt: number }>();
+
+const getCachedLookupTableAccount = async (
+  lookupTableAddress: string,
+): Promise<AddressLookupTableAccount | null> => {
+  const now = Date.now();
+  const cached = lookupTableAccountCache.get(lookupTableAddress);
+  if (cached && cached.expiresAt > now) {
+    recordProviderLaneUse('helius-rpc-cache-hit', 0);
+    return cached.value;
+  }
+
+  const result = await rlGetAddressLookupTable(new PublicKey(lookupTableAddress));
+  if (result.value) {
+    lookupTableAccountCache.set(lookupTableAddress, {
+      value: result.value,
+      expiresAt: now + ALT_CACHE_TTL_MS,
+    });
+  }
+  return result.value;
+};
+
+const rlGetBalance = async (publicKey: PublicKey) => {
+  if (!heliusConnection) throw new Error('Solana integration is not ready');
+  await reserveHeliusRpc();
+  return getHeliusRpcConnection().getBalance(publicKey, 'confirmed');
+};
+
+const rlGetLatestBlockhash = async () => {
+  if (!heliusConnection) throw new Error('Solana integration is not ready');
+  await reserveHeliusRpc();
+  return getHeliusRpcConnection().getLatestBlockhash('confirmed');
+};
+
+const rlGetFeeForMessage = async (message: Parameters<Connection['getFeeForMessage']>[0]) => {
+  if (!heliusConnection) throw new Error('Solana integration is not ready');
+  await reserveHeliusRpc();
+  return getHeliusRpcConnection().getFeeForMessage(message, 'confirmed');
 };
 
 const rlSimulateTransaction = async (transaction: VersionedTransaction) => {
   if (!heliusConnection) throw new Error('Solana integration is not ready');
-  await heliusLimiter.acquire();
-  return heliusConnection.simulateTransaction(transaction, {
+  await reserveHeliusRpc();
+  return getHeliusRpcConnection().simulateTransaction(transaction, {
     replaceRecentBlockhash: true,
     sigVerify: false,
     commitment: 'confirmed',
@@ -492,14 +1027,14 @@ const rlSimulateTransaction = async (transaction: VersionedTransaction) => {
 
 const rlGetBlockHeight = async () => {
   if (!heliusConnection) throw new Error('Solana integration is not ready');
-  await heliusLimiter.acquire();
-  return heliusConnection.getBlockHeight('confirmed');
+  await reserveHeliusRpc();
+  return getHeliusRpcConnection().getBlockHeight('confirmed');
 };
 
 const rlSendRawTransaction = async (serializedTransaction: Uint8Array, maxRetries?: number) => {
   if (!heliusConnection) throw new Error('Solana integration is not ready');
-  await heliusLimiter.acquire();
-  return heliusConnection.sendRawTransaction(serializedTransaction, {
+  await reserveHeliusRpc();
+  return getHeliusRpcConnection().sendRawTransaction(serializedTransaction, {
     skipPreflight: false,
     preflightCommitment: 'confirmed',
     ...(maxRetries !== undefined ? { maxRetries } : {}),
@@ -508,30 +1043,30 @@ const rlSendRawTransaction = async (serializedTransaction: Uint8Array, maxRetrie
 
 const rlConfirmTransaction = async (params: { signature: string; blockhash: string; lastValidBlockHeight: number }) => {
   if (!heliusConnection) throw new Error('Solana integration is not ready');
-  await heliusLimiter.acquire();
-  return heliusConnection.confirmTransaction(params, 'confirmed');
+  await reserveHeliusRpc();
+  return getHeliusRpcConnection().confirmTransaction(params, 'confirmed');
 };
 
 const rlGetSignatureStatus = async (signature: string) => {
   if (!heliusConnection) throw new Error('Solana integration is not ready');
-  await heliusLimiter.acquire();
-  return heliusConnection.getSignatureStatus(signature, {
+  await reserveHeliusRpc();
+  return getHeliusRpcConnection().getSignatureStatus(signature, {
     searchTransactionHistory: true,
   });
 };
 
 const rlGetSignatureStatuses = async (signatures: string[]) => {
   if (!heliusConnection) throw new Error('Solana integration is not ready');
-  await heliusLimiter.acquire();
-  return heliusConnection.getSignatureStatuses(signatures, {
+  await reserveHeliusRpc();
+  return getHeliusRpcConnection().getSignatureStatuses(signatures, {
     searchTransactionHistory: true,
   });
 };
 
 const rlGetTransaction = async (signature: string) => {
   if (!heliusConnection) throw new Error('Solana integration is not ready');
-  await heliusLimiter.acquire();
-  return heliusConnection.getTransaction(signature, {
+  await reserveHeliusRpc();
+  return getHeliusRpcConnection().getTransaction(signature, {
     commitment: 'confirmed',
     maxSupportedTransactionVersion: 0,
   });
@@ -551,6 +1086,63 @@ const getUsdValueFromAtomicAmount = (mint: string, amountAtomic: number, solUsdP
   }
 
   return 0;
+};
+
+const fetchPythSolUsd = async (): Promise<PythQuoteSample> => {
+  const url =
+    `${pythPriceConfig.hermesBaseUrl}/v2/updates/price/latest` +
+    `?ids%5B%5D=${pythPriceConfig.solUsdFeedId}`;
+  const res = await fetch(url, {
+    headers: pythPriceConfig.apiKey
+      ? { Authorization: `Bearer ${pythPriceConfig.apiKey}` }
+      : undefined,
+  });
+
+  if (!res.ok) {
+    throw new Error(`pyth hermes ${res.status} ${res.statusText}`);
+  }
+
+  const body = (await res.json()) as {
+    parsed?: Array<{
+      id: string;
+      price: { price: string; conf: string; expo: number; publish_time: number };
+    }>;
+  };
+
+  const parsed = body.parsed?.find((entry) => entry.id === pythPriceConfig.solUsdFeedId);
+  if (!parsed) {
+    throw new Error(`pyth hermes response missing feed ${pythPriceConfig.solUsdFeedId}`);
+  }
+
+  const scale = Math.pow(10, parsed.price.expo);
+  const usdPrice = Number(parsed.price.price) * scale;
+  const confidenceUsd = Number(parsed.price.conf) * scale;
+  const confidenceBps = usdPrice > 0
+    ? Math.round((confidenceUsd / usdPrice) * 10_000)
+    : 0;
+
+  return {
+    usdPrice,
+    confidenceUsd,
+    confidenceBps,
+    publishTime: parsed.price.publish_time,
+    sampledAt: new Date().toISOString(),
+  };
+};
+
+const getPythFundingQuoteSample = async () => {
+  const sample = await fetchPythSolUsd();
+  const sampleAgeSeconds = Math.max(0, Math.floor(Date.now() / 1000) - sample.publishTime);
+
+  if (sampleAgeSeconds > workerSignalPolicy.maxPythAgeSeconds) {
+    throw new Error(`stale_price_${sampleAgeSeconds}s`);
+  }
+
+  if (sample.confidenceBps > workerSignalPolicy.maxPythConfidenceBps) {
+    throw new Error(`confidence_too_wide_${sample.confidenceBps}bps`);
+  }
+
+  return sample;
 };
 
 const getTransactionAccountKeys = (transactionDetails: any): string[] => {
@@ -615,6 +1207,44 @@ const getTokenBalanceDeltaAtomic = (
   }
 
   return totalDeltaAtomic;
+};
+
+const getTokenPostBalanceAtomic = (
+  transactionDetails: any,
+  params: { mint: string; owner?: string; accountAddress?: string },
+): number | null => {
+  const accountKeys = getTransactionAccountKeys(transactionDetails);
+  const postTokenBalances = transactionDetails?.meta?.postTokenBalances ?? [];
+  let totalPostAtomic = 0;
+  let matched = false;
+
+  for (const entry of postTokenBalances) {
+    if (!entry || entry.mint !== params.mint) {
+      continue;
+    }
+
+    const accountAddress = accountKeys[entry.accountIndex] ?? null;
+    if (params.owner && entry.owner !== params.owner) {
+      continue;
+    }
+    if (params.accountAddress && accountAddress !== params.accountAddress) {
+      continue;
+    }
+
+    matched = true;
+    totalPostAtomic += Number(entry.uiTokenAmount?.amount ?? '0');
+  }
+
+  return matched ? totalPostAtomic : null;
+};
+
+const getTokenDecimalsFromTransaction = (transactionDetails: any, mint: string): number | null => {
+  const tokenBalances = [
+    ...(transactionDetails?.meta?.preTokenBalances ?? []),
+    ...(transactionDetails?.meta?.postTokenBalances ?? []),
+  ];
+  const match = tokenBalances.find((entry: any) => entry?.mint === mint && Number.isFinite(entry?.uiTokenAmount?.decimals));
+  return Number.isFinite(match?.uiTokenAmount?.decimals) ? Number(match.uiTokenAmount.decimals) : null;
 };
 
 const getWalletBalanceSnapshot = (transactionDetails: any, wallet: string) => {
@@ -687,8 +1317,8 @@ const estimatePriorityFeeMicroLamports = async (params: {
 }) => {
   const result = await fetchJsonWithRetry({
     label: 'helius-priority-fee-estimate',
-    limiter: heliusLimiter,
-    request: () => fetch(getHeliusRpcUrl(process.env), {
+    budget: { reserve: reserveHeliusRpc },
+    request: () => fetch(getHeliusRpcConnection().rpcEndpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(buildPriorityFeeEstimateRequest({
@@ -710,7 +1340,7 @@ const estimatePriorityFeeMicroLamports = async (params: {
 const sendViaHeliusSender = async (signedTransactionBase64: string) => {
   const result = await fetchJsonWithRetry({
     label: 'helius-sender',
-    limiter: senderLimiter,
+    budget: { reserve: reserveHeliusSender },
     request: () => fetch(heliusTradingConfig.senderEndpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -756,10 +1386,10 @@ const loadLookupTableAccounts = async (
 
   const lookupTableResults = await Promise.all(
     lookupTableAddresses.map(async (lookupTableAddress) => {
-      const lookupTableAccount = await rlGetAddressLookupTable(new PublicKey(lookupTableAddress));
+      const value = await getCachedLookupTableAccount(lookupTableAddress);
       return {
         lookupTableAddress,
-        value: lookupTableAccount.value,
+        value,
       };
     }),
   );
@@ -838,9 +1468,9 @@ const fetchJupiterBuild = async (
 
   const result = await fetchJsonWithRetry({
     label: 'jupiter-build',
-    limiter: jupiterLimiter,
+    budget: { reserve: reserveJupiterRequest },
     request: () => fetch(`${jupiterSwapBuildConfig.apiBaseUrl}/build?${params.toString()}`, {
-      headers: { 'x-api-key': jupiterSwapBuildConfig.apiKey },
+      headers: { 'x-api-key': (jupiterApiKeySelector?.next() ?? jupiterSwapBuildConfig.apiKey) },
     }),
   });
 
@@ -1051,10 +1681,27 @@ const reconcileExecutionById = async (executionId: string) => {
 
   const signatureStatuses = await rlGetSignatureStatuses([execution.signature]);
   const signatureStatusValue = signatureStatuses.value[0] ?? null;
-  const confirmationStatus = signatureStatusValue?.confirmationStatus ?? null;
   const currentBlockHeight = execution.lastValidBlockHeight !== null
     ? await rlGetBlockHeight()
     : null;
+
+  return reconcileSubmittedExecutionRecord(execution, signatureStatusValue, currentBlockHeight);
+};
+
+const reconcileSubmittedExecutionRecord = async (
+  execution: SwapExecution,
+  signatureStatusValue: SignatureStatus | null,
+  currentBlockHeight: number | null,
+) => {
+  if (!execution.signature) {
+    return {
+      kind: 'not_reconcilable' as const,
+      execution,
+      reason: 'Execution does not have a signature yet',
+    };
+  }
+
+  const confirmationStatus = signatureStatusValue?.confirmationStatus ?? null;
   const blockhashExpired =
     execution.lastValidBlockHeight !== null &&
     currentBlockHeight !== null &&
@@ -1105,37 +1752,78 @@ const reconcileExecutionById = async (executionId: string) => {
     updatedAt: now,
   });
 
-  if (transitionedToConfirmed && updatedExecution?.status === 'confirmed') {
+  if (updatedExecution?.status === 'confirmed') {
     const session = await getSessionByWallet(updatedExecution.taker);
 
     if (session) {
+      const alreadyAccounted = session.serviceControl.lastExecutionAudit?.executionId === updatedExecution.id;
+      if (alreadyAccounted) {
+        return {
+          kind: 'updated' as const,
+          execution: updatedExecution,
+        };
+      }
+
       const currentPositionState = session.serviceControl.positionState;
-      let nextPositionState = currentPositionState;
+      const currentPositionsState = normalizePositionsState(
+        session.serviceControl.positionsState,
+        currentPositionState ?? null,
+      );
+      let nextPositionsState = currentPositionsState;
+      let summaryFallback = currentPositionState ?? buildFlatSessionPositionState();
       const confirmedAt = updatedExecution.confirmedAt ?? now;
       const quotedOutputAtomic = typeof updatedExecution.build?.outAmount === 'string'
         ? updatedExecution.build.outAmount
         : null;
+      const expectedOutputAtomic = quotedOutputAtomic !== null ? Number(quotedOutputAtomic) : null;
       const markedPriceUsd = currentPositionState?.lastMarkedPriceUsd ?? null;
 
       const inAtomic = Number(updatedExecution.amount);
+      const feeMint = updatedExecution.feeTokenSymbol === 'USDC'
+        ? USDC_MINT
+        : updatedExecution.feeTokenSymbol === 'USDT'
+          ? USDT_MINT
+          : SOL_MINT;
       const feeAccountDeltaAtomic = transactionDetails
         ? Math.max(0, getTokenBalanceDeltaAtomic(transactionDetails, {
-            mint: updatedExecution.outputMint === SOL_MINT ? updatedExecution.inputMint : updatedExecution.outputMint,
+            mint: feeMint,
             accountAddress: updatedExecution.feeAccount,
           }) ?? 0)
         : 0;
+      let feeSolUsdPrice = markedPriceUsd;
+      if (feeMint === SOL_MINT && feeAccountDeltaAtomic > 0 && (!feeSolUsdPrice || feeSolUsdPrice <= 0)) {
+        try {
+          feeSolUsdPrice = (await fetchPythSolUsd()).usdPrice;
+        } catch (error) {
+          console.warn('Unable to fetch SOL/USD price for fee accounting', error);
+        }
+      }
+      const capturedFeeUsdFromDelta = feeAccountDeltaAtomic > 0
+        ? getUsdValueFromAtomicAmount(feeMint, feeAccountDeltaAtomic, feeSolUsdPrice)
+        : 0;
       const walletBalanceSnapshot = transactionDetails
         ? getWalletBalanceSnapshot(transactionDetails, updatedExecution.taker)
+        : null;
+      const usdcPostBalanceAtomic = transactionDetails
+        ? getTokenPostBalanceAtomic(transactionDetails, {
+            mint: USDC_MINT,
+            owner: updatedExecution.taker,
+          })
         : null;
       let realizedDeltaUsd = 0;
       let capturedFeesDeltaUsd = 0;
       let costBasisPerSolUsd: number | null = null;
       let fundingPatch: Partial<import('@roguezero/session-schema').Session['funding']> | undefined;
+      let executionAuditDirection: 'enter_long' | 'exit_long' | 'other' = 'other';
+      let actualOutputAtomic: number | null = null;
 
       if (
-        updatedExecution.inputMint === SOL_MINT
-        && updatedExecution.outputMint === USDC_MINT
+        updatedExecution.outputMint === USDC_MINT
+        && isLongPositionStatus((currentPositionsState.positions[updatedExecution.inputMint]?.status ?? 'flat') as SessionPositionState['status'])
       ) {
+        executionAuditDirection = 'exit_long';
+        const soldMint = updatedExecution.inputMint;
+        const existingPosition = currentPositionsState.positions[soldMint] ?? null;
         const observedUsdcDelta = transactionDetails
           ? getTokenBalanceDeltaAtomic(transactionDetails, {
               mint: USDC_MINT,
@@ -1145,83 +1833,332 @@ const reconcileExecutionById = async (executionId: string) => {
         const outAtomic = observedUsdcDelta !== null && observedUsdcDelta > 0
           ? observedUsdcDelta
           : (quotedOutputAtomic !== null ? Number(quotedOutputAtomic) : 0);
-        const solSold = inAtomic / 1e9;
+        actualOutputAtomic = outAtomic > 0 ? outAtomic : null;
+        const soldDecimals = transactionDetails ? getTokenDecimalsFromTransaction(transactionDetails, soldMint) : null;
+        const soldUi = getPositionUiAmount(soldMint, inAtomic, soldDecimals);
         const usdcReceived = outAtomic / 1e6;
-        const entry = currentPositionState?.entryPriceUsd ?? null;
-        if (entry !== null && solSold > 0) {
-          realizedDeltaUsd = usdcReceived - solSold * entry;
+        const entry = existingPosition?.entryPriceUsd ?? null;
+        if (entry !== null && soldUi > 0) {
+          realizedDeltaUsd = usdcReceived - soldUi * entry;
         }
-        capturedFeesDeltaUsd = feeAccountDeltaAtomic > 0
-          ? getUsdValueFromAtomicAmount(USDC_MINT, feeAccountDeltaAtomic)
-          : 0;
-        fundingPatch = walletBalanceSnapshot
-          ? { currentBalanceAtomic: String(walletBalanceSnapshot.postBalance) }
+        capturedFeesDeltaUsd = capturedFeeUsdFromDelta;
+        fundingPatch = usdcPostBalanceAtomic !== null
+          ? { currentBalanceAtomic: String(usdcPostBalanceAtomic) }
           : undefined;
 
-        nextPositionState = {
-          status: 'flat',
-          entryPriceUsd: null,
-          entryAt: null,
-          quantityAtomic: null,
-          highWaterPriceUsd: null,
-          lastMarkedPriceUsd: currentPositionState?.lastMarkedPriceUsd ?? null,
-          lastMarkedAt: currentPositionState?.lastMarkedAt ?? null,
-          pendingExitReason: null,
-          exitReason: currentPositionState?.pendingExitReason ?? currentPositionState?.exitReason ?? 'signal_reversal',
-        };
+        const exitUpdate = applyPositionExit({
+          existingPosition,
+          soldAtomic: inAtomic,
+          exitReason: existingPosition?.pendingExitReason ?? existingPosition?.exitReason ?? 'signal_reversal',
+          fallbackMarkedPriceUsd: currentPositionState?.lastMarkedPriceUsd ?? null,
+          fallbackMarkedAt: currentPositionState?.lastMarkedAt ?? null,
+        });
+        const nextPositions = { ...currentPositionsState.positions };
+        if (exitUpdate.remainingPosition) {
+          nextPositions[soldMint] = exitUpdate.remainingPosition;
+        } else {
+          delete nextPositions[soldMint];
+        }
+        nextPositionsState = normalizePositionsState({
+          activePositionMint: currentPositionsState.activePositionMint === soldMint
+            ? null
+            : currentPositionsState.activePositionMint,
+          positions: nextPositions,
+        }, null);
+        summaryFallback = exitUpdate.summaryFallback;
       } else if (
         updatedExecution.inputMint === USDC_MINT
-        && updatedExecution.outputMint === SOL_MINT
+        && updatedExecution.outputMint !== USDC_MINT
       ) {
+        executionAuditDirection = 'enter_long';
+        const boughtMint = updatedExecution.outputMint;
+        const existingPosition = currentPositionsState.positions[boughtMint] ?? null;
         const observedUsdcDelta = transactionDetails
           ? getTokenBalanceDeltaAtomic(transactionDetails, {
               mint: USDC_MINT,
               owner: updatedExecution.taker,
             })
           : null;
-        const observedSolDelta = walletBalanceSnapshot?.delta ?? null;
         const usdcSpentAtomic = observedUsdcDelta !== null && observedUsdcDelta < 0
           ? Math.abs(observedUsdcDelta)
           : inAtomic;
-        const outAtomic = observedSolDelta !== null && observedSolDelta > 0
-          ? observedSolDelta
+        const observedOutputDelta = transactionDetails
+          ? getTokenBalanceDeltaAtomic(transactionDetails, {
+              mint: boughtMint,
+              owner: updatedExecution.taker,
+            })
+          : null;
+        const outAtomic = observedOutputDelta !== null && observedOutputDelta > 0
+          ? observedOutputDelta
           : (quotedOutputAtomic !== null ? Number(quotedOutputAtomic) : 0);
+        actualOutputAtomic = outAtomic > 0 ? outAtomic : null;
         const usdcSpent = usdcSpentAtomic / 1e6;
-        const solReceived = outAtomic / 1e9;
-        if (solReceived > 0) {
-          costBasisPerSolUsd = usdcSpent / solReceived;
+        const outputDecimals = transactionDetails ? getTokenDecimalsFromTransaction(transactionDetails, boughtMint) : null;
+        const outputUiAmount = getPositionUiAmount(boughtMint, outAtomic, outputDecimals);
+        if (outputUiAmount > 0) {
+          costBasisPerSolUsd = usdcSpent / outputUiAmount;
         }
-        capturedFeesDeltaUsd = feeAccountDeltaAtomic > 0
-          ? getUsdValueFromAtomicAmount(USDC_MINT, feeAccountDeltaAtomic)
-          : 0;
-        fundingPatch = walletBalanceSnapshot
-          ? { currentBalanceAtomic: String(walletBalanceSnapshot.postBalance) }
+        capturedFeesDeltaUsd = capturedFeeUsdFromDelta;
+        fundingPatch = usdcPostBalanceAtomic !== null
+          ? { currentBalanceAtomic: String(usdcPostBalanceAtomic) }
           : undefined;
 
         const entryPriceForState = costBasisPerSolUsd ?? markedPriceUsd;
-        nextPositionState = {
-          status: 'long_sol',
-          entryPriceUsd: entryPriceForState,
-          entryAt: confirmedAt,
-          quantityAtomic: outAtomic > 0 ? String(outAtomic) : quotedOutputAtomic,
-          highWaterPriceUsd: entryPriceForState,
-          lastMarkedPriceUsd: markedPriceUsd,
-          lastMarkedAt: markedPriceUsd ? confirmedAt : currentPositionState?.lastMarkedAt ?? null,
-          pendingExitReason: null,
-          exitReason: null,
-        };
+        nextPositionsState = normalizePositionsState({
+          activePositionMint: boughtMint,
+          positions: {
+            ...currentPositionsState.positions,
+            [boughtMint]: upsertPositionEntry({
+              existingPosition,
+              mint: boughtMint,
+              symbol: boughtMint === SOL_MINT ? 'SOL' : null,
+              quantityAtomic: outAtomic > 0 ? outAtomic : Number(quotedOutputAtomic ?? 0),
+              entryPriceUsd: entryPriceForState,
+              tokenDecimals: outputDecimals,
+              entryStrategy: updatedExecution.metadata.entryStrategy ?? updatedExecution.metadata.scannerStrategy ?? null,
+              confirmedAt,
+              markedPriceUsd,
+              status: 'long',
+            }),
+          },
+        }, null);
+      } else if (
+        updatedExecution.outputMint === SOL_MINT
+        && isLongPositionStatus((currentPositionsState.positions[updatedExecution.inputMint]?.status ?? 'flat') as SessionPositionState['status'])
+      ) {
+        // Exit: token → SOL
+        executionAuditDirection = 'exit_long';
+        const soldMint = updatedExecution.inputMint;
+        const existingPosition = currentPositionsState.positions[soldMint] ?? null;
+        const observedSolDelta = walletBalanceSnapshot?.delta ?? null;
+        const outLamports = observedSolDelta !== null && observedSolDelta > 0
+          ? observedSolDelta
+          : (quotedOutputAtomic !== null ? Number(quotedOutputAtomic) : 0);
+        actualOutputAtomic = outLamports > 0 ? outLamports : null;
+        const solReceived = outLamports / 1e9;
+        const entry = existingPosition?.entryPriceUsd ?? null;
+        const quantityAtomic = existingPosition?.quantityAtomic
+          ? Number(existingPosition.quantityAtomic)
+          : inAtomic;
+        const quantityUi = getPositionUiAmount(soldMint, quantityAtomic, existingPosition?.tokenDecimals ?? null);
+        if (entry !== null && solReceived > 0 && quantityUi > 0) {
+          // Resolve SOL/USD explicitly for token→SOL exits. `markedPriceUsd`
+          // belongs to the sold token/position and must not be reused as the
+          // SOL proceeds price, or realized PnL is scaled down by hundreds.
+          let solPriceUsd = 0;
+          try {
+            solPriceUsd = (await fetchPythSolUsd()).usdPrice;
+          } catch (error) {
+            console.warn('Unable to fetch SOL/USD price for token→SOL PnL accounting; leaving realized PnL unchanged', error);
+          }
+
+          const realized = computeTokenToSolRealizedPnlUsd({
+            receivedLamports: outLamports,
+            soldAtomic: quantityAtomic,
+            soldDecimals: existingPosition?.tokenDecimals ?? (soldMint === SOL_MINT ? 9 : 6),
+            entryPriceUsd: entry,
+            solUsdPrice: solPriceUsd,
+          });
+          if (realized !== null) {
+            realizedDeltaUsd = realized;
+          }
+        }
+        capturedFeesDeltaUsd = 0; // SOL fee capture tracked separately
+        fundingPatch = walletBalanceSnapshot
+          ? { currentBalanceAtomic: String(walletBalanceSnapshot.postBalance) }
+          : undefined;
+        const exitUpdate = applyPositionExit({
+          existingPosition,
+          soldAtomic: inAtomic,
+          exitReason: existingPosition?.pendingExitReason ?? existingPosition?.exitReason ?? 'signal_reversal',
+          fallbackMarkedPriceUsd: currentPositionState?.lastMarkedPriceUsd ?? null,
+          fallbackMarkedAt: currentPositionState?.lastMarkedAt ?? null,
+        });
+        const nextPositions = { ...currentPositionsState.positions };
+        if (exitUpdate.remainingPosition) {
+          nextPositions[soldMint] = exitUpdate.remainingPosition;
+        } else {
+          delete nextPositions[soldMint];
+        }
+        nextPositionsState = normalizePositionsState({
+          activePositionMint: currentPositionsState.activePositionMint === soldMint
+            ? null
+            : currentPositionsState.activePositionMint,
+          positions: nextPositions,
+        }, null);
+        summaryFallback = exitUpdate.summaryFallback;
+      } else if (
+        updatedExecution.inputMint === SOL_MINT
+        && updatedExecution.outputMint === USDC_MINT
+      ) {
+        // Funding conversion: SOL → USDC establishes the neutral base inventory.
+        // It is not a long position unless an existing SOL position was being exited,
+        // which is handled by the outputMint === USDC_MINT exit branch above.
+        executionAuditDirection = 'other';
+        const observedUsdcDelta = transactionDetails
+          ? getTokenBalanceDeltaAtomic(transactionDetails, {
+              mint: USDC_MINT,
+              owner: updatedExecution.taker,
+            })
+          : null;
+        const outAtomic = observedUsdcDelta !== null && observedUsdcDelta > 0
+          ? observedUsdcDelta
+          : (quotedOutputAtomic !== null ? Number(quotedOutputAtomic) : 0);
+        actualOutputAtomic = outAtomic > 0 ? outAtomic : null;
+        capturedFeesDeltaUsd = capturedFeeUsdFromDelta;
+        fundingPatch = usdcPostBalanceAtomic !== null
+          ? {
+              fundingMint: USDC_MINT,
+              fundingTokenSymbol: 'USDC',
+              currentBalanceAtomic: String(usdcPostBalanceAtomic),
+            }
+          : {
+              fundingMint: USDC_MINT,
+              fundingTokenSymbol: 'USDC',
+            };
+        nextPositionsState = normalizePositionsState({
+          activePositionMint: currentPositionsState.activePositionMint,
+          positions: currentPositionsState.positions,
+        }, null);
+        summaryFallback = summarizePositionsState(nextPositionsState, buildFlatSessionPositionState());
+      } else if (
+        updatedExecution.inputMint === SOL_MINT
+        && updatedExecution.outputMint !== SOL_MINT
+      ) {
+        // Entry: SOL → token
+        executionAuditDirection = 'enter_long';
+        const boughtMint = updatedExecution.outputMint;
+        const existingPosition = currentPositionsState.positions[boughtMint] ?? null;
+        const observedSolDelta = walletBalanceSnapshot?.delta ?? null;
+        const spentLamports = observedSolDelta !== null && observedSolDelta < 0
+          ? Math.max(Math.abs(observedSolDelta), inAtomic)
+          : inAtomic;
+        // Use the actual on-chain token delta when available; fall back to the
+        // quoted output only if the confirmation didn't expose a balance change.
+        const observedOutputDelta = transactionDetails
+          ? getTokenBalanceDeltaAtomic(transactionDetails, {
+              mint: boughtMint,
+              owner: updatedExecution.taker,
+            })
+          : null;
+        const outAtomic = observedOutputDelta !== null && observedOutputDelta > 0
+          ? observedOutputDelta
+          : (quotedOutputAtomic !== null ? Number(quotedOutputAtomic) : 0);
+        actualOutputAtomic = outAtomic > 0 ? outAtomic : null;
+        const solSpent = spentLamports / 1e9;
+        // Resolve the bought token's real decimals from the transaction instead
+        // of assuming 6. A wrong decimal count scales the recorded quantity and
+        // cost basis by orders of magnitude and fabricates phantom PnL on exit.
+        const outputDecimals = transactionDetails ? getTokenDecimalsFromTransaction(transactionDetails, boughtMint) : null;
+        const outputUiAmount = getPositionUiAmount(boughtMint, outAtomic, outputDecimals);
+        if (outputUiAmount > 0 && solSpent > 0) {
+          // Cost basis: USD per token = (SOL spent × SOL/USD) / tokens received.
+          // This must never silently fall back to zero/null. If entry cost basis is
+          // wrong, a later token→USDC exit treats returned principal as profit and
+          // profit-payout can drain the whole exit proceeds to the owner wallet.
+          // `markedPriceUsd` is the bought token's mark in this branch, not
+          // SOL/USD. Always fetch SOL/USD for SOL-denominated cost basis.
+          let solPriceUsd = 0;
+          try {
+            solPriceUsd = (await fetchPythSolUsd()).usdPrice;
+          } catch (error) {
+            console.warn('Unable to fetch SOL/USD price for SOL→token cost basis; recording entry without fabricated cost basis', error);
+          }
+
+          costBasisPerSolUsd = computeSolInputEntryPriceUsd({
+            spentLamports,
+            outputAtomic: outAtomic,
+            outputDecimals: outputDecimals ?? (boughtMint === SOL_MINT ? 9 : 6),
+            solUsdPrice: solPriceUsd,
+          });
+        }
+        capturedFeesDeltaUsd = 0;
+        fundingPatch = walletBalanceSnapshot
+          ? { currentBalanceAtomic: String(walletBalanceSnapshot.postBalance) }
+          : undefined;
+        const entryPriceForState = costBasisPerSolUsd ?? existingPosition?.entryPriceUsd ?? null;
+        nextPositionsState = normalizePositionsState({
+          activePositionMint: boughtMint,
+          positions: {
+            ...currentPositionsState.positions,
+            [boughtMint]: upsertPositionEntry({
+              existingPosition,
+              mint: boughtMint,
+              symbol: boughtMint === SOL_MINT ? 'SOL' : null,
+              quantityAtomic: outAtomic > 0 ? outAtomic : Number(quotedOutputAtomic ?? 0),
+              entryPriceUsd: entryPriceForState,
+              tokenDecimals: outputDecimals,
+              entryStrategy: updatedExecution.metadata.entryStrategy ?? updatedExecution.metadata.scannerStrategy ?? null,
+              confirmedAt,
+              markedPriceUsd,
+              status: 'long_sol',
+            }),
+          },
+        }, null);
+      }
+
+      const nextPositionState = summarizePositionsState(nextPositionsState, summaryFallback);
+      const positionsChanged = JSON.stringify(nextPositionsState) !== JSON.stringify(currentPositionsState);
+      const outputDeltaBps = computeOutputDeltaBps(actualOutputAtomic, expectedOutputAtomic);
+      const badFill = outputDeltaBps !== null && outputDeltaBps <= -Math.abs(EXECUTION_BAD_FILL_THRESHOLD_BPS);
+      const currentRiskState = session.serviceControl.riskState;
+      const confirmedAtIso = confirmedAt;
+      const dayKey = getUtcDayKey(new Date(confirmedAtIso));
+      const priceImpactPct = typeof updatedExecution.build?.priceImpactPct === 'string'
+        ? updatedExecution.build.priceImpactPct
+        : null;
+      const previousDailyRealizedPnlUsd = currentRiskState?.dayKey === dayKey
+        ? currentRiskState.dailyRealizedPnlUsd
+        : 0;
+      const dailyRealizedPnlUsd = Number((previousDailyRealizedPnlUsd + realizedDeltaUsd).toFixed(6));
+      const consecutiveLosses = realizedDeltaUsd < 0
+        ? (currentRiskState?.consecutiveLosses ?? 0) + 1
+        : realizedDeltaUsd > 0
+          ? 0
+          : currentRiskState?.consecutiveLosses ?? 0;
+      const badFillStreak = badFill
+        ? (currentRiskState?.badFillStreak ?? 0) + 1
+        : outputDeltaBps !== null
+          ? 0
+          : currentRiskState?.badFillStreak ?? 0;
+      const serviceControlPatch: SessionServiceControlPatch = {
+        riskState: {
+          dayKey,
+          dailyRealizedPnlUsd,
+          consecutiveLosses,
+          badFillStreak,
+          lastLossAt: realizedDeltaUsd < 0 ? confirmedAtIso : currentRiskState?.lastLossAt ?? null,
+          lastBadFillAt: badFill ? confirmedAtIso : currentRiskState?.lastBadFillAt ?? null,
+        },
+        lastExecutionAudit: {
+          at: confirmedAtIso,
+          executionId: updatedExecution.id,
+          direction: executionAuditDirection,
+          inputMint: updatedExecution.inputMint,
+          outputMint: updatedExecution.outputMint,
+          inputAmountAtomic: String(updatedExecution.amount),
+          expectedOutputAtomic: expectedOutputAtomic !== null && expectedOutputAtomic > 0 ? String(expectedOutputAtomic) : null,
+          actualOutputAtomic: actualOutputAtomic !== null && actualOutputAtomic > 0 ? String(actualOutputAtomic) : null,
+          outputDeltaBps,
+          priceImpactBps: parseQuotePriceImpactBps(priceImpactPct),
+          badFill,
+        },
+      };
+
+      if (positionsChanged) {
+        serviceControlPatch.positionsState = nextPositionsState;
+        serviceControlPatch.positionState = nextPositionState;
       }
 
       if (
-        nextPositionState !== currentPositionState
+        positionsChanged
         || realizedDeltaUsd !== 0
         || capturedFeesDeltaUsd !== 0
         || fundingPatch !== undefined
+        || serviceControlPatch.lastExecutionAudit !== undefined
       ) {
         await updateSessionExecutionOutcomeByWallet(updatedExecution.taker, {
-          serviceControlPatch: nextPositionState !== currentPositionState
-            ? { positionState: nextPositionState }
-            : undefined,
+          serviceControlPatch,
           fundingDelta: (realizedDeltaUsd !== 0 || capturedFeesDeltaUsd !== 0)
             ? {
                 realizedPnlUsd: realizedDeltaUsd,
@@ -1335,6 +2272,7 @@ const reconcileStaleSubmittedExecutions = async () => {
 
   const executions = await listExecutionsByStatus(['submitted'], 200);
   const now = Date.now();
+  const staleExecutions: SwapExecution[] = [];
 
   for (const execution of executions) {
     if (!execution.signature) {
@@ -1348,8 +2286,45 @@ const reconcileStaleSubmittedExecutions = async () => {
       continue;
     }
 
-    app.log.info({ executionId: execution.id, signature: execution.signature }, 'reconciling stale submitted execution');
-    await reconcileExecutionByIdSafely(execution.id);
+    if (executionReconcilesInFlight.has(execution.id)) {
+      continue;
+    }
+
+    staleExecutions.push(execution);
+  }
+
+  if (staleExecutions.length === 0) {
+    return;
+  }
+
+  app.log.info({ count: staleExecutions.length }, 'batch reconciling stale submitted executions');
+  const signatures = staleExecutions.map((execution) => execution.signature!);
+  const signatureStatuses = await rlGetSignatureStatuses(signatures);
+  const currentBlockHeight = staleExecutions.some((execution) => execution.lastValidBlockHeight !== null)
+    ? await rlGetBlockHeight()
+    : null;
+
+  for (let index = 0; index < staleExecutions.length; index += 1) {
+    const execution = staleExecutions[index];
+    if (executionReconcilesInFlight.has(execution.id)) {
+      continue;
+    }
+
+    executionReconcilesInFlight.add(execution.id);
+
+    try {
+      const result = await reconcileSubmittedExecutionRecord(
+        execution,
+        signatureStatuses.value[index] ?? null,
+        currentBlockHeight,
+      );
+
+      if (result.kind === 'updated' && result.execution && result.execution.status !== 'submitted') {
+        stopWatchingSubmittedExecution(execution.id);
+      }
+    } finally {
+      executionReconcilesInFlight.delete(execution.id);
+    }
   }
 };
 
@@ -1370,7 +2345,7 @@ const startSubmittedExecutionWatcherLoop = () => {
   }, SUBMITTED_EXECUTION_SYNC_INTERVAL_MS);
 };
 
-app.log.info({ configReport }, 'runtime configuration evaluated');
+app.log.info({ configReport, deployCanary: DEPLOY_CANARY }, 'runtime configuration evaluated');
 void executionStoreReady()
   .then(() => {
     app.log.info('swap execution store ready');
@@ -1454,12 +2429,115 @@ app.options('*', async (_req, reply) => {
 app.get('/health', async () => ({
   service: 'roguezero-api',
   status: 'ok',
+  deployCanary: DEPLOY_CANARY,
   configReady: configReport.readyForLiveIntegration,
   missingLiveValues: configReport.missingLiveValues,
   timestamp: new Date().toISOString(),
 }));
 
+app.get('/ops/deploy-drain', async () => {
+  const pool = getPool();
+  const runtimeControl = await getLiveRuntimeControl();
+
+  const executionResult = await pool.query<{
+    prepared: string;
+    submitted: string;
+    recent_submitted: string;
+  }>(`
+    SELECT count(*) FILTER (WHERE status = 'prepared')::text AS prepared,
+           count(*) FILTER (WHERE status = 'submitted')::text AS submitted,
+           count(*) FILTER (
+             WHERE status = 'submitted'
+               AND submitted_at > NOW() - INTERVAL '5 minutes'
+           )::text AS recent_submitted
+      FROM swap_executions
+  `);
+
+  const queueExists = await pool.query<{ exists: boolean }>(
+    `SELECT to_regclass('public.execution_queue') IS NOT NULL AS exists`,
+  );
+  const queueResult = queueExists.rows[0]?.exists
+    ? await pool.query<{
+        queued: string;
+        running: string;
+        locked: string;
+      }>(`
+        SELECT count(*) FILTER (WHERE status = 'queued')::text AS queued,
+               count(*) FILTER (WHERE status = 'running')::text AS running,
+               count(*) FILTER (
+                 WHERE status = 'running'
+                   AND locked_until IS NOT NULL
+                   AND locked_until > NOW()
+               )::text AS locked
+          FROM execution_queue
+      `)
+    : null;
+
+  const sessionResult = await pool.query<{
+    active_sessions: string;
+    active_flat_sessions: string;
+    active_with_positions: string;
+    stopping_sessions: string;
+  }>(`
+    SELECT count(*) FILTER (WHERE status = 'active')::text AS active_sessions,
+           count(*) FILTER (
+             WHERE status = 'active'
+               AND COALESCE(service_control->'positionsState'->>'activePositionMint', '') = ''
+           )::text AS active_flat_sessions,
+           count(*) FILTER (
+             WHERE status = 'active'
+               AND COALESCE(service_control->'positionsState'->>'activePositionMint', '') <> ''
+           )::text AS active_with_positions,
+           count(*) FILTER (WHERE status = 'stopping')::text AS stopping_sessions
+      FROM sessions
+     WHERE status IN ('awaiting_funding', 'ready', 'starting', 'active', 'paused', 'stopping')
+  `);
+
+  const executions = executionResult.rows[0] ?? { prepared: '0', submitted: '0', recent_submitted: '0' };
+  const queue = queueResult?.rows[0] ?? { queued: '0', running: '0', locked: '0' };
+  const sessions = sessionResult.rows[0] ?? {
+    active_sessions: '0',
+    active_flat_sessions: '0',
+    active_with_positions: '0',
+    stopping_sessions: '0',
+  };
+
+  const inFlightExecutions = Number(executions.prepared) + Number(executions.submitted);
+  const inFlightQueue = Number(queue.running) + Number(queue.locked);
+  const safeToRestartWorker = runtimeControl.entriesEnabled === false
+    && inFlightExecutions === 0
+    && inFlightQueue === 0;
+
+  return {
+    service: 'roguezero-api',
+    status: safeToRestartWorker ? 'drained' : 'not_drained',
+    safeToRestartWorker,
+    entriesEnabled: runtimeControl.entriesEnabled,
+    maintenanceReason: runtimeControl.maintenanceReason,
+    speedProfile: runtimeControl.speedProfile,
+    executions: {
+      prepared: Number(executions.prepared),
+      submitted: Number(executions.submitted),
+      recentSubmitted: Number(executions.recent_submitted),
+    },
+    queue: {
+      queued: Number(queue.queued),
+      running: Number(queue.running),
+      locked: Number(queue.locked),
+    },
+    sessions: {
+      active: Number(sessions.active_sessions),
+      activeFlat: Number(sessions.active_flat_sessions),
+      activeWithPositions: Number(sessions.active_with_positions),
+      stopping: Number(sessions.stopping_sessions),
+    },
+    timestamp: new Date().toISOString(),
+  };
+});
+
 app.get('/config-status', async () => configReport);
+
+app.get('/provider/budgets', async () => getProviderBudgetSnapshot());
 
 app.get('/session-schema', async () => ({
   schemaVersion,
@@ -1704,7 +2782,7 @@ app.post('/jupiter/swap/build', async (request, reply) => {
   };
 });
 
-app.post('/jupiter/swap/prepare', { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } }, async (request, reply) => {
+app.post('/jupiter/swap/prepare', { config: { rateLimit: { max: INTERNAL_SWAP_PREPARE_RATE_LIMIT_PER_MINUTE, timeWindow: '1 minute' } } }, async (request, reply) => {
   if (!jupiterSwapBuildConfig || !heliusConnection) {
     return reply.status(503).send({
       error: 'Jupiter or Solana integration is not ready',
@@ -1720,6 +2798,17 @@ app.post('/jupiter/swap/prepare', { config: { rateLimit: { max: 10, timeWindow: 
 
   const { taker, feeTokenSymbol } = parsed.value;
   const feeAccount = jupiterSwapBuildConfig.getFeeAccountForToken(feeTokenSymbol);
+  const activeExecution = await getActiveExecutionByTaker(taker);
+
+  if (activeExecution) {
+    return reply.status(409).send({
+      error: 'Execution already in flight for taker',
+      executionId: activeExecution.id,
+      status: activeExecution.status,
+      taker,
+    });
+  }
+
   let candidate = await buildPreparedSimulationCandidate({
     request: parsed.value,
     feeAccount,
@@ -1854,6 +2943,12 @@ app.post('/jupiter/swap/prepare', { config: { rateLimit: { max: 10, timeWindow: 
             shortfall: simulationShortfall,
           }
         : null,
+      metadata: {
+        scannerStrategy: parsed.value.scannerStrategy ?? null,
+        entryStrategy: parsed.value.entryStrategy ?? null,
+        exitStrategy: parsed.value.exitStrategy ?? null,
+        exitReason: parsed.value.exitReason ?? null,
+      },
       preparedAt: now,
       submittedAt: null,
       confirmedAt: null,
@@ -1863,6 +2958,16 @@ app.post('/jupiter/swap/prepare', { config: { rateLimit: { max: 10, timeWindow: 
       confirmationStatus: null,
     });
   } catch (error) {
+    if (isSwapExecutionUniqueViolation(error)) {
+      const conflictingExecution = await getActiveExecutionByTaker(taker);
+      return reply.status(409).send({
+        error: 'Execution already in flight for taker',
+        executionId: conflictingExecution?.id ?? null,
+        status: conflictingExecution?.status ?? null,
+        taker,
+      });
+    }
+
     app.log.error({ error }, 'failed to persist prepared swap execution');
     return reply.status(500).send({
       error: 'Failed to persist prepared swap execution',
@@ -1938,7 +3043,7 @@ app.post('/jupiter/swap/prepare', { config: { rateLimit: { max: 10, timeWindow: 
   };
 });
 
-app.post('/jupiter/swap/submit', { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } }, async (request, reply) => {
+app.post('/jupiter/swap/submit', { config: { rateLimit: { max: INTERNAL_SWAP_SUBMIT_RATE_LIMIT_PER_MINUTE, timeWindow: '1 minute' } } }, async (request, reply) => {
   if (!heliusConnection) {
     return reply.status(503).send({
       error: 'Solana integration is not ready',
@@ -2200,7 +3305,7 @@ app.post('/jupiter/swap/submit', { config: { rateLimit: { max: 10, timeWindow: '
 
 const start = async () => {
   try {
-    await app.listen({ port, host: '0.0.0.0' });
+    await app.listen({ port, host: '::' });
   } catch (error) {
     app.log.error(error);
     process.exit(1);
@@ -2245,6 +3350,7 @@ app.get('/users/by-wallet/:wallet', async (request, reply) => {
         username: user.username,
         walletAddress: user.walletAddress,
         expiryDate: user.expiryDate,
+        maxWalletUsd: user.maxWalletUsd,
         duration: user.duration,
         gatedAccessEnrolledAt: user.gatedAccessEnrolledAt,
         licenseKeyRevealedAt: user.licenseKeyRevealedAt,
@@ -2530,7 +3636,6 @@ app.post('/sessions', { config: { rateLimit: { max: 5, timeWindow: '1 minute' } 
       error: 'Bot capacity is full',
       speedProfile: runtimeControl.speedProfile,
       concurrentCapacity: runtimeControl.profile.concurrentCapacity,
-      maxSolEntryUsd: runtimeControl.profile.maxSolEntryUsd,
       occupiedCapacity: occupiedCapacitySessions.length,
     });
   }
@@ -2561,6 +3666,8 @@ app.post('/sessions', { config: { rateLimit: { max: 5, timeWindow: '1 minute' } 
         targetDurationMinutes: req.targetDurationMinutes,
         autoRestart: false,
         stopLossBehavior: req.stopLossBehavior,
+        profitHandling: req.profitHandling,
+        stopDisposition: 'return_tokens',
       },
       serviceControl: {
         executionVenue: 'jupiter',
@@ -2568,36 +3675,42 @@ app.post('/sessions', { config: { rateLimit: { max: 5, timeWindow: '1 minute' } 
         platformFeeBps,
         strategyUniverse: [
           { key: 'momentum',       version: '1.0.0', enabled: true  },
-          { key: 'mean_reversion', version: '1.0.0', enabled: false },
-          { key: 'supertrend',     version: '1.0.0', enabled: false },
+          { key: 'mean_reversion', version: '1.0.0', enabled: true  },
+          { key: 'supertrend',     version: '1.0.0', enabled: true  },
         ],
         rotationState: {
           activeStrategy: 'momentum',
           queuedStrategy: 'momentum',
-          rotationIntervalMinutes: 60,
+          rotationIntervalMinutes: DEFAULT_ROTATION_INTERVAL_MINUTES,
           lastRotatedAt: null,
           lockedUntil: null,
         },
         schedulingState: {
           lastTradeAttemptedAt: null,
           lastTradeSubmittedAt: null,
+          lastDecisionAt: null,
+          lastDecisionOutcome: null,
+          lastDecisionReason: null,
+          lastBlockedAt: null,
+          lastBlockedReason: null,
+          blockedReasonCounts: {},
+          lastProfitTransferAt: null,
+          transferredProfitUsd: 0,
+          pendingProfitPayout: null,
+          recentStopLossLocks: {},
         },
-        positionState: {
-          status: 'flat',
-          entryPriceUsd: null,
-          entryAt: null,
-          quantityAtomic: null,
-          highWaterPriceUsd: null,
-          lastMarkedPriceUsd: null,
-          lastMarkedAt: null,
-          pendingExitReason: null,
-          exitReason: null,
+        strategyConfig: buildDefaultStrategyConfig(),
+        positionsState: {
+          activePositionMint: null,
+          positions: {},
         },
+        positionState: buildFlatSessionPositionState(),
       },
       riskLimits: req.riskLimits,
       funding: {
         fundingMint: req.fundingMint,
         fundingTokenSymbol: req.fundingTokenSymbol,
+        requestedFundingLamports: '0',
         startingBalanceAtomic: req.startingBalanceAtomic,
         currentBalanceAtomic: req.startingBalanceAtomic,
         realizedPnlUsd: 0,
@@ -2623,6 +3736,185 @@ app.post('/sessions', { config: { rateLimit: { max: 5, timeWindow: '1 minute' } 
     return reply.status(500).send({
       error: 'Failed to create session',
       details: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
+app.post('/sessions/:id/funding-quote', async (request, reply) => {
+  const id = asOptionalString((request.params as { id?: unknown }).id);
+  if (!id || !uuidPattern.test(id)) {
+    return reply.status(400).send({ error: 'id must be a UUID' });
+  }
+
+  const body = (request.body ?? {}) as FundingQuoteRequestBody;
+  const requestedUsd = asOptionalPositiveNumber(body.requestedUsd);
+  const requestedLamportsRaw = asOptionalIntString(body.requestedLamports);
+  const requestedFundingPct = asOptionalPositiveNumber(body.requestedFundingPct);
+
+  const requestedModeCount = [
+    requestedUsd !== undefined,
+    Boolean(requestedLamportsRaw),
+    requestedFundingPct !== undefined,
+  ].filter(Boolean).length;
+
+  if (requestedModeCount !== 1) {
+    return reply.status(400).send({ error: 'Provide exactly one of requestedUsd, requestedLamports, or requestedFundingPct' });
+  }
+
+  if (requestedFundingPct !== undefined && requestedFundingPct > 100) {
+    return reply.status(400).send({ error: 'requestedFundingPct must be greater than 0 and no more than 100' });
+  }
+
+  try {
+    const session = await getSessionById(id);
+    if (!session) {
+      return reply.status(404).send({ error: 'Session not found', id });
+    }
+
+    const access = await enforceUserAccess(reply, {
+      userId: session.userId,
+      ownerWallet: session.ownerWallet,
+      licenseId: session.licenseId,
+    });
+    if (!access.ok) {
+      return access.response;
+    }
+
+    if (session.status !== 'awaiting_funding') {
+      return reply.status(409).send({
+        error: 'Funding quote is only available while the session is awaiting funding',
+        sessionStatus: session.status,
+      });
+    }
+
+    const ownerPubkey = new PublicKey(session.ownerWallet);
+    const sessionPubkey = new PublicKey(session.sessionWallet);
+    const priceSample = await getPythFundingQuoteSample();
+    const { blockhash, lastValidBlockHeight } = await rlGetLatestBlockhash();
+    const feeProbeTransaction = new Transaction({
+      feePayer: ownerPubkey,
+      blockhash,
+      lastValidBlockHeight,
+    }).add(
+      SystemProgram.transfer({
+        fromPubkey: ownerPubkey,
+        toPubkey: sessionPubkey,
+        lamports: 1,
+      }),
+    );
+    const estimatedFeeLamports = (await rlGetFeeForMessage(feeProbeTransaction.compileMessage())).value ?? workerFundingThresholds.txFeeLamports;
+    const feeReserveLamports = Math.max(
+      estimatedFeeLamports + FUNDING_FEE_CUSHION_LAMPORTS,
+      FUNDING_FEE_CUSHION_LAMPORTS,
+    );
+    const rentReserveLamports = 0;
+    const ownerBalanceLamports = await rlGetBalance(ownerPubkey);
+    const maxSpendableLamports = Math.max(0, ownerBalanceLamports - feeReserveLamports - rentReserveLamports);
+    const maxWalletLamports = Math.floor((access.user.max_wallet_usd / priceSample.usdPrice) * LAMPORTS_PER_SOL);
+    const maxAllowedFundingLamports = Math.max(0, Math.min(maxSpendableLamports, maxWalletLamports));
+    const requestedLamports = requestedLamportsRaw
+      ? Number(requestedLamportsRaw)
+      : requestedFundingPct !== undefined
+        ? Math.floor(maxAllowedFundingLamports * (requestedFundingPct / 100))
+        : Math.floor(((requestedUsd ?? 0) / priceSample.usdPrice) * LAMPORTS_PER_SOL);
+
+    if (!Number.isFinite(requestedLamports) || requestedLamports <= 0) {
+      return reply.status(400).send({ error: 'Requested amount must resolve to at least 1 lamport' });
+    }
+
+    const requestedUsdValue = requestedLamportsRaw
+      ? Number((((requestedLamports / LAMPORTS_PER_SOL) * priceSample.usdPrice)).toFixed(6))
+      : Number((requestedUsd ?? 0).toFixed(6));
+
+    if (requestedUsdValue > access.user.max_wallet_usd) {
+      return reply.status(400).send({
+        error: 'Requested funding exceeds wallet cap',
+        requestedUsd: requestedUsdValue,
+        maxWalletUsd: access.user.max_wallet_usd,
+      });
+    }
+
+    if (requestedLamports < workerFundingThresholds.minimumTradeableLamports) {
+      return reply.status(400).send({
+        error: 'Requested funding is below the minimum funding threshold',
+        requestedLamports,
+        minimumFundingLamports: workerFundingThresholds.minimumTradeableLamports,
+        minimumFundingSol: Number((workerFundingThresholds.minimumTradeableLamports / LAMPORTS_PER_SOL).toFixed(6)),
+      });
+    }
+
+    const transaction = new Transaction({
+      feePayer: ownerPubkey,
+      blockhash,
+      lastValidBlockHeight,
+    }).add(
+      SystemProgram.transfer({
+        fromPubkey: ownerPubkey,
+        toPubkey: sessionPubkey,
+        lamports: requestedLamports,
+      }),
+    );
+
+    if (requestedLamports > maxSpendableLamports) {
+      return reply.status(400).send({
+        error: 'Requested funding exceeds available wallet balance after reserves',
+        ownerBalanceLamports,
+        feeReserveLamports,
+        rentReserveLamports,
+        maxSpendableLamports,
+        requestedLamports,
+      });
+    }
+
+    const updatedSession = await updateSessionExecutionOutcomeByWallet(session.sessionWallet, {
+      fundingPatch: {
+        requestedFundingLamports: String(requestedLamports),
+      },
+    });
+
+    return {
+      sessionId: session.id,
+      sessionWallet: session.sessionWallet,
+      ownerWallet: session.ownerWallet,
+      requestedLamports,
+      requestedSol: Number((requestedLamports / LAMPORTS_PER_SOL).toFixed(9)),
+      requestedUsd: requestedUsdValue,
+      requestedFundingPct: requestedFundingPct ?? null,
+      maxWalletUsd: access.user.max_wallet_usd,
+      minimumFundingLamports: workerFundingThresholds.minimumTradeableLamports,
+      minimumFundingSol: Number((workerFundingThresholds.minimumTradeableLamports / LAMPORTS_PER_SOL).toFixed(6)),
+      ownerBalanceLamports,
+      maxSpendableLamports,
+      maxAllowedFundingLamports,
+      feeReserveLamports,
+      rentReserveLamports,
+      solUsdPrice: priceSample.usdPrice,
+      priceSample: {
+        sampledAt: priceSample.sampledAt,
+        publishTime: priceSample.publishTime,
+        confidenceBps: priceSample.confidenceBps,
+      },
+      blockhash,
+      lastValidBlockHeight,
+      unsignedTransactionBase64: transaction.serialize({
+        requireAllSignatures: false,
+        verifySignatures: false,
+      }).toString('base64'),
+      persistedRequestedFundingLamports: updatedSession?.funding.requestedFundingLamports ?? String(requestedLamports),
+    };
+  } catch (error) {
+    const details = error instanceof Error ? error.message : String(error);
+    if (details.startsWith('stale_price_') || details.startsWith('confidence_too_wide_')) {
+      return reply.status(503).send({
+        error: 'Funding quote unavailable because the SOL/USD price feed is not healthy enough',
+        details,
+      });
+    }
+
+    app.log.error({ error, id }, 'failed to build funding quote');
+    return reply.status(500).send({
+      error: 'Failed to build funding quote',
+      details,
     });
   }
 });
@@ -2681,6 +3973,145 @@ app.get('/sessions/:id', async (request, reply) => {
   }
 });
 
+app.patch('/sessions/:id/strategy-controls', async (request, reply) => {
+  const id = asOptionalString((request.params as { id?: unknown }).id);
+  if (!id || !uuidPattern.test(id)) {
+    return reply.status(400).send({ error: 'id must be a UUID' });
+  }
+
+  try {
+    const session = await getSessionById(id);
+    if (!session) {
+      return reply.status(404).send({ error: 'Session not found', id });
+    }
+
+    const access = await enforceUserAccess(reply, {
+      userId: session.userId,
+      ownerWallet: session.ownerWallet,
+      licenseId: session.licenseId,
+    });
+    if (!access.ok) {
+      return access.response;
+    }
+
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    const enabledStrategiesRaw = Array.isArray(body.enabledStrategies)
+      ? body.enabledStrategies.filter((value): value is string => typeof value === 'string')
+      : undefined;
+    const activeStrategy = asOptionalString(body.activeStrategy);
+    const queuedStrategy = asOptionalString(body.queuedStrategy);
+    const rotationIntervalMinutes = asOptionalPositiveInt(body.rotationIntervalMinutes);
+    const autoRotationEnabled = asOptionalBoolean(body.autoRotationEnabled);
+
+    if (body.rotationIntervalMinutes !== undefined && rotationIntervalMinutes === undefined) {
+      return reply.status(400).send({ error: 'rotationIntervalMinutes must be a positive integer' });
+    }
+
+    if (activeStrategy && !strategyKeyValues.includes(activeStrategy as any)) {
+      return reply.status(400).send({ error: `activeStrategy must be one of ${strategyKeyValues.join(', ')}` });
+    }
+    if (queuedStrategy && !strategyKeyValues.includes(queuedStrategy as any)) {
+      return reply.status(400).send({ error: `queuedStrategy must be one of ${strategyKeyValues.join(', ')}` });
+    }
+
+    if (enabledStrategiesRaw) {
+      const invalid = enabledStrategiesRaw.filter((value) => !strategyKeyValues.includes(value as any));
+      if (invalid.length > 0) {
+        return reply.status(400).send({ error: `enabledStrategies contains invalid keys: ${invalid.join(', ')}` });
+      }
+    }
+
+    const currentUniverse = session.serviceControl.strategyUniverse;
+    const nextEnabledSet = enabledStrategiesRaw
+      ? new Set(enabledStrategiesRaw)
+      : new Set(currentUniverse.filter((strategy) => strategy.enabled).map((strategy) => strategy.key));
+
+    const nextStrategyUniverse = currentUniverse.map((strategy) => ({
+      ...strategy,
+      enabled: nextEnabledSet.has(strategy.key),
+    })) as typeof currentUniverse;
+
+    if (!nextStrategyUniverse.some((strategy) => strategy.enabled)) {
+      return reply.status(400).send({ error: 'At least one strategy must remain enabled' });
+    }
+
+    const nextActiveStrategy = activeStrategy ?? session.serviceControl.rotationState.activeStrategy;
+    const nextQueuedStrategy = queuedStrategy ?? session.serviceControl.rotationState.queuedStrategy;
+
+    if (!nextStrategyUniverse.some((strategy) => strategy.key === nextActiveStrategy && strategy.enabled)) {
+      return reply.status(400).send({ error: 'activeStrategy must be enabled' });
+    }
+    if (!nextStrategyUniverse.some((strategy) => strategy.key === nextQueuedStrategy && strategy.enabled)) {
+      return reply.status(400).send({ error: 'queuedStrategy must be enabled' });
+    }
+
+    const momentumPatch = (body.momentum ?? {}) as Record<string, unknown>;
+    const meanReversionPatch = (body.meanReversion ?? {}) as Record<string, unknown>;
+    const supertrendPatch = (body.supertrend ?? {}) as Record<string, unknown>;
+
+    const defaultStrategyConfig = buildDefaultStrategyConfig();
+    const currentStrategyConfig = session.serviceControl.strategyConfig ?? defaultStrategyConfig;
+    const nextStrategyConfig = {
+      autoRotationEnabled: autoRotationEnabled ?? currentStrategyConfig.autoRotationEnabled,
+      momentum: {
+        lookbackSamples: asOptionalPositiveInt(momentumPatch.lookbackSamples)
+          ?? currentStrategyConfig.momentum.lookbackSamples,
+        thresholdBps: asOptionalPositiveInt(momentumPatch.thresholdBps)
+          ?? currentStrategyConfig.momentum.thresholdBps,
+        edgeSafetyBufferBps: asOptionalNonNegativeNumber(momentumPatch.edgeSafetyBufferBps)
+          ?? currentStrategyConfig.momentum.edgeSafetyBufferBps,
+      },
+      meanReversion: {
+        length: asOptionalPositiveInt(meanReversionPatch.length)
+          ?? currentStrategyConfig.meanReversion.length,
+        stdMultiplier: asOptionalNonNegativeNumber(meanReversionPatch.stdMultiplier)
+          ?? currentStrategyConfig.meanReversion.stdMultiplier,
+        minBandWidthFraction: asOptionalNonNegativeNumber(meanReversionPatch.minBandWidthFraction)
+          ?? currentStrategyConfig.meanReversion.minBandWidthFraction,
+        entryThreshold: asOptionalNumber(meanReversionPatch.entryThreshold)
+          ?? currentStrategyConfig.meanReversion.entryThreshold,
+        exitThreshold: asOptionalNumber(meanReversionPatch.exitThreshold)
+          ?? currentStrategyConfig.meanReversion.exitThreshold,
+      },
+      supertrend: {
+        candleSamples: asOptionalPositiveInt(supertrendPatch.candleSamples)
+          ?? currentStrategyConfig.supertrend.candleSamples,
+        atrPeriod: asOptionalPositiveInt(supertrendPatch.atrPeriod)
+          ?? currentStrategyConfig.supertrend.atrPeriod,
+        multiplier: asOptionalNonNegativeNumber(supertrendPatch.multiplier)
+          ?? currentStrategyConfig.supertrend.multiplier,
+      },
+    };
+
+    const updatedSession = await updateSessionServiceControlByWallet(session.sessionWallet, {
+      strategyUniverse: nextStrategyUniverse,
+      strategyConfig: nextStrategyConfig,
+      rotationState: {
+        activeStrategy: nextActiveStrategy as any,
+        queuedStrategy: nextQueuedStrategy as any,
+        rotationIntervalMinutes: rotationIntervalMinutes ?? session.serviceControl.rotationState.rotationIntervalMinutes,
+        lastRotatedAt: session.serviceControl.rotationState.lastRotatedAt,
+        lockedUntil: session.serviceControl.rotationState.lockedUntil,
+      },
+    });
+
+    if (!updatedSession) {
+      return reply.status(404).send({ error: 'Session not found after update', id });
+    }
+
+    return {
+      session: updatedSession,
+      updatedAt: new Date().toISOString(),
+    };
+  } catch (error) {
+    app.log.error({ error, id }, 'failed to patch strategy controls');
+    return reply.status(500).send({
+      error: 'Failed to patch strategy controls',
+      details: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
 app.get('/sessions/performance', async (request, reply) => {
   const query = request.query as Record<string, string | undefined>;
   const userId = asOptionalString(query.userId);
@@ -2736,6 +4167,29 @@ app.patch('/sessions/:id/action', async (request, reply) => {
     });
   }
 
+  const profitMode = asOptionalProfitMode(body.profitMode);
+  const profitPayoutToken = asOptionalProfitPayoutToken(body.profitPayoutToken);
+
+  if (body.profitMode !== undefined && profitMode === undefined) {
+    return reply.status(400).send({ error: 'profitMode must be one of: send_to_owner, compound' });
+  }
+
+  if (body.profitPayoutToken !== undefined && profitPayoutToken === undefined) {
+    return reply.status(400).send({ error: 'profitPayoutToken must be one of: SOL, USDC' });
+  }
+
+  if (action === 'start' && (!profitMode || !profitPayoutToken)) {
+    return reply.status(400).send({
+      error: 'start requires explicit profitMode and profitPayoutToken selection',
+    });
+  }
+
+  const stopDisposition = asOptionalStopDisposition(body.stopDisposition);
+
+  if (body.stopDisposition !== undefined && stopDisposition === undefined) {
+    return reply.status(400).send({ error: 'stopDisposition must be one of: return_tokens, liquidate' });
+  }
+
   try {
     const session = await getSessionById(id);
     if (!session) return reply.status(404).send({ error: 'Session not found', id });
@@ -2758,10 +4212,26 @@ app.patch('/sessions/:id/action', async (request, reply) => {
     };
 
     const t = transitions[action];
+    const nextUserControl = action === 'start'
+      ? {
+          ...session.userControl,
+          profitHandling: {
+            mode: profitMode ?? session.userControl.profitHandling.mode,
+            payoutToken: profitPayoutToken ?? session.userControl.profitHandling.payoutToken,
+          },
+        }
+      : action === 'stop'
+        ? {
+            ...session.userControl,
+            stopDisposition: stopDisposition ?? session.userControl.stopDisposition ?? 'return_tokens',
+          }
+        : undefined;
+
     const updated = await updateSessionStatus(id, t.next, {
       startedAt: t.startedAt,
       endedAt:   t.endedAt,
       stopReason: t.stopReason,
+      userControl: nextUserControl,
     });
 
     return { session: updated, action, appliedAt: now };

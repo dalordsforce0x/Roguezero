@@ -7,9 +7,9 @@ const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 const EPSILON_USD = 0.000001;
 
-const databaseUrl = process.env.DATABASE_PRIVATE_URL || process.env.DATABASE_URL;
+const databaseUrl = process.env.DATABASE_PRIVATE_URL?.trim();
 if (!databaseUrl) {
-  throw new Error('DATABASE_PRIVATE_URL or DATABASE_URL is required');
+  throw new Error('DATABASE_PRIVATE_URL is required');
 }
 
 const parsed = new URL(databaseUrl);

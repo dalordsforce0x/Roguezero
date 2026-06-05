@@ -91,6 +91,7 @@ type PerformanceSummaryRow = {
   submitted_executions: string;
   prepared_executions: string;
   failed_executions: string;
+  cancelled_executions: string;
   last_execution_at: Date | null;
 };
 
@@ -103,6 +104,7 @@ type RecentActivityRow = {
   execution_id: string | null;
   signature: string | null;
   amount: string | null;
+  reason: string | null;
 };
 
 type LatestSessionInsightRow = {
@@ -206,6 +208,7 @@ export type UserPerformanceSnapshot = {
     submittedExecutions: number;
     preparedExecutions: number;
     failedExecutions: number;
+    cancelledExecutions: number;
     totalRealizedPnlUsd: number;
     confirmedRealizedPnlUsd: number;
     confirmedRealizedPnlTodayUsd: number;
@@ -225,6 +228,7 @@ export type UserPerformanceSnapshot = {
     executionId: string | null;
     signature: string | null;
     amount: string | null;
+    reason: string | null;
   }>;
   latestSessionInsights: Array<{
     sessionId: string;
@@ -255,6 +259,7 @@ const DATABASE_LOCK_TIMEOUT_MS = Number(process.env.DATABASE_LOCK_TIMEOUT_MS ?? 
 const DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS = Number(process.env.DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS ?? 10000);
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+const USDT_MINT = 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB';
 
 const { Pool } = pg;
 let pool: pg.Pool | null = null;
@@ -297,7 +302,7 @@ const getUsdValueFromAtomicAmount = (mint: string, amountAtomic: number, solUsdP
     return 0;
   }
 
-  if (mint === USDC_MINT) {
+  if (mint === USDC_MINT || mint === USDT_MINT) {
     return amountAtomic / 1_000_000;
   }
 
@@ -306,6 +311,32 @@ const getUsdValueFromAtomicAmount = (mint: string, amountAtomic: number, solUsdP
   }
 
   return 0;
+};
+
+const getFeeMintForSymbol = (feeTokenSymbol: TradeMetricExecutionRow['fee_token_symbol']) => {
+  if (feeTokenSymbol === 'USDC') return USDC_MINT;
+  if (feeTokenSymbol === 'USDT') return USDT_MINT;
+  return SOL_MINT;
+};
+
+const getQuotedSolUsdPrice = (row: TradeMetricExecutionRow): number | null => {
+  const buildResponse = row.build_response as { outAmount?: unknown; inAmount?: unknown } | null;
+  const inputAtomic = Number(buildResponse?.inAmount ?? row.amount);
+  const outputAtomic = Number(buildResponse?.outAmount ?? NaN);
+
+  if (!Number.isFinite(inputAtomic) || !Number.isFinite(outputAtomic) || inputAtomic <= 0 || outputAtomic <= 0) {
+    return null;
+  }
+
+  if (row.input_mint === SOL_MINT && row.output_mint === USDC_MINT) {
+    return (outputAtomic / 1_000_000) / (inputAtomic / 1_000_000_000);
+  }
+
+  if (row.input_mint === USDC_MINT && row.output_mint === SOL_MINT) {
+    return (inputAtomic / 1_000_000) / (outputAtomic / 1_000_000_000);
+  }
+
+  return null;
 };
 
 const getConfirmationAccountKeys = (confirmation: Record<string, unknown> | null) => {
@@ -519,12 +550,16 @@ const buildTradeAnalytics = (
     sessionHistory.confirmedExecutions += 1;
     sessionHistory.lastConfirmedExecutionAt = confirmedAt;
 
-    const feeMint = row.output_mint === SOL_MINT ? row.input_mint : row.output_mint;
+    const feeMint = getFeeMintForSymbol(row.fee_token_symbol);
     const feeAccountDeltaAtomic = Math.max(0, getConfirmationTokenBalanceDeltaAtomic(row.confirmation, {
       mint: feeMint,
       accountAddress: row.fee_account,
     }) ?? 0);
-    sessionHistory.confirmedCapturedFeesUsd += getUsdValueFromAtomicAmount(feeMint, feeAccountDeltaAtomic);
+    sessionHistory.confirmedCapturedFeesUsd += getUsdValueFromAtomicAmount(
+      feeMint,
+      feeAccountDeltaAtomic,
+      feeMint === SOL_MINT ? getQuotedSolUsdPrice(row) : null,
+    );
 
     if (row.input_mint === USDC_MINT && row.output_mint === SOL_MINT) {
       const usdcDeltaAtomic = getConfirmationTokenBalanceDeltaAtomic(row.confirmation, {
@@ -893,6 +928,7 @@ export const updateSessionStatus = async (
     startedAt?: string | null;
     endedAt?: string | null;
     stopReason?: string | null;
+    userControl?: Record<string, unknown>;
     serviceControl?: Record<string, unknown>;
     funding?: Record<string, unknown>;
   } = {},
@@ -914,6 +950,10 @@ export const updateSessionStatus = async (
   if (opts.stopReason !== undefined) {
     values.push(opts.stopReason);
     setClauses.push(`stop_reason = $${values.length}`);
+  }
+  if (opts.userControl !== undefined) {
+    values.push(JSON.stringify(opts.userControl));
+    setClauses.push(`user_control = $${values.length}::jsonb`);
   }
   if (opts.serviceControl !== undefined) {
     values.push(JSON.stringify(opts.serviceControl));
@@ -1140,13 +1180,42 @@ export type RzUserRow = {
   license_key: string | null;
   expiry_date: string | null;
   access_enabled: boolean;
+  max_wallet_usd: number;
   duration: string | null;
 };
 
+let rzUsersColumnsReadyPromise: Promise<void> | null = null;
+
+const ensureRzUsersColumnsReady = async () => {
+  const dbPool = getPool();
+  if (!rzUsersColumnsReadyPromise) {
+    rzUsersColumnsReadyPromise = dbPool.query(`
+      DO $$
+      BEGIN
+        IF EXISTS (
+          SELECT 1
+            FROM information_schema.tables
+           WHERE table_schema = 'public'
+             AND table_name = 'rz_users'
+        ) THEN
+          ALTER TABLE rz_users
+            ADD COLUMN IF NOT EXISTS max_wallet_usd INTEGER NOT NULL DEFAULT 10000;
+        END IF;
+      END
+      $$;
+    `).then(() => undefined);
+  }
+
+  return rzUsersColumnsReadyPromise;
+};
+
 export const getUserByWallet = async (walletAddress: string): Promise<RzUserRow | null> => {
+  await ensureRzUsersColumnsReady();
   const dbPool = getPool();
   const result = await dbPool.query<RzUserRow>(
-    `SELECT id, username, wallet_address, license_key, expiry_date, access_enabled, duration
+    `SELECT id, username, wallet_address, license_key, expiry_date, access_enabled,
+            COALESCE(max_wallet_usd, 10000)::integer AS max_wallet_usd,
+            duration
        FROM rz_users
       WHERE wallet_address = $1
       LIMIT 1`,
@@ -1157,9 +1226,12 @@ export const getUserByWallet = async (walletAddress: string): Promise<RzUserRow 
 };
 
 export const getUserById = async (userId: string): Promise<RzUserRow | null> => {
+  await ensureRzUsersColumnsReady();
   const dbPool = getPool();
   const result = await dbPool.query<RzUserRow>(
-    `SELECT id, username, wallet_address, license_key, expiry_date, access_enabled, duration
+    `SELECT id, username, wallet_address, license_key, expiry_date, access_enabled,
+            COALESCE(max_wallet_usd, 10000)::integer AS max_wallet_usd,
+            duration
        FROM rz_users
       WHERE id = $1
       LIMIT 1`,
@@ -1170,9 +1242,12 @@ export const getUserById = async (userId: string): Promise<RzUserRow | null> => 
 };
 
 export const getUserByLicenseKey = async (licenseKey: string): Promise<RzUserRow | null> => {
+  await ensureRzUsersColumnsReady();
   const dbPool = getPool();
   const result = await dbPool.query<RzUserRow>(
-    `SELECT id, username, wallet_address, license_key, expiry_date, access_enabled, duration
+    `SELECT id, username, wallet_address, license_key, expiry_date, access_enabled,
+            COALESCE(max_wallet_usd, 10000)::integer AS max_wallet_usd,
+            duration
        FROM rz_users
       WHERE license_key = $1
       LIMIT 1`,
@@ -1264,7 +1339,10 @@ export const getUserPerformanceSnapshot = async (
          COUNT(*) FILTER (WHERE status IN ('ready', 'starting'))::bigint AS ready_or_starting_sessions,
          COUNT(*) FILTER (
            WHERE status = 'active'
-             AND COALESCE(service_control->'positionState'->>'status', 'flat') = 'long_sol'
+             AND (
+               COALESCE(service_control->'positionsState'->'positions', '{}'::jsonb) <> '{}'::jsonb
+               OR COALESCE(service_control->'positionState'->>'status', 'flat') IN ('long', 'long_sol')
+             )
          )::bigint AS long_sol_sessions,
          COALESCE(SUM((funding->>'realizedPnlUsd')::numeric), 0)::text AS total_realized_pnl_usd,
          COALESCE(SUM((funding->>'capturedFeesUsd')::numeric), 0)::text AS total_captured_fees_usd,
@@ -1278,7 +1356,8 @@ export const getUserPerformanceSnapshot = async (
          COUNT(*) FILTER (WHERE e.status = 'confirmed')::bigint AS confirmed_executions,
          COUNT(*) FILTER (WHERE e.status = 'submitted')::bigint AS submitted_executions,
          COUNT(*) FILTER (WHERE e.status = 'prepared')::bigint AS prepared_executions,
-         COUNT(*) FILTER (WHERE e.status = 'failed')::bigint AS failed_executions,
+         COUNT(*) FILTER (WHERE e.status = 'failed' AND COALESCE(e.last_error->>'stage', '') <> 'worker_cancel')::bigint AS failed_executions,
+         COUNT(*) FILTER (WHERE e.status = 'failed' AND e.last_error->>'stage' = 'worker_cancel')::bigint AS cancelled_executions,
          MAX(COALESCE(e.confirmed_at, e.submitted_at, e.prepared_at)) AS last_execution_at
        FROM swap_executions e
        INNER JOIN matched_sessions s
@@ -1300,6 +1379,7 @@ export const getUserPerformanceSnapshot = async (
        COALESCE(execution_rollup.submitted_executions, 0)::text AS submitted_executions,
        COALESCE(execution_rollup.prepared_executions, 0)::text AS prepared_executions,
        COALESCE(execution_rollup.failed_executions, 0)::text AS failed_executions,
+       COALESCE(execution_rollup.cancelled_executions, 0)::text AS cancelled_executions,
        execution_rollup.last_execution_at
      FROM session_rollup
      CROSS JOIN execution_rollup`,
@@ -1322,7 +1402,8 @@ export const getUserPerformanceSnapshot = async (
            status,
            NULL::uuid AS execution_id,
            NULL::text AS signature,
-           NULL::text AS amount
+           NULL::text AS amount,
+           NULL::text AS reason
          FROM matched_sessions
 
          UNION ALL
@@ -1335,7 +1416,8 @@ export const getUserPerformanceSnapshot = async (
            status,
            NULL::uuid AS execution_id,
            NULL::text AS signature,
-           NULL::text AS amount
+           NULL::text AS amount,
+           NULL::text AS reason
          FROM matched_sessions
          WHERE started_at IS NOT NULL
 
@@ -1349,7 +1431,8 @@ export const getUserPerformanceSnapshot = async (
            status,
            NULL::uuid AS execution_id,
            NULL::text AS signature,
-           NULL::text AS amount
+           NULL::text AS amount,
+           NULL::text AS reason
          FROM matched_sessions
          WHERE ended_at IS NOT NULL
 
@@ -1357,10 +1440,11 @@ export const getUserPerformanceSnapshot = async (
 
          SELECT
            COALESCE(e.confirmed_at, e.submitted_at, e.prepared_at) AS at,
-           CASE e.status
-             WHEN 'confirmed' THEN 'swap_confirmed'
-             WHEN 'submitted' THEN 'swap_submitted'
-             WHEN 'prepared' THEN 'swap_prepared'
+           CASE
+             WHEN e.status = 'confirmed' THEN 'swap_confirmed'
+             WHEN e.status = 'submitted' THEN 'swap_submitted'
+             WHEN e.status = 'prepared' THEN 'swap_prepared'
+             WHEN e.status = 'failed' AND e.last_error->>'stage' = 'worker_cancel' THEN 'swap_skipped'
              ELSE 'swap_failed'
            END AS kind,
            s.id AS session_id,
@@ -1368,7 +1452,8 @@ export const getUserPerformanceSnapshot = async (
            e.status,
            e.id AS execution_id,
            e.signature,
-           e.amount
+           e.amount,
+           e.last_error->>'reason' AS reason
          FROM swap_executions e
          INNER JOIN matched_sessions s
                  ON s.session_wallet = e.taker
@@ -1463,6 +1548,7 @@ export const getUserPerformanceSnapshot = async (
     submitted_executions: '0',
     prepared_executions: '0',
     failed_executions: '0',
+    cancelled_executions: '0',
     last_execution_at: null,
   };
   const tradeAnalytics = buildTradeAnalytics(matchedSessionsResult.rows, tradeMetricResult.rows);
@@ -1490,6 +1576,7 @@ export const getUserPerformanceSnapshot = async (
       confirmedExecutions: parseCount(summary.confirmed_executions),
       submittedExecutions: parseCount(summary.submitted_executions),
       preparedExecutions: parseCount(summary.prepared_executions),
+      cancelledExecutions: parseCount(summary.cancelled_executions),
       failedExecutions: parseCount(summary.failed_executions),
       totalRealizedPnlUsd,
       confirmedRealizedPnlUsd,
@@ -1510,6 +1597,7 @@ export const getUserPerformanceSnapshot = async (
       executionId: row.execution_id,
       signature: row.signature,
       amount: row.amount,
+      reason: row.reason,
     })),
     latestSessionInsights: latestInsightResult.rows.map((row) => ({
       sessionId: row.session_id,

@@ -1,6 +1,7 @@
 'use client';
 
 import { useMemo } from 'react';
+import { clusterApiUrl } from '@solana/web3.js';
 import { ConnectionProvider, WalletProvider } from '@solana/wallet-adapter-react';
 import { WalletModalProvider } from '@solana/wallet-adapter-react-ui';
 import {
@@ -12,12 +13,17 @@ import {
 import { WalletError } from '@solana/wallet-adapter-base';
 import '@solana/wallet-adapter-react-ui/styles.css';
 
-const HELIUS_RPC = process.env.NEXT_PUBLIC_HELIUS_RPC_URL;
+const SOLANA_NETWORK = process.env.NEXT_PUBLIC_SOLANA_NETWORK === 'devnet'
+  ? 'devnet'
+  : process.env.NEXT_PUBLIC_SOLANA_NETWORK === 'testnet'
+    ? 'testnet'
+    : 'mainnet-beta';
+
+const PUBLIC_RPC_ENDPOINT = process.env.NEXT_PUBLIC_SOLANA_RPC_URL
+  ?? process.env.NEXT_PUBLIC_HELIUS_RPC_URL
+  ?? clusterApiUrl(SOLANA_NETWORK);
 
 export function RZWalletProvider({ children }: { children: React.ReactNode }) {
-  if (!HELIUS_RPC) {
-    throw new Error('NEXT_PUBLIC_HELIUS_RPC_URL must be set on the web service');
-  }
   const wallets = useMemo(
     () => [
       new PhantomWalletAdapter(),
@@ -33,7 +39,7 @@ export function RZWalletProvider({ children }: { children: React.ReactNode }) {
   };
 
   return (
-    <ConnectionProvider endpoint={HELIUS_RPC}>
+    <ConnectionProvider endpoint={PUBLIC_RPC_ENDPOINT}>
       <WalletProvider wallets={wallets} autoConnect onError={onError}>
         <WalletModalProvider>{children}</WalletModalProvider>
       </WalletProvider>

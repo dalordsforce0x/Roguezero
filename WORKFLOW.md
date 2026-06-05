@@ -39,17 +39,16 @@ User: approve before implementation, confirm after
 
 ### Jupiter
 - **1 account, 3 API keys** — all share ONE rate limit bucket
-- Developer plan: **10 RPS general** (all `/order`, `/build`, price, tokens, etc.)
-- `/swap/v2/execute` dedicated bucket: **100 RPS**
-- `/tx/v1/submit` dedicated bucket: **100 RPS**
+- Pro plan (yearly): **150 RPS general** (all `/order`, `/build`, price, tokens, etc.), 6B credits/year
 - Rotating keys does NOT increase throughput
-- Safe operating target: **≤8 RPS general**, leave headroom for retries
+- Fleet operating target: **135 RPS general (90% of cap)**, leaves 10% headroom for retries
 
 ### Helius
 - **1 account, 5 API keys** — all share ONE rate limit bucket
-- Developer plan: **50 RPS RPC**, 10 RPS DAS, 10M credits/mo
+- Business plan: **200 RPS RPC**, 50 sendTransaction/sec, 50 DAS RPS, 100M credits/mo
 - Rotating keys does NOT increase throughput
-- Safe operating target: **≤40 RPS RPC**
+- Fleet operating targets: **180 RPS RPC (90%)**, **45 sendTransaction/sec (90%)**
+- Buckets are DB-backed and shared fleet-wide across worker + API; the worker auto-shifts Surge/Pulse/Glide to stay under 90% of the binding lane (Helius RPC)
 
 ### Jupiter API Paths
 | Path | Endpoints | Fee Model | Routing |
@@ -121,7 +120,7 @@ Checklist:
 - [x] Global rate limiter implemented in worker (shared token buckets for Jupiter general and Helius RPC)
 - [x] Session requests queued through shared limiter — not firing independently
 - [x] Poll interval replaced with event-driven or adaptive scheduling
-- [x] Helius RPC calls rate-governed similarly (≤40 RPS target)
+- [x] Helius RPC calls rate-governed similarly (180 RPS fleet target, 90% of cap)
 - [x] 429 handling: exponential backoff, not tight retry loops
 - [x] Test: 10 concurrent sessions running for 60s — no visible 429s, all sessions made progress, and all stop flows returned funds home
 

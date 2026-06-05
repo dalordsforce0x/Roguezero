@@ -1,0 +1,11 @@
+﻿import "dotenv/config";
+import pg from "pg";
+const u = new URL(process.env.DATABASE_PRIVATE_URL.trim());
+u.searchParams.delete("sslmode");
+const pool = new pg.Pool({ connectionString: u.toString(), ssl: { rejectUnauthorized: false } });
+const sid = "3951496c-5459-4298-8369-fb873e2ef613";
+const iso = new Date().toISOString();
+await pool.query(`update sessions set service_control = jsonb_set(service_control, '{riskState,lastLossAt}', to_jsonb($2::text), true) where id=$1`, [sid, iso]);
+const r = await pool.query(`select service_control->'riskState' as risk from sessions where id=$1`, [sid]);
+console.log(JSON.stringify(r.rows[0].risk, null, 2));
+await pool.end();
