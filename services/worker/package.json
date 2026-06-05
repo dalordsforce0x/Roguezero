@@ -8,7 +8,7 @@
     "dev": "tsx watch src/index.ts",
     "prebuild": "npm run build --workspace @roguezero/session-schema && npm run build --workspace @roguezero/runtime-config && npm run build --workspace @roguezero/provider-governor",
     "build": "tsc -p tsconfig.json",
-    "start": "node dist/index.js",
+    "start": "exec node dist/index.js",
     "lint": "echo \"Worker lint not configured yet\"",
     "test": "node --import tsx --test src/**/*.test.ts"
   },

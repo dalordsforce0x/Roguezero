@@ -1427,6 +1427,21 @@ const getBuildBlockhash = (build: JupiterBuildResponse) => {
   throw new Error('Jupiter build response returned an invalid blockhash format');
 };
 
+// Platform fee is charged ONLY on profit-taking exits (take_profit / trailing_stop),
+// which by design fire above the cost floor. Entries, stop-losses, and signal
+// reversals are fee-free so users never pay the platform fee on an entry or a loss.
+const PROFIT_EXIT_FEE_REASONS = new Set(['take_profit', 'trailing_stop']);
+
+const resolveEffectivePlatformFeeBps = (
+  request: ValidatedJupiterBuildRequest,
+  basePlatformFeeBps: number,
+): number => {
+  if (request.exitReason && PROFIT_EXIT_FEE_REASONS.has(request.exitReason)) {
+    return basePlatformFeeBps;
+  }
+  return 0;
+};
+
 const fetchJupiterBuild = async (
   request: ValidatedJupiterBuildRequest,
   feeAccount: string,
@@ -1441,14 +1456,22 @@ const fetchJupiterBuild = async (
     ...routeControlsOverride,
   };
 
+  const effectivePlatformFeeBps = resolveEffectivePlatformFeeBps(
+    request,
+    jupiterSwapBuildConfig.platformFeeBps,
+  );
+
   const params = new URLSearchParams({
     inputMint: request.inputMint,
     outputMint: request.outputMint,
     amount: request.amount,
     taker: request.taker,
-    platformFeeBps: String(jupiterSwapBuildConfig.platformFeeBps),
-    feeAccount,
   });
+
+  if (effectivePlatformFeeBps > 0) {
+    params.set('platformFeeBps', String(effectivePlatformFeeBps));
+    params.set('feeAccount', feeAccount);
+  }
 
   if (request.slippageBps) {
     params.set('slippageBps', request.slippageBps);
@@ -2760,6 +2783,7 @@ app.post('/jupiter/swap/build', async (request, reply) => {
 
   const { feeTokenSymbol } = parsed.value;
   const feeAccount = jupiterSwapBuildConfig.getFeeAccountForToken(feeTokenSymbol);
+  const effectivePlatformFeeBps = resolveEffectivePlatformFeeBps(parsed.value, jupiterSwapBuildConfig.platformFeeBps);
 
   const result = await fetchJupiterBuild(parsed.value, feeAccount);
 
@@ -2768,7 +2792,7 @@ app.post('/jupiter/swap/build', async (request, reply) => {
       error: 'Jupiter /build request failed',
       feeTokenSymbol,
       feeAccount,
-      platformFeeBps: jupiterSwapBuildConfig.platformFeeBps,
+      platformFeeBps: effectivePlatformFeeBps,
       upstream: result.payload,
     });
   }
@@ -2777,7 +2801,7 @@ app.post('/jupiter/swap/build', async (request, reply) => {
     swapPath: '/build',
     feeTokenSymbol,
     feeAccount,
-    platformFeeBps: jupiterSwapBuildConfig.platformFeeBps,
+    platformFeeBps: effectivePlatformFeeBps,
     build: result.payload,
   };
 });
@@ -2798,6 +2822,7 @@ app.post('/jupiter/swap/prepare', { config: { rateLimit: { max: INTERNAL_SWAP_PR
 
   const { taker, feeTokenSymbol } = parsed.value;
   const feeAccount = jupiterSwapBuildConfig.getFeeAccountForToken(feeTokenSymbol);
+  const effectivePlatformFeeBps = resolveEffectivePlatformFeeBps(parsed.value, jupiterSwapBuildConfig.platformFeeBps);
   const activeExecution = await getActiveExecutionByTaker(taker);
 
   if (activeExecution) {
@@ -2820,7 +2845,7 @@ app.post('/jupiter/swap/prepare', { config: { rateLimit: { max: INTERNAL_SWAP_PR
       error: 'Jupiter /build request failed',
       feeTokenSymbol,
       feeAccount,
-      platformFeeBps: jupiterSwapBuildConfig.platformFeeBps,
+      platformFeeBps: effectivePlatformFeeBps,
       upstream: buildResult.payload,
     });
   }
@@ -2922,7 +2947,7 @@ app.post('/jupiter/swap/prepare', { config: { rateLimit: { max: INTERNAL_SWAP_PR
       taker: parsed.value.taker,
       feeTokenSymbol,
       feeAccount,
-      platformFeeBps: jupiterSwapBuildConfig.platformFeeBps,
+      platformFeeBps: effectivePlatformFeeBps,
       blockhash,
       lastValidBlockHeight: build.blockhashWithMetadata.lastValidBlockHeight ?? null,
       recommendedComputeUnitLimit,
@@ -2981,7 +3006,7 @@ app.post('/jupiter/swap/prepare', { config: { rateLimit: { max: INTERNAL_SWAP_PR
       swapPath: '/build',
       feeTokenSymbol,
       feeAccount,
-      platformFeeBps: jupiterSwapBuildConfig.platformFeeBps,
+      platformFeeBps: effectivePlatformFeeBps,
       quote: {
         inAmount: String((build as Record<string, unknown>).inAmount ?? parsed.value.amount),
         outAmount: String((build as Record<string, unknown>).outAmount ?? '0'),
@@ -3014,7 +3039,7 @@ app.post('/jupiter/swap/prepare', { config: { rateLimit: { max: INTERNAL_SWAP_PR
     swapPath: '/build',
     feeTokenSymbol,
     feeAccount,
-    platformFeeBps: jupiterSwapBuildConfig.platformFeeBps,
+    platformFeeBps: effectivePlatformFeeBps,
     quote: {
       inAmount: String((build as Record<string, unknown>).inAmount ?? parsed.value.amount),
       outAmount: String((build as Record<string, unknown>).outAmount ?? '0'),

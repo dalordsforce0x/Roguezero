@@ -914,6 +914,10 @@ export default function Home() {
   const lastCelebratedProfitTransferKeyRef = useRef<string | null>(null);
   const celebrationInitializedRef = useRef(false);
   const profitCelebrationTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Sessions the user just funded and that are awaiting the profit-mode prompt
+  // once the worker flips them to `ready`. This is the safety net so the prompt
+  // still appears even if the inline funding poll window expires first.
+  const awaitingProfitModeSessionIdsRef = useRef<Set<string>>(new Set());
 
   const refreshAccessGate = useCallback(async () => {
     try {
@@ -1180,6 +1184,24 @@ export default function Home() {
     };
   }, [auth, fetchPerformance, fetchSessions]);
 
+  // Safety net: if a just-funded session reaches `ready` after the inline
+  // funding poll window has expired, the background poll picks it up here and
+  // still pops the profit-mode prompt so the user is never stuck on a funded
+  // session with no way to proceed.
+  useEffect(() => {
+    if (awaitingProfitModeSessionIdsRef.current.size === 0) return;
+    if (showProfitModeModal) return;
+    const readySession = sessions.find(
+      (item) => awaitingProfitModeSessionIdsRef.current.has(item.id) && item.status === 'ready',
+    );
+    if (!readySession) return;
+    awaitingProfitModeSessionIdsRef.current.delete(readySession.id);
+    setDismissedProfitModeSessionId(null);
+    setProfitModeChoice(readySession.userControl?.profitHandling?.mode ?? 'send_to_owner');
+    setProfitPayoutTokenChoice(readySession.userControl?.profitHandling?.payoutToken ?? 'USDC');
+    setShowProfitModeModal(true);
+  }, [sessions, showProfitModeModal]);
+
   const sessionHistoryForSelection = performance?.sessionHistory ?? [];
   const [prevPerformanceSnapshot, setPrevPerformanceSnapshot] = useState(performance);
   if (performance !== prevPerformanceSnapshot) {
@@ -1265,21 +1287,41 @@ export default function Home() {
 
       const transaction = Transaction.from(Buffer.from(quote.unsignedTransactionBase64, 'base64'));
 
+      // The server bakes a blockhash into the quote, but it can expire while the
+      // wallet popup waits for the user to approve. Refresh it right before
+      // signing so a slow approval no longer fails with an expired blockhash.
+      let confirmBlockhash = quote.blockhash;
+      let confirmLastValidBlockHeight = quote.lastValidBlockHeight;
+      try {
+        const fresh = await connection.getLatestBlockhash('confirmed');
+        transaction.recentBlockhash = fresh.blockhash;
+        transaction.feePayer = publicKey;
+        confirmBlockhash = fresh.blockhash;
+        confirmLastValidBlockHeight = fresh.lastValidBlockHeight;
+      } catch {
+        // Fall back to the server-provided blockhash if the refresh fails.
+      }
+
       const signature = await sendTransaction(transaction, connection, {
         preflightCommitment: 'confirmed',
       });
 
       await connection.confirmTransaction({
         signature,
-        blockhash: quote.blockhash,
-        lastValidBlockHeight: quote.lastValidBlockHeight,
+        blockhash: confirmBlockhash,
+        lastValidBlockHeight: confirmLastValidBlockHeight,
       }, 'confirmed');
 
       setFundingSignature(signature);
-      for (let attempt = 0; attempt < 12; attempt += 1) {
+      // Register this session so the profit-mode prompt still fires from the
+      // background poll if the inline window below expires before the worker
+      // (which polls on-chain every ~5s) flips the session to `ready`.
+      awaitingProfitModeSessionIdsRef.current.add(session.id);
+      for (let attempt = 0; attempt < 40; attempt += 1) {
         const latestSessions = await fetchSessions(auth.user.id);
         const fundedSession = latestSessions?.find((item) => item.id === session.id);
         if (fundedSession?.status === 'ready') {
+          awaitingProfitModeSessionIdsRef.current.delete(session.id);
           setDismissedProfitModeSessionId(null);
           setProfitModeChoice(fundedSession.userControl?.profitHandling?.mode ?? 'send_to_owner');
           setProfitPayoutTokenChoice(fundedSession.userControl?.profitHandling?.payoutToken ?? 'USDC');
@@ -1291,7 +1333,7 @@ export default function Home() {
           break;
         }
 
-        await new Promise<void>((resolve) => setTimeout(resolve, 1500));
+        await new Promise<void>((resolve) => setTimeout(resolve, 2000));
       }
     } catch (error) {
       setFundingError(error instanceof Error ? error.message : 'Funding transaction failed');
@@ -1932,6 +1974,10 @@ export default function Home() {
                         if (getOpenSessionPositions(primarySession).length > 0) {
                           setShowStopModal(true);
                         } else {
+                          const isRunning = ['ready', 'starting', 'active', 'paused'].includes(primarySession.status);
+                          if (isRunning && !window.confirm('Stop this session? This ends the session and returns funds to your owner wallet.')) {
+                            return;
+                          }
                           void handleAction(primarySession.id, 'stop', { stopDisposition: 'return_tokens' });
                         }
                       }}

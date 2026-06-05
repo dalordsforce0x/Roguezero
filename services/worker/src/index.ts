@@ -5059,10 +5059,48 @@ const maybeTransferRealizedProfit = async (
     }
 
     const desiredLamports = Math.floor((principalSafeAvailableProfitUsd / solUsd) * 1_000_000_000);
-    const transferableLamports = Math.min(
-      desiredLamports,
-      Math.max(0, solBalanceLamports - MIN_SOL_OPERATING_RESERVE_LAMPORTS - TX_FEE_LAMPORTS),
-    );
+    if (desiredLamports <= 0) {
+      return 0;
+    }
+
+    // Native SOL available for payout above the operating reserve + this transfer's fee.
+    let spareLamports = Math.max(0, solBalanceLamports - MIN_SOL_OPERATING_RESERVE_LAMPORTS - TX_FEE_LAMPORTS);
+
+    // USDC-base sessions realize profit as USDC, leaving native SOL at just the operating
+    // reserve. Convert the USDC shortfall into SOL so a SOL payout actually pays out — mirrors
+    // the USDC branch above which converts SOL->USDC for USDC payouts.
+    if (spareLamports < desiredLamports) {
+      const shortfallLamports = desiredLamports - spareLamports;
+      const shortfallUsd = (shortfallLamports / 1_000_000_000) * solUsd;
+      // Add headroom for swap slippage/price impact so the swap yields at least the shortfall.
+      const desiredUsdcAtomic = Math.ceil(shortfallUsd * USDC_ATOMIC_PER_USD * 1.02);
+      const sessionUsdcBalance = await getTokenBalanceAtomic(payerPubkey, USDC_MINT, TOKEN_PROGRAM_ID).catch(() => 0);
+      const usdcToConvert = Math.min(desiredUsdcAtomic, sessionUsdcBalance);
+
+      if (usdcToConvert >= GAS_REFILL_MIN_USDC_ATOMIC) {
+        const swapped = await convertUsdcToSol(session, keypair, usdcToConvert);
+        if (!swapped) {
+          log('info', session.id, 'profit skim deferred: USDC->SOL profit conversion did not complete this cycle');
+          return 0;
+        }
+
+        // Wait for the converted SOL to land before sizing the payout.
+        for (let attempt = 1; attempt <= 8; attempt++) {
+          const sol = await rlGetBalance(payerPubkey).catch(() => solBalanceLamports);
+          if (sol > solBalanceLamports) {
+            solBalanceLamports = sol;
+            break;
+          }
+          if (attempt < 8) {
+            await new Promise<void>((resolve) => setTimeout(resolve, 1500));
+          }
+        }
+        setCachedSessionBalance(payerPubkey.toBase58(), solBalanceLamports);
+        spareLamports = Math.max(0, solBalanceLamports - MIN_SOL_OPERATING_RESERVE_LAMPORTS - TX_FEE_LAMPORTS);
+      }
+    }
+
+    const transferableLamports = Math.min(desiredLamports, spareLamports);
 
     if (transferableLamports <= 0) {
       return 0;
@@ -8442,15 +8480,23 @@ const tick = async (): Promise<number> => {
   return nextDelayMs;
 };
 
+let shuttingDown = false;
+let activeTickPromise: Promise<number> | null = null;
+let nextTickTimer: NodeJS.Timeout | null = null;
+
 const scheduleNextTick = (delayMs: number) => {
-  setTimeout(() => {
+  if (shuttingDown) return;
+  nextTickTimer = setTimeout(() => {
+    nextTickTimer = null;
     void runLoop();
   }, delayMs);
 };
 
 const runLoop = async (): Promise<void> => {
+  if (shuttingDown) return;
   try {
-    const nextDelayMs = await tick();
+    activeTickPromise = tick();
+    const nextDelayMs = await activeTickPromise;
     scheduleNextTick(nextDelayMs);
   } catch (err) {
     console.error(JSON.stringify({
@@ -8462,8 +8508,112 @@ const runLoop = async (): Promise<void> => {
       ts: new Date().toISOString(),
     }));
     scheduleNextTick(POLL_MS);
+  } finally {
+    activeTickPromise = null;
   }
 };
+
+// â”€â”€ Graceful shutdown â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// On redeploy/restart Railway sends SIGTERM before SIGKILL. We stop scheduling
+// new ticks, let the in-flight tick finish (so an active swap submit + its DB
+// write are not severed mid-flight), then requeue our own in-flight execution
+// locks so the next worker picks them up immediately instead of waiting out the
+// stale-lock TTL. Session rows already live in Postgres and resume on boot, so
+// active trading sessions survive the deploy.
+const SHUTDOWN_DRAIN_TIMEOUT_MS = Number(process.env.WORKER_SHUTDOWN_DRAIN_TIMEOUT_MS ?? 8_000);
+
+const releaseOwnExecutionQueueLocksOnShutdown = async () => {
+  await ensureExecutionQueueReady();
+  const result = await getPool().query<{ id: string }>(
+    `
+      UPDATE execution_queue
+         SET status = 'queued',
+             locked_by = NULL,
+             locked_until = NULL,
+             last_error = 'worker_graceful_shutdown_released_lock',
+             available_at = NOW(),
+             updated_at = NOW()
+       WHERE status = 'running'
+         AND locked_by = $1
+      RETURNING id
+    `,
+    [WORKER_INSTANCE_ID],
+  );
+  if ((result.rowCount ?? 0) > 0) {
+    console.warn(JSON.stringify({
+      service: 'roguezero-worker',
+      kind: 'execution_queue_release_on_shutdown',
+      workerInstanceId: WORKER_INSTANCE_ID,
+      released: result.rowCount,
+      ids: result.rows.map((row) => row.id),
+      ts: new Date().toISOString(),
+    }));
+  }
+};
+
+let shutdownInFlight = false;
+const gracefulShutdown = async (signal: string) => {
+  if (shutdownInFlight) return;
+  shutdownInFlight = true;
+  shuttingDown = true;
+  const startedAt = Date.now();
+  console.log(JSON.stringify({
+    service: 'roguezero-worker',
+    kind: 'graceful_shutdown',
+    phase: 'begin',
+    signal,
+    ts: new Date().toISOString(),
+  }));
+
+  if (nextTickTimer) {
+    clearTimeout(nextTickTimer);
+    nextTickTimer = null;
+  }
+
+  // Let the in-flight tick finish (bounded by the drain timeout) so a mid-flight
+  // swap submit and its DB write complete before we tear down.
+  if (activeTickPromise) {
+    const drainTimeout = new Promise<void>((resolve) => setTimeout(resolve, SHUTDOWN_DRAIN_TIMEOUT_MS));
+    try {
+      await Promise.race([activeTickPromise.then(() => undefined), drainTimeout]);
+    } catch {
+      // tick errors are already logged by runLoop; continue shutdown regardless.
+    }
+  }
+
+  try {
+    await releaseOwnExecutionQueueLocksOnShutdown();
+  } catch (err) {
+    console.error('[worker] graceful shutdown lock release failed:', String(err));
+  }
+
+  try {
+    await getPool().end();
+  } catch {
+    // pool may already be closing; ignore.
+  }
+
+  console.log(JSON.stringify({
+    service: 'roguezero-worker',
+    kind: 'graceful_shutdown',
+    phase: 'complete',
+    signal,
+    durationMs: Date.now() - startedAt,
+    ts: new Date().toISOString(),
+  }));
+  process.exit(0);
+};
+
+process.once('SIGTERM', () => void gracefulShutdown('SIGTERM'));
+process.once('SIGINT', () => void gracefulShutdown('SIGINT'));
+console.log(JSON.stringify({
+  service: 'roguezero-worker',
+  kind: 'graceful_shutdown_handlers_registered',
+  pid: process.pid,
+  ppid: process.ppid,
+  isPid1: process.pid === 1,
+  ts: new Date().toISOString(),
+}));
 
 // â”€â”€ Boot â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
