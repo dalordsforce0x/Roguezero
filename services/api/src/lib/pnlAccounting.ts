@@ -45,3 +45,24 @@ export const computeTokenToSolRealizedPnlUsd = (params: {
 
   return solReceived * params.solUsdPrice - quantityUi * params.entryPriceUsd;
 };
+
+export const computeTokenToUsdcRealizedPnlUsd = (params: {
+  receivedUsdcAtomic: number;
+  soldAtomic: number;
+  soldDecimals: number;
+  entryPriceUsd: number;
+}): number | null => {
+  const usdcReceived = atomicToUiAmount(params.receivedUsdcAtomic, 6);
+  const quantityUi = atomicToUiAmount(params.soldAtomic, params.soldDecimals);
+
+  if (
+    usdcReceived <= 0
+    || quantityUi <= 0
+    || !Number.isFinite(params.entryPriceUsd)
+    || params.entryPriceUsd < 0
+  ) {
+    return null;
+  }
+
+  return usdcReceived - quantityUi * params.entryPriceUsd;
+};

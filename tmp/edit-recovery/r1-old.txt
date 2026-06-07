@@ -1,0 +1,4 @@
+  const applyTakeProfitTimeDecay = (rawTakeProfitBps: number): number => {
+    if (decayFullMs <= decayStartMs || positionAgeMs <= decayStartMs || rawTakeProfitBps <= costFloorBps) {
+      return rawTakeProfitBps;
+    }

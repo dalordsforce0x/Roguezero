@@ -1,0 +1,29 @@
+const WORKER_UNIVERSE_SCOUT_MAX_ENTRY_PRICE_IMPACT_BPS = Number(
+  process.env.WORKER_UNIVERSE_SCOUT_MAX_ENTRY_PRICE_IMPACT_BPS
+  ?? process.env.WORKER_UNIVERSE_SCOUT_MAX_SOL_PRICE_IMPACT_BPS
+  ?? 50,
+);
+// ENTRY QUALITY GATE. The single honest "is this token tradeable for profit"
+// test, and the decisive filter that keeps us in liquid, tradeable names. Every
+// other entry gate checks the ENTRY leg (cheap to buy) or a price-shape signal,
+// but profitability is governed by one relationship neither of those captures:
+// the move the token can REALISTICALLY reach vs. the cost to round-trip it. We
+// require the take-profit the token can plausibly hit (its measured ATR x the
+// take-profit ATR multiplier) to clear the measured round-trip cost (entry +
+// exit impact + platform fee) by a safety ratio. Liquid majors with cheap exits
+// pass at modest volatility; post-pump micro-caps whose exit toll dwarfs their
+// remaining volatility are rejected here instead of being bought and then
+// force-sold at a loss.
+const WORKER_ENTRY_QUALITY_GATE_ENABLED = process.env.WORKER_ENTRY_QUALITY_GATE_ENABLED !== 'false';
+const WORKER_ENTRY_QUALITY_TP_COST_RATIO = Number(process.env.WORKER_ENTRY_QUALITY_TP_COST_RATIO ?? 1.2);
+// When the candidate's ATR cannot be computed yet (tape still warming) we cannot
+// prove its reachable move beats its cost, so we block rather than gamble on an
+// unmeasured token. Set false to allow entries on tokens with no ATR yet.
+const WORKER_ENTRY_QUALITY_REQUIRE_ATR = process.env.WORKER_ENTRY_QUALITY_REQUIRE_ATR !== 'false';
+// FORCED-SELL BRAKE. The time-decay take-profit ladder lowers a position's take-
+// profit target toward the cost floor as it ages, which DUMPS green-but-stuck
+// bags near breakeven-minus-fees -- a forced loss exit. Disabled by default so
+// winners ride the trailing stop instead of being force-sold flat. Set true to
+// re-enable the decay ladder.
+const WORKER_TP_TIME_DECAY_ENABLED = process.env.WORKER_TP_TIME_DECAY_ENABLED === 'true';
+const WORKER_MAX_CONSECUTIVE_LOSSES = Number(process.env.WORKER_MAX_CONSECUTIVE_LOSSES ?? 2);

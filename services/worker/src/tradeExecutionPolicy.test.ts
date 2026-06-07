@@ -1,8 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  computeTrendingEntryShapeGate,
+  computePrePrepareEntryGate,
   computeFullExitAmountAtomic,
   computeGasRefillPlan,
+  computeRetryMinimumTradeAmountAtomic,
+  computeStopLossThresholdBps,
   resolveTradeGateAssessment,
   shouldApplyPostExitSolReserveProtection,
   shouldForceExitExecution,
@@ -12,6 +16,17 @@ import {
 
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const JTO_MINT = 'jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL';
+
+const baseTrendingShapeInput = {
+  enabled: true,
+  minSamples: 8,
+  chaseLookbackSamples: 3,
+  maxRecentSurgeBps: 80,
+  minPullbackFromHighBps: 30,
+  minReclaimFromLowBps: 20,
+  maxRangePositionBps: 8500,
+  maxNegativeWindowMomentumBps: 250,
+};
 
 const blockedAssessment: TradeGateAssessment = {
   allowed: false,
@@ -48,6 +63,108 @@ test('resolveTradeGateAssessment leaves entry trades unchanged', () => {
   });
 
   assert.deepEqual(resolved, blockedAssessment);
+});
+
+test('computePrePrepareEntryGate skips impossible entries before prepare', () => {
+  const gate = computePrePrepareEntryGate({
+    direction: 'enter_long',
+    signalMomentumBps: 16,
+    signalThresholdBps: 45,
+    safetyBufferBps: 35,
+  });
+
+  assert.deepEqual(gate, {
+    allowed: false,
+    reason: 'entry_edge_below_cost',
+    expectedEdgeBps: 0,
+    estimatedCostBps: 0,
+    safetyBufferBps: 35,
+  });
+});
+
+test('computePrePrepareEntryGate allows prepare when edge could clear costs', () => {
+  const gate = computePrePrepareEntryGate({
+    direction: 'enter_long',
+    signalMomentumBps: 95,
+    signalThresholdBps: 45,
+    safetyBufferBps: 35,
+  });
+
+  assert.equal(gate, null);
+});
+
+test('computePrePrepareEntryGate never blocks exits', () => {
+  const gate = computePrePrepareEntryGate({
+    direction: 'exit_long',
+    signalMomentumBps: 0,
+    signalThresholdBps: 45,
+    safetyBufferBps: 35,
+  });
+
+  assert.equal(gate, null);
+});
+
+test('computeTrendingEntryShapeGate blocks a vertical candle with no pullback', () => {
+  const gate = computeTrendingEntryShapeGate({
+    ...baseTrendingShapeInput,
+    prices: [1, 1.002, 1.004, 1.007, 1.01, 1.016, 1.024, 1.035],
+  });
+
+  assert.equal(gate.allowed, false);
+  assert.equal(gate.reason, 'trending_entry_chasing_vertical');
+  assert.ok((gate.metrics?.recentSurgeBps ?? 0) > baseTrendingShapeInput.maxRecentSurgeBps);
+});
+
+test('computeTrendingEntryShapeGate allows pullback then confirmed reclaim', () => {
+  const gate = computeTrendingEntryShapeGate({
+    ...baseTrendingShapeInput,
+    prices: [1, 1.006, 1.014, 1.02, 1.015, 1.009, 1.011, 1.014],
+  });
+
+  assert.equal(gate.allowed, true);
+  assert.equal(gate.reason, 'trending_entry_pullback_reclaim');
+  assert.ok((gate.metrics?.pullbackFromHighBps ?? 0) >= baseTrendingShapeInput.minPullbackFromHighBps);
+  assert.ok((gate.metrics?.reclaimFromLowBps ?? 0) >= baseTrendingShapeInput.minReclaimFromLowBps);
+});
+
+test('computeTrendingEntryShapeGate blocks falling-knife pullbacks without reclaim', () => {
+  const gate = computeTrendingEntryShapeGate({
+    ...baseTrendingShapeInput,
+    prices: [1, 1.006, 1.014, 1.02, 1.015, 1.009, 1.005, 1.003],
+  });
+
+  assert.equal(gate.allowed, false);
+  assert.equal(gate.reason, 'trending_entry_reclaim_not_confirmed');
+});
+
+test('computeTrendingEntryShapeGate waits for enough live samples', () => {
+  const gate = computeTrendingEntryShapeGate({
+    ...baseTrendingShapeInput,
+    prices: [1, 1.01, 1.005],
+  });
+
+  assert.equal(gate.allowed, false);
+  assert.equal(gate.reason, 'trending_entry_shape_warming_up');
+});
+
+test('computeStopLossThresholdBps keeps stop-loss independent from cost floor', () => {
+  const stopLossBps = computeStopLossThresholdBps({
+    configuredStopLossBps: 8,
+    atrBps: 10,
+    atrStopLossMultiplier: 1,
+  });
+
+  assert.equal(stopLossBps, 10);
+});
+
+test('computeStopLossThresholdBps falls back to configured cap without ATR', () => {
+  const stopLossBps = computeStopLossThresholdBps({
+    configuredStopLossBps: 8,
+    atrBps: null,
+    atrStopLossMultiplier: 1,
+  });
+
+  assert.equal(stopLossBps, 8);
 });
 
 test('computeFullExitAmountAtomic uses tracked position quantity for exits', () => {
@@ -88,6 +205,20 @@ test('shouldApplyPostExitSolReserveProtection only trims SOL exits', () => {
     inputMint: SOL_MINT,
     solMint: SOL_MINT,
   }), false);
+});
+
+test('computeRetryMinimumTradeAmountAtomic lets forced exits retry below entry minimum', () => {
+  assert.equal(computeRetryMinimumTradeAmountAtomic({
+    forceExitExecution: true,
+    minTradeAtomic: 5_000_000,
+  }), 1);
+});
+
+test('computeRetryMinimumTradeAmountAtomic preserves entry minimum for non-forced trades', () => {
+  assert.equal(computeRetryMinimumTradeAmountAtomic({
+    forceExitExecution: false,
+    minTradeAtomic: 5_000_000,
+  }), 5_000_000);
 });
 
 const baseRefillInput: GasRefillPlanInput = {

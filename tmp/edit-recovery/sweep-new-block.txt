@@ -1,0 +1,104 @@
+  // Solana caps a serialized transaction at 1232 bytes. A full session sweep can
+  // queue dozens of instructions (per-token ATA-create + transfer + close), which
+  // overruns a single transaction and previously threw `RangeError: encoding
+  // overruns Uint8Array` at serialize time -- bricking the entire return flow and
+  // stranding user funds. Pack the token instructions into size-bounded batches and
+  // send each sequentially, then sweep the remaining SOL last, so funds always
+  // return home (fail toward return).
+  const TX_SERIALIZED_SIZE_TARGET = 1180;
+
+  const probeBlockhash = (await rlGetLatestBlockhash()).blockhash;
+  const measureBatchSize = (instructions: TransactionInstruction[]): number =>
+    new VersionedTransaction(
+      new TransactionMessage({
+        payerKey: sessionPubkey,
+        recentBlockhash: probeBlockhash,
+        instructions,
+      }).compileToV0Message(),
+    ).serialize().length;
+
+  const tokenBatches: TransactionInstruction[][] = [];
+  for (const ix of ixs) {
+    const current = tokenBatches[tokenBatches.length - 1];
+    if (current && measureBatchSize([...current, ix]) <= TX_SERIALIZED_SIZE_TARGET) {
+      current.push(ix);
+    } else {
+      tokenBatches.push([ix]);
+    }
+  }
+
+  // Reserve the base fee for every transaction we are about to send (each token
+  // batch plus one final SOL-sweep tx) so the SOL sweep cannot overdraw the fee
+  // payer across multiple sequential transactions.
+  const totalSweepTxCount = tokenBatches.length + 1;
+  const solToSend = computeSessionSolSweepLamports({
+    solBalance,
+    ownerAtaCreationCost,
+    txFeeLamports: TX_FEE_LAMPORTS * totalSweepTxCount,
+    mayLeaveResidualState,
+  });
+
+  if (mayLeaveResidualState) {
+    log(
+      'warn',
+      session.id,
+      `retaining ${Math.max(0, solBalance - ownerAtaCreationCost - TX_FEE_LAMPORTS * totalSweepTxCount)} lamports as recovery gas -- a valued token position could not be swept home; not draining SOL to zero to avoid orphaning it`,
+    );
+  }
+
+  if (tokenBatches.length === 0 && solToSend <= 0) {
+    log('info', session.id, 'session wallet empty -- nothing to sweep');
+    return getWalletSweepSnapshot(sessionPubkey);
+  }
+
+  const sendSweepBatch = async (instructions: TransactionInstruction[], label: string): Promise<boolean> => {
+    const { blockhash, lastValidBlockHeight } = await rlGetLatestBlockhash();
+    const message = new TransactionMessage({
+      payerKey: sessionPubkey,
+      recentBlockhash: blockhash,
+      instructions,
+    }).compileToV0Message();
+
+    const sweepTx = new VersionedTransaction(message);
+    sweepTx.sign([keypair]);
+
+    const sig = await rlSendRawTransaction(sweepTx.serialize());
+    try {
+      const confirmation = await rlConfirmTransaction({ signature: sig, blockhash, lastValidBlockHeight });
+      if (confirmation.value.err) {
+        throw new Error(`sweep transaction failed: ${JSON.stringify(confirmation.value.err)}`);
+      }
+      log('info', session.id, `sweep ${label} confirmed: ${sig}`);
+      return true;
+    } catch (error) {
+      if (isConfirmationExpiryError(error)) {
+        log('warn', session.id, `sweep ${label} confirmation expired for ${sig}; verifying wallet state directly`);
+        return false;
+      }
+      throw error;
+    }
+  };
+
+  let confirmationSettled = false;
+  for (let batchIndex = 0; batchIndex < tokenBatches.length; batchIndex += 1) {
+    const settled = await sendSweepBatch(
+      tokenBatches[batchIndex],
+      `token batch ${batchIndex + 1}/${tokenBatches.length}`,
+    );
+    confirmationSettled = confirmationSettled || settled;
+  }
+
+  if (solToSend > 0) {
+    log('info', session.id, `queuing SOL sweep: ${solToSend} lamports -> ${ownerWallet}`);
+    const settled = await sendSweepBatch(
+      [SystemProgram.transfer({ fromPubkey: sessionPubkey, toPubkey: ownerPubkey, lamports: solToSend })],
+      'SOL sweep',
+    );
+    confirmationSettled = confirmationSettled || settled;
+  }
+
+  const postSweepSnapshot = await waitForPostSweepSnapshot(session.id, sessionPubkey, preSweepSnapshot);
+  if (!confirmationSettled && !sweepSnapshotChanged(preSweepSnapshot, postSweepSnapshot)) {
+    throw new Error('sweep expired before confirmation and wallet state did not change');
+  }
+

@@ -1,0 +1,41 @@
+      log('warn', session.id, `reconciled stale position inventory; dropped ${droppedMints.join(', ')}`);
+    }
+  }
+
+  const openPositionMints = new Set(openPositions.map(({ mint }) => mint));
+
+  // Gas keep-alive: if SOL has drained toward the fee floor while the session
+  // still holds USDC working capital, top the tank back up from a small USDC
+  // slice instead of stalling (`insufficient_sol_fee_reserve`) or stopping
+  // (`depleted`) with money still in the wallet. Runs before the depletion gate
+  // below so a refilled session keeps trading this same cycle.
+  balance = await maybeRefillGasFromUsdc(session, keypair, balance);
+
+  // SOL depletion only stops a FLAT session. In the USDC-base model an active
+  // session's capital lives in USDC + open token positions, while SOL is only a
+  // fee reserve. When positions are open we just need enough SOL to pay exit
+  // fees (operating reserve), never the full tradeable size — otherwise a healthy
+  // multi-position session gets killed as "depleted" the moment its SOL is just a
+  // fee reserve. Exit management must stay alive instead of sweeping mid-position.
+  const minimumRequiredLamports = MIN_SOL_OPERATING_RESERVE_LAMPORTS;
+
+  if (openPositions.length === 0 && balance < minimumRequiredLamports) {
+    await persistTradeDecision(session, 'stopped', 'insufficient_balance');
+    log('warn', session.id, `insufficient balance for trade: ${balance}/${minimumRequiredLamports} lamports`);
+    await setSessionStatus(session.id, 'stopping', { stop_reason: 'depleted' }, { expectedStatuses: ['active'] });
+    log('info', session.id, 'balance depleted â†’ stopping (sweep will run)');
+    return;
+  }
+
+  let tradePlan: TradeExecutionPlan | null = null;
+  let useBasicPairEntryFallback = false;
+  let basicPairEntryFallbackReason: string | null = null;
+
+  if (openPositions.length > 0) {
+    const exitReasonPriority = {
+      stop_loss: 0,
+      trailing_stop: 1,
+      signal_reversal: 2,
+      take_profit: 3,
+    } satisfies Record<NonNullable<SessionPositionState['exitReason']>, number>;
+    const nextPositions = { ...positionsState.positions };

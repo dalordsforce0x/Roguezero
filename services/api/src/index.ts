@@ -98,6 +98,7 @@ import {
 import {
   computeSolInputEntryPriceUsd,
   computeTokenToSolRealizedPnlUsd,
+  computeTokenToUsdcRealizedPnlUsd,
 } from './lib/pnlAccounting.js';
 
 dotenv.config({ path: '../../.env' });
@@ -425,6 +426,10 @@ const upsertPositionEntry = (params: {
     lastComputedAtrUsd: params.existingPosition?.lastComputedAtrUsd ?? null,
     lastComputedAtrBps: params.existingPosition?.lastComputedAtrBps ?? null,
     atrComputedAt: params.existingPosition?.atrComputedAt ?? null,
+    maxFavorableBps: params.existingPosition?.maxFavorableBps ?? null,
+    maxAdverseBps: params.existingPosition?.maxAdverseBps ?? null,
+    maxFavorableAt: params.existingPosition?.maxFavorableAt ?? null,
+    maxAdverseAt: params.existingPosition?.maxAdverseAt ?? null,
     pendingExitReason: null,
     exitReason: null,
   };
@@ -1857,12 +1862,20 @@ const reconcileSubmittedExecutionRecord = async (
           ? observedUsdcDelta
           : (quotedOutputAtomic !== null ? Number(quotedOutputAtomic) : 0);
         actualOutputAtomic = outAtomic > 0 ? outAtomic : null;
-        const soldDecimals = transactionDetails ? getTokenDecimalsFromTransaction(transactionDetails, soldMint) : null;
-        const soldUi = getPositionUiAmount(soldMint, inAtomic, soldDecimals);
-        const usdcReceived = outAtomic / 1e6;
+        const soldDecimals = (transactionDetails ? getTokenDecimalsFromTransaction(transactionDetails, soldMint) : null)
+          ?? existingPosition?.tokenDecimals
+          ?? (soldMint === SOL_MINT ? 9 : 6);
         const entry = existingPosition?.entryPriceUsd ?? null;
-        if (entry !== null && soldUi > 0) {
-          realizedDeltaUsd = usdcReceived - soldUi * entry;
+        if (entry !== null) {
+          const realized = computeTokenToUsdcRealizedPnlUsd({
+            receivedUsdcAtomic: outAtomic,
+            soldAtomic: inAtomic,
+            soldDecimals,
+            entryPriceUsd: entry,
+          });
+          if (realized !== null) {
+            realizedDeltaUsd = realized;
+          }
         }
         capturedFeesDeltaUsd = capturedFeeUsdFromDelta;
         fundingPatch = usdcPostBalanceAtomic !== null
@@ -2892,8 +2905,13 @@ app.post('/jupiter/swap/prepare', { config: { rateLimit: { max: INTERNAL_SWAP_PR
   const unitsConsumed = (simulation.value.unitsConsumed && simulation.value.unitsConsumed > 0)
     ? simulation.value.unitsConsumed
     : maxComputeUnitLimit;
+  // On-chain landing routinely consumes more compute than simulation predicts
+  // (account states shift between sim and land), so a thin 10% margin caused
+  // real `ComputationalBudgetExceeded` failures — including stop-loss exits that
+  // then failed to close the position. Use a 30% margin plus a fixed 20k-CU
+  // floor so small routes also get absolute headroom, capped at the network max.
   const recommendedComputeUnitLimit = Math.min(
-    Math.ceil(unitsConsumed * 1.1),
+    Math.ceil(unitsConsumed * 1.3) + 20_000,
     maxComputeUnitLimit,
   );
   const priorityFeeMicroLamports = heliusTradingConfig.senderEnabled
@@ -3672,6 +3690,9 @@ app.post('/sessions', { config: { rateLimit: { max: 5, timeWindow: '1 minute' } 
   const platformFeeBps = configReport.schemaValid
     ? (process.env.JUPITER_PLATFORM_FEE_BPS ? Number(process.env.JUPITER_PLATFORM_FEE_BPS) : 30)
     : 30;
+  const normalizedTargetDurationMinutes = Number.isFinite(req.targetDurationMinutes) && req.targetDurationMinutes >= 1
+    ? req.targetDurationMinutes
+    : 1440;
 
   try {
     const session = await createSessionWithKey({
@@ -3688,7 +3709,7 @@ app.post('/sessions', { config: { rateLimit: { max: 5, timeWindow: '1 minute' } 
       endedAt: null,
       stopReason: null,
       userControl: {
-        targetDurationMinutes: req.targetDurationMinutes,
+        targetDurationMinutes: normalizedTargetDurationMinutes,
         autoRestart: false,
         stopLossBehavior: req.stopLossBehavior,
         profitHandling: req.profitHandling,
@@ -4081,10 +4102,16 @@ app.patch('/sessions/:id/strategy-controls', async (request, reply) => {
       momentum: {
         lookbackSamples: asOptionalPositiveInt(momentumPatch.lookbackSamples)
           ?? currentStrategyConfig.momentum.lookbackSamples,
-        thresholdBps: asOptionalPositiveInt(momentumPatch.thresholdBps)
-          ?? currentStrategyConfig.momentum.thresholdBps,
-        edgeSafetyBufferBps: asOptionalNonNegativeNumber(momentumPatch.edgeSafetyBufferBps)
-          ?? currentStrategyConfig.momentum.edgeSafetyBufferBps,
+        thresholdBps: Math.max(
+          workerSignalPolicy.momentumThresholdBps,
+          asOptionalPositiveInt(momentumPatch.thresholdBps)
+            ?? currentStrategyConfig.momentum.thresholdBps,
+        ),
+        edgeSafetyBufferBps: Math.max(
+          workerSignalPolicy.edgeSafetyBufferBps,
+          asOptionalNonNegativeNumber(momentumPatch.edgeSafetyBufferBps)
+            ?? currentStrategyConfig.momentum.edgeSafetyBufferBps,
+        ),
       },
       meanReversion: {
         length: asOptionalPositiveInt(meanReversionPatch.length)
@@ -4215,6 +4242,21 @@ app.patch('/sessions/:id/action', async (request, reply) => {
     return reply.status(400).send({ error: 'stopDisposition must be one of: return_tokens, liquidate' });
   }
 
+  if (action === 'stop') {
+    app.log.warn({
+      sessionId: id,
+      event: 'SESSION_STOP_REQUEST_SOURCE',
+      method: request.method,
+      userAgent: request.headers['user-agent'] ?? null,
+      referer: request.headers['referer'] ?? request.headers['referrer'] ?? null,
+      origin: request.headers['origin'] ?? null,
+      xForwardedFor: request.headers['x-forwarded-for'] ?? null,
+      remoteAddress: request.ip,
+      bodyKeys: Object.keys(body),
+      stopDisposition: stopDisposition ?? null,
+    }, 'session stop request received — capturing source');
+  }
+
   try {
     const session = await getSessionById(id);
     if (!session) return reply.status(404).send({ error: 'Session not found', id });
@@ -4237,6 +4279,22 @@ app.patch('/sessions/:id/action', async (request, reply) => {
     };
 
     const t = transitions[action];
+    const stopRequestSource = action === 'stop'
+      ? {
+          at: now,
+          event: 'SESSION_STOP_REQUEST_SOURCE',
+          source: 'api-session-action',
+          method: request.method,
+          userAgent: request.headers['user-agent'] ?? null,
+          referer: request.headers['referer'] ?? request.headers['referrer'] ?? null,
+          origin: request.headers['origin'] ?? null,
+          xForwardedFor: request.headers['x-forwarded-for'] ?? null,
+          remoteAddress: request.ip,
+          bodyKeys: Object.keys(body),
+          clientActionSource: asOptionalString(body.clientActionSource) ?? null,
+          stopDisposition: stopDisposition ?? null,
+        }
+      : undefined;
     const nextUserControl = action === 'start'
       ? {
           ...session.userControl,
@@ -4251,12 +4309,28 @@ app.patch('/sessions/:id/action', async (request, reply) => {
             stopDisposition: stopDisposition ?? session.userControl.stopDisposition ?? 'return_tokens',
           }
         : undefined;
+    const currentServiceControl = session.serviceControl as Record<string, unknown>;
+    const stopRequestSourceHistory = Array.isArray(currentServiceControl.stopRequestSourceHistory)
+      ? currentServiceControl.stopRequestSourceHistory
+      : [];
+    const nextServiceControl = stopRequestSource
+      ? {
+          ...currentServiceControl,
+          lastStopRequestSource: stopRequestSource,
+          stopRequestSourceHistory: [
+            ...stopRequestSourceHistory.slice(-9),
+            stopRequestSource,
+          ],
+        }
+      : undefined;
 
     const updated = await updateSessionStatus(id, t.next, {
       startedAt: t.startedAt,
       endedAt:   t.endedAt,
       stopReason: t.stopReason,
       userControl: nextUserControl,
+      serviceControl: nextServiceControl,
+      userInitiatedStop: action === 'stop',
     });
 
     return { session: updated, action, appliedAt: now };

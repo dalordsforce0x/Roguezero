@@ -1,0 +1,5 @@
+select disk 2
+create partition primary
+format fs=ntfs quick label=M2-1TB
+assign letter=E
+exit

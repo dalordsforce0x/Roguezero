@@ -231,6 +231,72 @@ export const sessionHealthStateSchema = z.object({
   blockerCount: z.number().int().nonnegative().default(0),
 });
 
+export const sessionExitEvaluationSchema = z.object({
+  at: isoDatetimeSchema,
+  mint: publicKeySchema,
+  symbol: z.string().min(1).max(32),
+  tokenClass: z.enum(['major', 'sol_beta', 'trend_liquid', 'long_tail']),
+  strategy: strategyKeySchema,
+  shouldExit: z.boolean(),
+  reason: sessionPositionExitReasonSchema,
+  pnlBps: z.number().int().nullable(),
+  trailingDrawdownBps: z.number().int().nullable(),
+  maxFavorableBps: z.number().int().nullable().default(null),
+  maxAdverseBps: z.number().int().nullable().default(null),
+  entryPriceUsd: z.number().positive().nullable(),
+  markPriceUsd: z.number().positive().nullable(),
+  highWaterPriceUsd: z.number().positive().nullable(),
+  thresholds: z.object({
+    takeProfitBps: z.number().int().nonnegative(),
+    stopLossBps: z.number().int().nonnegative(),
+    trailingStopBps: z.number().int().nonnegative(),
+    atrBps: z.number().int().positive().nullable(),
+    costFloorBps: z.number().int().nonnegative(),
+    mode: z.enum(['atr', 'fallback']),
+  }),
+  signalStatus: z.enum(['warming_up', 'ready', 'guarded_off']),
+  signalRegime: z.enum(['bullish', 'bearish', 'flat']).nullable(),
+  signalMomentumBps: z.number().int().nullable(),
+  pendingExitReason: sessionPositionExitReasonSchema.nullable(),
+});
+
+export const sessionAdaptiveExitShadowSchema = z.object({
+  at: isoDatetimeSchema,
+  enabled: z.boolean(),
+  mode: z.literal('shadow'),
+  canarySessionId: z.string().uuid().nullable().default(null),
+  decisions: z.array(z.object({
+    mint: publicKeySchema,
+    symbol: z.string().min(1).max(32),
+    tokenClass: z.enum(['major', 'sol_beta', 'trend_liquid', 'long_tail']),
+    action: z.enum(['hold', 'partial_take_profit', 'protect_breakeven', 'trail_runner', 'full_exit']),
+    reason: z.string().min(1).max(160),
+    pnlBps: z.number().int().nullable(),
+    maxFavorableBps: z.number().int().nullable().default(null),
+    maxAdverseBps: z.number().int().nullable().default(null),
+    suggestedSellBps: z.number().int().min(0).max(10000).default(0),
+    suggestedStopBps: z.number().int().nullable().default(null),
+  })).default([]),
+});
+
+export const sessionGridChopShadowSchema = z.object({
+  at: isoDatetimeSchema,
+  enabled: z.boolean(),
+  mode: z.literal('shadow'),
+  canarySessionId: z.string().uuid().nullable().default(null),
+  marketRegime: z.enum(['chop', 'trend', 'unknown']),
+  reason: z.string().min(1).max(160),
+  candidates: z.array(z.object({
+    mint: publicKeySchema,
+    symbol: z.string().min(1).max(32),
+    tokenClass: z.enum(['major', 'sol_beta', 'trend_liquid', 'long_tail']),
+    action: z.enum(['grid_hold', 'grid_buy_zone', 'grid_sell_zone', 'grid_disabled']),
+    pnlBps: z.number().int().nullable(),
+    drawdownBps: z.number().int().nullable(),
+    reason: z.string().min(1).max(160),
+  })).default([]),
+});
+
 export const sessionPositionStateSchema = z.object({
   status: sessionPositionStatusSchema,
   positionMint: publicKeySchema.nullable().default(null),
@@ -246,6 +312,10 @@ export const sessionPositionStateSchema = z.object({
   lastComputedAtrUsd: z.number().positive().nullable().default(null),
   lastComputedAtrBps: z.number().int().positive().nullable().default(null),
   atrComputedAt: isoDatetimeSchema.nullable().default(null),
+  maxFavorableBps: z.number().int().nullable().default(null),
+  maxFavorableAt: isoDatetimeSchema.nullable().default(null),
+  maxAdverseBps: z.number().int().nullable().default(null),
+  maxAdverseAt: isoDatetimeSchema.nullable().default(null),
   pendingExitReason: sessionPositionExitReasonSchema.nullable().default(null),
   exitReason: sessionPositionExitReasonSchema.nullable().default(null),
 });
@@ -318,6 +388,10 @@ export const sessionServiceControlSchema = z.object({
   riskState: sessionRiskStateSchema.optional(),
   lastExecutionAudit: sessionLastExecutionAuditSchema.optional(),
   healthState: sessionHealthStateSchema.optional(),
+  lastExitEvaluations: z.array(sessionExitEvaluationSchema).optional(),
+  lastExitEvaluation: z.union([sessionExitEvaluationSchema, z.array(sessionExitEvaluationSchema)]).optional(),
+  adaptiveExitShadow: sessionAdaptiveExitShadowSchema.optional(),
+  gridChopShadow: sessionGridChopShadowSchema.optional(),
   positionsState: sessionPositionsStateSchema.optional(),
   positionState: sessionPositionStateSchema.optional(),
   // Set when a session finalizes to `stopped` but the session wallet could not be
@@ -359,6 +433,10 @@ const defaultSessionPositionState: NonNullable<SessionServiceControl['positionSt
   lastComputedAtrUsd: null,
   lastComputedAtrBps: null,
   atrComputedAt: null,
+  maxFavorableBps: null,
+  maxFavorableAt: null,
+  maxAdverseBps: null,
+  maxAdverseAt: null,
   pendingExitReason: null,
   exitReason: null,
 };

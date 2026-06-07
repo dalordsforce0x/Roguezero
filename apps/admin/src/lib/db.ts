@@ -510,14 +510,8 @@ export async function listActiveSessions(): Promise<AdminSessionRow[]> {
 }
 
 export async function forceStopSession(sessionId: string): Promise<AdminSessionRow | null> {
-  const { rows } = await getPool().query<AdminSessionRow>(
-    `UPDATE sessions
-     SET status = 'stopping', stop_reason = 'operator_stop', ended_at = NOW()
-     WHERE id = $1 AND status IN ('active', 'paused', 'ready', 'starting', 'awaiting_funding')
-     RETURNING *`,
-    [sessionId]
-  );
-  return rows[0] ?? null;
+  console.warn(`[admin] forceStopSession disabled by user-only stop invariant: ${sessionId}`);
+  return null;
 }
 
 const strategyKeyValues: StrategyKey[] = ['momentum', 'mean_reversion', 'supertrend'];

@@ -1,0 +1,4 @@
+    // Cache the measured exit toll for this mint so the exit cost floor can price
+    // take-profit/stop-loss against the REAL cost to get out (give-back fix),
+    // instead of the assumed risk_limits.maxSlippageBps.
+    if (WORKER_MEASURED_EXIT_COST_FLOOR_ENABLED) {

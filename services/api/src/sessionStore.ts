@@ -931,10 +931,18 @@ export const updateSessionStatus = async (
     userControl?: Record<string, unknown>;
     serviceControl?: Record<string, unknown>;
     funding?: Record<string, unknown>;
+    userInitiatedStop?: boolean;
   } = {},
 ) => {
   await sessionStoreReady();
   const dbPool = getPool();
+
+  if (['stopping', 'stopped'].includes(status) && (opts.userInitiatedStop !== true || opts.stopReason !== 'user_requested')) {
+    throw new Error('updateSessionStatus may only close sessions for an authenticated user stop request');
+  }
+  if (status === 'error') {
+    throw new Error('updateSessionStatus may not move sessions to error; record runtime failures in service_control.healthState');
+  }
 
   const setClauses: string[] = ['status = $2'];
   const values: unknown[] = [id, status];

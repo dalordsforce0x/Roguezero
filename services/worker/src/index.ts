@@ -1,4 +1,4 @@
-﻿import { createDecipheriv, randomUUID } from 'node:crypto';
+import { createDecipheriv, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
@@ -64,8 +64,10 @@ import {
   type SessionServiceControlPatch,
 } from '@roguezero/session-schema';
 import {
+  computePrePrepareEntryGate,
   computeFullExitAmountAtomic,
   computeGasRefillPlan,
+  computeTrendingEntryShapeGate,
   resolveTradeGateAssessment,
   shouldApplyPostExitSolReserveProtection,
   shouldForceExitExecution,
@@ -133,6 +135,7 @@ const DATABASE_STATEMENT_TIMEOUT_MS = Number(process.env.DATABASE_STATEMENT_TIME
 const DATABASE_LOCK_TIMEOUT_MS = Number(process.env.DATABASE_LOCK_TIMEOUT_MS ?? 5000);
 const DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS = Number(process.env.DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS ?? 10000);
 const DEPLOY_CANARY = process.env.DEPLOY_CANARY ?? 'rz-canary-2026-06-01-01';
+const WORKER_SOURCE_REV = 'entry-reject-cooldown-v1-2026-06-07';
 const fundingThresholds = getWorkerFundingThresholds(process.env);
 const sizingPolicy = getWorkerSizingPolicy(process.env);
 const pricePollPolicy: WorkerPricePollPolicy = getWorkerPricePollPolicy(process.env);
@@ -216,6 +219,12 @@ const WORKER_UNIVERSE_SCOUT_MAX_ENTRY_PRICE_IMPACT_BPS = Number(
   ?? process.env.WORKER_UNIVERSE_SCOUT_MAX_SOL_PRICE_IMPACT_BPS
   ?? 50,
 );
+// FORCED-SELL BRAKE. The time-decay take-profit ladder lowers a position's take-
+// profit target toward the cost floor as it ages, which DUMPS green-but-stuck
+// bags near breakeven-minus-fees -- a forced loss exit. Disabled by default so
+// winners ride the trailing stop instead of being force-sold flat. Set true to
+// re-enable the decay ladder.
+const WORKER_TP_TIME_DECAY_ENABLED = process.env.WORKER_TP_TIME_DECAY_ENABLED === 'true';
 const WORKER_MAX_CONSECUTIVE_LOSSES = Number(process.env.WORKER_MAX_CONSECUTIVE_LOSSES ?? 2);
 const WORKER_MAX_BAD_FILL_STREAK = Number(process.env.WORKER_MAX_BAD_FILL_STREAK ?? 2);
 const WORKER_SOFT_RISK_COOLDOWN_MS = Number(process.env.WORKER_SOFT_RISK_COOLDOWN_MS ?? 5 * 60_000);
@@ -227,6 +236,11 @@ const WORKER_MAX_OPEN_PER_CLUSTER = Number(process.env.WORKER_MAX_OPEN_PER_CLUST
 // After a stop_loss, exclude the stopped token's whole cluster from new entries
 // for this window so the bot does not immediately re-buy what it just sold.
 const WORKER_STOP_LOSS_LOCK_MS = Number(process.env.WORKER_STOP_LOSS_LOCK_MS ?? 10 * 60_000);
+// Post-prepare entry reject cooldown. If a candidate passes the cheap scout but
+// then fails a cost/economics/route gate, do not let it monopolize the next few
+// cycles. This is intentionally short and in-memory: prices move every minute,
+// so the token can re-enter consideration quickly without pinning selection.
+const WORKER_ENTRY_REJECT_COOLDOWN_MS = Number(process.env.WORKER_ENTRY_REJECT_COOLDOWN_MS ?? 3 * 60_000);
 // In a flat tape there is no persistent bullish candidate; only a routed-fallback
 // pick survives. Suppress those noise entries so we only buy real momentum.
 const WORKER_FLAT_REGIME_SUPPRESS_FALLBACK = process.env.WORKER_FLAT_REGIME_SUPPRESS_FALLBACK !== 'false';
@@ -270,6 +284,18 @@ const TOKEN_UNIVERSE_AUTOSORT_STATE_WRITE_MIN_INTERVAL_MS = Number(process.env.W
 const TOKEN_UNIVERSE_METADATA_WRITE_MIN_INTERVAL_MS = Number(process.env.WORKER_TOKEN_UNIVERSE_METADATA_WRITE_MIN_INTERVAL_MS ?? 300000);
 const MARKET_SCANNER_CANDIDATE_TTL_MS = Number(process.env.WORKER_MARKET_SCANNER_CANDIDATE_TTL_MS ?? 180000);
 const MARKET_SCANNER_MAX_PERSISTED_CANDIDATES = Number(process.env.WORKER_MARKET_SCANNER_MAX_PERSISTED_CANDIDATES ?? 50);
+const WORKER_TRENDING_ENTRY_SHAPE_GATE_ENABLED = process.env.WORKER_TRENDING_ENTRY_SHAPE_GATE_ENABLED !== 'false';
+const WORKER_TRENDING_ENTRY_SHAPE_MIN_SAMPLES = Number(process.env.WORKER_TRENDING_ENTRY_SHAPE_MIN_SAMPLES ?? 12);
+const WORKER_EXIT_TELEMETRY_ENABLED = process.env.WORKER_EXIT_TELEMETRY_ENABLED !== 'false';
+const WORKER_ADAPTIVE_EXIT_SHADOW_ENABLED = process.env.WORKER_ADAPTIVE_EXIT_SHADOW_ENABLED === 'true';
+const WORKER_GRID_CHOP_SHADOW_ENABLED = process.env.WORKER_GRID_CHOP_SHADOW_ENABLED === 'true';
+const WORKER_ADAPTIVE_EXIT_CANARY_SESSION_ID = process.env.WORKER_ADAPTIVE_EXIT_CANARY_SESSION_ID?.trim() || null;
+const WORKER_TRENDING_ENTRY_CHASE_LOOKBACK_SAMPLES = Number(process.env.WORKER_TRENDING_ENTRY_CHASE_LOOKBACK_SAMPLES ?? 4);
+const WORKER_TRENDING_ENTRY_MAX_RECENT_SURGE_BPS = Number(process.env.WORKER_TRENDING_ENTRY_MAX_RECENT_SURGE_BPS ?? 80);
+const WORKER_TRENDING_ENTRY_MIN_PULLBACK_BPS = Number(process.env.WORKER_TRENDING_ENTRY_MIN_PULLBACK_BPS ?? 35);
+const WORKER_TRENDING_ENTRY_MIN_RECLAIM_BPS = Number(process.env.WORKER_TRENDING_ENTRY_MIN_RECLAIM_BPS ?? 20);
+const WORKER_TRENDING_ENTRY_MAX_RANGE_POSITION_BPS = Number(process.env.WORKER_TRENDING_ENTRY_MAX_RANGE_POSITION_BPS ?? 8500);
+const WORKER_TRENDING_ENTRY_MAX_NEGATIVE_WINDOW_BPS = Number(process.env.WORKER_TRENDING_ENTRY_MAX_NEGATIVE_WINDOW_BPS ?? 250);
 const RUNTIME_CONTROL_KEY = 'global_live_runtime';
 const RUNTIME_CONTROL_REFRESH_MS = Number(process.env.RUNTIME_CONTROL_REFRESH_MS ?? 5000);
 let liveSpeedProfileName: RuntimeSpeedProfileName = normalizeRuntimeSpeedProfileName(process.env.WORKER_SPEED_PROFILE);
@@ -1034,6 +1060,8 @@ type PythSample = {
   slot: number;
   sampledAt: string;
 };
+
+type TokenTradeClass = 'major' | 'sol_beta' | 'trend_liquid' | 'long_tail';
 
 type JupiterPriceSample = {
   source: 'jupiter-price-v3';
@@ -4299,6 +4327,38 @@ const getUniverseScoutCandidateMints = (params: {
     .slice(0, Math.max(1, WORKER_UNIVERSE_SCOUT_MAX_CANDIDATES));
 };
 
+const getUniverseScoutPreEntryBlockReason = (sample: UniverseScoutSample): string | null => {
+  if (
+    sample.priceImpactBps !== null
+    && sample.priceImpactBps > WORKER_UNIVERSE_SCOUT_MAX_ENTRY_PRICE_IMPACT_BPS
+  ) {
+    return 'universe_scout_entry_impact_too_high';
+  }
+
+  const appliesTrendingShapeGate = WORKER_TRENDING_ENTRY_SHAPE_GATE_ENABLED
+    && sample.mint !== SOL_MINT
+    && !TRUSTED_ENTRY_UNIVERSE_MINT_SET.has(sample.mint);
+  if (appliesTrendingShapeGate) {
+    const shapeGate = computeTrendingEntryShapeGate({
+      enabled: true,
+      prices: getMomentumTapeForMint(sample.mint).map((tapeSample) => tapeSample.usdPrice),
+      minSamples: WORKER_TRENDING_ENTRY_SHAPE_MIN_SAMPLES,
+      chaseLookbackSamples: WORKER_TRENDING_ENTRY_CHASE_LOOKBACK_SAMPLES,
+      maxRecentSurgeBps: WORKER_TRENDING_ENTRY_MAX_RECENT_SURGE_BPS,
+      minPullbackFromHighBps: WORKER_TRENDING_ENTRY_MIN_PULLBACK_BPS,
+      minReclaimFromLowBps: WORKER_TRENDING_ENTRY_MIN_RECLAIM_BPS,
+      maxRangePositionBps: WORKER_TRENDING_ENTRY_MAX_RANGE_POSITION_BPS,
+      maxNegativeWindowMomentumBps: WORKER_TRENDING_ENTRY_MAX_NEGATIVE_WINDOW_BPS,
+    });
+
+    if (!shapeGate.allowed) {
+      return shapeGate.reason;
+    }
+  }
+
+  return null;
+};
+
 const scoutEntryUniverse = async (params: {
   inputMint: string;
   inputSymbol: string;
@@ -4396,20 +4456,22 @@ const scoutEntryUniverse = async (params: {
   const ranked = samples
     .filter((sample) => sample.routeFound)
     .sort((a, b) => b.score - a.score);
+  const selectableRanked = ranked.filter((sample) => getUniverseScoutPreEntryBlockReason(sample) === null);
 
-  const bestBullishSample = ranked.find((sample) => sample.persistentBullish)
+  const bestBullishSample = selectableRanked.find((sample) => sample.persistentBullish)
     ?? (WORKER_UNIVERSE_SCOUT_REQUIRE_PERSISTENT_BULLISH
       ? null
-      : ranked.find((sample) => sample.signalStatus === 'ready' && sample.regime === 'bullish'))
+      : selectableRanked.find((sample) => sample.signalStatus === 'ready' && sample.regime === 'bullish'))
     ?? null;
   const bestRoutedFallbackSample = WORKER_UNIVERSE_SCOUT_ALLOW_ROUTED_FALLBACK
-    ? (ranked[0] ?? null)
+    ? (selectableRanked[0] ?? null)
     : null;
   const bestSample = bestBullishSample ?? bestRoutedFallbackSample;
 
   return {
     candidates,
     ranked,
+    selectableRanked,
     bestMint: bestSample?.mint ?? null,
     bestPriceImpactBps: bestSample?.priceImpactBps ?? null,
     bestOutAmountAtomic: bestSample?.outAmountAtomic ?? null,
@@ -5327,7 +5389,10 @@ const assessTradeGate = (params: {
   entryCostCapBps: number;
 }): TradeGateAssessment => {
   const signalMagnitudeBps = Math.abs(params.signalSnapshot.momentumBps ?? 0);
-  const expectedEdgeBps = Math.max(0, signalMagnitudeBps - params.signalSnapshot.thresholdBps);
+  const signalThresholdBps = params.signalSnapshot.strategy === 'momentum'
+    ? params.signalSnapshot.thresholdBps
+    : 0;
+  const expectedEdgeBps = Math.max(0, signalMagnitudeBps - signalThresholdBps);
   const networkCostBps = computeCostBpsFromUsd(
     params.economics.estimatedNetworkCostUsd,
     params.economics.tradeNotionalUsd,
@@ -5404,10 +5469,89 @@ const computeReturnBps = (referencePriceUsd: number | null, currentPriceUsd: num
   return Math.round(((currentPriceUsd - referencePriceUsd) / referencePriceUsd) * 10_000);
 };
 
+const entryRejectCooldowns = new Map<string, { expiresAtMs: number; reason: string }>();
+const ENTRY_REJECT_COOLDOWN_REASONS = new Set([
+  'entry_edge_below_cost',
+  'entry_leg_cost_too_high',
+  'price_impact_too_high',
+  'route_stability_impact_too_high',
+  'route_stability_impact_unstable',
+  'route_stability_output_unstable',
+]);
+
+const getEntryRejectCooldownKey = (sessionId: string, mint: string) => sessionId + ':' + mint;
+
+const getActiveEntryRejectCooldownMints = (sessionId: string, nowMs: number): Set<string> => {
+  const active = new Set<string>();
+  for (const [key, cooldown] of entryRejectCooldowns.entries()) {
+    const separatorIdx = key.indexOf(':');
+    const keySessionId = separatorIdx >= 0 ? key.slice(0, separatorIdx) : '';
+    const mint = separatorIdx >= 0 ? key.slice(separatorIdx + 1) : '';
+    if (cooldown.expiresAtMs <= nowMs || !mint) {
+      entryRejectCooldowns.delete(key);
+      continue;
+    }
+    if (keySessionId === sessionId) {
+      active.add(mint);
+    }
+  }
+  return active;
+};
+
+const recordEntryRejectCooldown = (session: RawSession, mint: string | null | undefined, reason: string | null | undefined): void => {
+  if (WORKER_ENTRY_REJECT_COOLDOWN_MS <= 0 || !mint || !reason || !ENTRY_REJECT_COOLDOWN_REASONS.has(reason)) {
+    return;
+  }
+  if (mint === USDC_MINT || mint === SOL_MINT) {
+    return;
+  }
+  const expiresAtMs = Date.now() + WORKER_ENTRY_REJECT_COOLDOWN_MS;
+  entryRejectCooldowns.set(getEntryRejectCooldownKey(session.id, mint), { expiresAtMs, reason });
+  log(
+    'info',
+    session.id,
+    `entry candidate cooldown: ${resolveTokenSymbol(mint)} (${mint}) reason=${reason} ms=${WORKER_ENTRY_REJECT_COOLDOWN_MS}`,
+  );
+};
+
+const recordTradePlanEntryRejectCooldown = (
+  session: RawSession,
+  tradePlan: TradeExecutionPlan | null,
+  reason: string | null | undefined,
+): void => {
+  if (tradePlan?.direction !== 'enter_long') {
+    return;
+  }
+  recordEntryRejectCooldown(session, tradePlan.inventory.outputMint, reason);
+};
+
 const computeExitCostFloorBps = (session: RawSession): number => Math.max(
   positionExitPolicy.exitCostFloorBps,
   session.risk_limits.maxSlippageBps + session.service_control.platformFeeBps + signalPolicy.edgeSafetyBufferBps,
 );
+
+const getTokenTradeClass = (mint: string, symbol?: string | null): TokenTradeClass => {
+  if (mint === SOL_MINT || mint === USDC_MINT) {
+    return 'major';
+  }
+  const normalizedSymbol = (symbol ?? '').toUpperCase();
+  if (normalizedSymbol === 'JUP' || normalizedSymbol === 'JTO') {
+    return 'sol_beta';
+  }
+  const cluster = getClusterForMint(mint);
+  if (cluster === 'sol-core' || cluster === 'sol-lst') {
+    return 'sol_beta';
+  }
+  if (TRUSTED_ENTRY_UNIVERSE_MINT_SET.has(mint)) {
+    return 'trend_liquid';
+  }
+  return 'long_tail';
+};
+
+const isCanaryShadowEnabled = (session: RawSession, enabled: boolean): boolean => {
+  if (!enabled) return false;
+  return WORKER_ADAPTIVE_EXIT_CANARY_SESSION_ID === null || WORKER_ADAPTIVE_EXIT_CANARY_SESSION_ID === session.id;
+};
 
 const computeDynamicExitThresholds = (
   session: RawSession,
@@ -5427,7 +5571,7 @@ const computeDynamicExitThresholds = (
   const decayStartMs = positionExitPolicy.takeProfitTimeDecayStartMs;
   const decayFullMs = positionExitPolicy.takeProfitTimeDecayFullMs;
   const applyTakeProfitTimeDecay = (rawTakeProfitBps: number): number => {
-    if (decayFullMs <= decayStartMs || positionAgeMs <= decayStartMs || rawTakeProfitBps <= costFloorBps) {
+    if (!WORKER_TP_TIME_DECAY_ENABLED || decayFullMs <= decayStartMs || positionAgeMs <= decayStartMs || rawTakeProfitBps <= costFloorBps) {
       return rawTakeProfitBps;
     }
     const progress = Math.min(1, (positionAgeMs - decayStartMs) / (decayFullMs - decayStartMs));
@@ -5488,6 +5632,15 @@ const refreshPositionsMarks = async (
       strategyConfig.supertrend,
     );
     const markedAt = new Date().toISOString();
+    const pnlBps = markedPriceUsd
+      ? computeReturnBps(positionState.entryPriceUsd, markedPriceUsd)
+      : null;
+    const nextMaxFavorableBps = pnlBps === null
+      ? positionState.maxFavorableBps ?? null
+      : Math.max(positionState.maxFavorableBps ?? pnlBps, pnlBps);
+    const nextMaxAdverseBps = pnlBps === null
+      ? positionState.maxAdverseBps ?? null
+      : Math.min(positionState.maxAdverseBps ?? pnlBps, pnlBps);
 
     const nextPositionState: SessionPositionState = !markedPriceUsd
       ? clonePositionState(positionState)
@@ -5503,6 +5656,14 @@ const refreshPositionsMarks = async (
           lastComputedAtrUsd: atr?.atrUsd ?? positionState.lastComputedAtrUsd ?? null,
           lastComputedAtrBps: atr?.atrBps ?? positionState.lastComputedAtrBps ?? null,
           atrComputedAt: atr ? markedAt : (positionState.atrComputedAt ?? null),
+          maxFavorableBps: nextMaxFavorableBps,
+          maxFavorableAt: nextMaxFavorableBps !== (positionState.maxFavorableBps ?? null)
+            ? markedAt
+            : (positionState.maxFavorableAt ?? null),
+          maxAdverseBps: nextMaxAdverseBps,
+          maxAdverseAt: nextMaxAdverseBps !== (positionState.maxAdverseBps ?? null)
+            ? markedAt
+            : (positionState.maxAdverseAt ?? null),
         };
 
     if (
@@ -5512,6 +5673,10 @@ const refreshPositionsMarks = async (
       || nextPositionState.lastComputedAtrUsd !== positionState.lastComputedAtrUsd
       || nextPositionState.lastComputedAtrBps !== positionState.lastComputedAtrBps
       || nextPositionState.atrComputedAt !== positionState.atrComputedAt
+      || nextPositionState.maxFavorableBps !== (positionState.maxFavorableBps ?? null)
+      || nextPositionState.maxFavorableAt !== (positionState.maxFavorableAt ?? null)
+      || nextPositionState.maxAdverseBps !== (positionState.maxAdverseBps ?? null)
+      || nextPositionState.maxAdverseAt !== (positionState.maxAdverseAt ?? null)
     ) {
       changed = true;
     }
@@ -5624,13 +5789,164 @@ const evaluateExitTrigger = (
   };
 };
 
+
+const buildAdaptiveExitShadow = (params: {
+  session: RawSession;
+  evaluations: Array<Record<string, unknown>>;
+}) => {
+  const enabled = isCanaryShadowEnabled(params.session, WORKER_ADAPTIVE_EXIT_SHADOW_ENABLED);
+  const decisions = enabled
+    ? params.evaluations.map((evaluation) => {
+        const pnlBps = typeof evaluation.pnlBps === 'number' ? evaluation.pnlBps : null;
+        const maxFavorableBps = typeof evaluation.maxFavorableBps === 'number' ? evaluation.maxFavorableBps : null;
+        const maxAdverseBps = typeof evaluation.maxAdverseBps === 'number' ? evaluation.maxAdverseBps : null;
+        const tokenClass = evaluation.tokenClass as TokenTradeClass;
+        const symbol = String(evaluation.symbol ?? 'UNKNOWN');
+        if (typeof evaluation.shouldExit === 'boolean' && evaluation.shouldExit) {
+          return {
+            mint: String(evaluation.mint),
+            symbol,
+            tokenClass,
+            action: 'full_exit' as const,
+            reason: `current_policy_${String(evaluation.reason ?? 'exit')}`,
+            pnlBps,
+            maxFavorableBps,
+            maxAdverseBps,
+            suggestedSellBps: 10000,
+            suggestedStopBps: null,
+          };
+        }
+
+        if (pnlBps !== null && pnlBps >= (tokenClass === 'long_tail' ? 60 : 85)) {
+          const costFloorBps = typeof evaluation.thresholds === 'object' && evaluation.thresholds !== null && 'costFloorBps' in evaluation.thresholds
+            ? Number((evaluation.thresholds as { costFloorBps?: unknown }).costFloorBps ?? 0)
+            : 0;
+          return {
+            mint: String(evaluation.mint),
+            symbol,
+            tokenClass,
+            action: 'partial_take_profit' as const,
+            reason: tokenClass === 'long_tail' ? 'fast_partial_for_long_tail_profit' : 'first_partial_profit_zone',
+            pnlBps,
+            maxFavorableBps,
+            maxAdverseBps,
+            suggestedSellBps: tokenClass === 'long_tail' ? 5000 : 3000,
+            suggestedStopBps: Math.max(-10, -costFloorBps),
+          };
+        }
+
+        if ((maxFavorableBps ?? 0) >= 80 && pnlBps !== null && pnlBps > 0) {
+          return {
+            mint: String(evaluation.mint),
+            symbol,
+            tokenClass,
+            action: 'protect_breakeven' as const,
+            reason: 'position_was_profitable_protect_remaining_risk',
+            pnlBps,
+            maxFavorableBps,
+            maxAdverseBps,
+            suggestedSellBps: 0,
+            suggestedStopBps: 0,
+          };
+        }
+
+        return {
+          mint: String(evaluation.mint),
+          symbol,
+          tokenClass,
+          action: 'hold' as const,
+          reason: 'no_adaptive_profit_or_protection_trigger',
+          pnlBps,
+          maxFavorableBps,
+          maxAdverseBps,
+          suggestedSellBps: 0,
+          suggestedStopBps: null,
+        };
+      })
+    : [];
+
+  return {
+    at: new Date().toISOString(),
+    enabled,
+    mode: 'shadow' as const,
+    canarySessionId: WORKER_ADAPTIVE_EXIT_CANARY_SESSION_ID,
+    decisions,
+  };
+};
+
+const buildGridChopShadow = (params: {
+  session: RawSession;
+  evaluations: Array<Record<string, unknown>>;
+}) => {
+  const enabled = isCanaryShadowEnabled(params.session, WORKER_GRID_CHOP_SHADOW_ENABLED);
+  const marketRegime = enabled && params.evaluations.some((evaluation) => evaluation.signalRegime === 'flat')
+    ? 'chop' as const
+    : enabled
+      ? 'trend' as const
+      : 'unknown' as const;
+
+  return {
+    at: new Date().toISOString(),
+    enabled,
+    mode: 'shadow' as const,
+    canarySessionId: WORKER_ADAPTIVE_EXIT_CANARY_SESSION_ID,
+    marketRegime,
+    reason: enabled
+      ? (marketRegime === 'chop' ? 'flat_signal_present_virtual_grid_observation' : 'trend_signal_present_grid_disabled')
+      : 'grid_chop_shadow_disabled',
+    candidates: enabled
+      ? params.evaluations.map((evaluation) => {
+          const pnlBps = typeof evaluation.pnlBps === 'number' ? evaluation.pnlBps : null;
+          const drawdownBps = typeof evaluation.trailingDrawdownBps === 'number' ? evaluation.trailingDrawdownBps : null;
+          const tokenClass = evaluation.tokenClass as TokenTradeClass;
+          const action = marketRegime !== 'chop'
+            ? 'grid_disabled' as const
+            : pnlBps !== null && pnlBps >= 60
+              ? 'grid_sell_zone' as const
+              : drawdownBps !== null && drawdownBps <= -60
+                ? 'grid_buy_zone' as const
+                : 'grid_hold' as const;
+          return {
+            mint: String(evaluation.mint),
+            symbol: String(evaluation.symbol ?? 'UNKNOWN'),
+            tokenClass,
+            action,
+            pnlBps,
+            drawdownBps,
+            reason: action === 'grid_disabled'
+              ? 'not_chop_regime'
+              : action === 'grid_sell_zone'
+                ? 'range_upper_profit_zone'
+                : action === 'grid_buy_zone'
+                  ? 'range_lower_pullback_zone'
+                  : 'inside_grid_neutral_zone',
+          };
+        })
+      : [],
+  };
+};
+
 const getSessionStrategyConfig = (session: RawSession) => {
   const configured = session.service_control.strategyConfig;
+  const configuredMomentum = configured?.momentum;
+
+  const resolvedMomentumLookbackSamples = Math.max(
+    signalPolicy.momentumLookbackSamples,
+    Number(configuredMomentum?.lookbackSamples ?? signalPolicy.momentumLookbackSamples),
+  );
+  const resolvedMomentumThresholdBps = Math.max(
+    signalPolicy.momentumThresholdBps,
+    Number(configuredMomentum?.thresholdBps ?? signalPolicy.momentumThresholdBps),
+  );
+  const resolvedMomentumEdgeSafetyBufferBps = Math.max(
+    signalPolicy.edgeSafetyBufferBps,
+    Number(configuredMomentum?.edgeSafetyBufferBps ?? signalPolicy.edgeSafetyBufferBps),
+  );
 
   const momentum = {
-    lookbackSamples: configured?.momentum?.lookbackSamples ?? signalPolicy.momentumLookbackSamples,
-    thresholdBps: configured?.momentum?.thresholdBps ?? signalPolicy.momentumThresholdBps,
-    edgeSafetyBufferBps: configured?.momentum?.edgeSafetyBufferBps ?? signalPolicy.edgeSafetyBufferBps,
+    lookbackSamples: resolvedMomentumLookbackSamples,
+    thresholdBps: resolvedMomentumThresholdBps,
+    edgeSafetyBufferBps: resolvedMomentumEdgeSafetyBufferBps,
   };
 
   const meanReversion: BollingerConfig = {
@@ -5959,6 +6275,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
     } satisfies Record<NonNullable<SessionPositionState['exitReason']>, number>;
     const nextPositions = { ...positionsState.positions };
     let positionsChanged = false;
+    const exitEvaluations: Array<Record<string, unknown>> = [];
     const exitCandidates: Array<{
       mint: string;
       position: SessionPositionState;
@@ -5974,6 +6291,27 @@ const executeTrade = async (session: RawSession): Promise<void> => {
         ? (strategySignalByKey.get(positionStrategy) ?? buildSessionSignalForStrategy(positionStrategy, pythTape, strategyConfig))
         : buildRuntimeSignalForMint(mint, positionStrategy, strategyConfig);
       const exitTrigger = evaluateExitTrigger(session, position, signalForPosition);
+      exitEvaluations.push({
+        at: new Date().toISOString(),
+        mint,
+        symbol: getPositionSymbol(position),
+        tokenClass: getTokenTradeClass(mint, getPositionSymbol(position)),
+        strategy: positionStrategy,
+        shouldExit: exitTrigger.shouldExit,
+        reason: exitTrigger.reason,
+        pnlBps: exitTrigger.pnlBps,
+        trailingDrawdownBps: exitTrigger.trailingDrawdownBps,
+        maxFavorableBps: position.maxFavorableBps ?? null,
+        maxAdverseBps: position.maxAdverseBps ?? null,
+        entryPriceUsd: position.entryPriceUsd,
+        markPriceUsd: exitTrigger.markPriceUsd,
+        highWaterPriceUsd: position.highWaterPriceUsd,
+        thresholds: exitTrigger.thresholds,
+        signalStatus: signalForPosition.status,
+        signalRegime: signalForPosition.regime,
+        signalMomentumBps: signalForPosition.momentumBps,
+        pendingExitReason: position.pendingExitReason,
+      });
 
       if (!exitTrigger.shouldExit) {
         if (position.pendingExitReason !== null) {
@@ -5992,6 +6330,15 @@ const executeTrade = async (session: RawSession): Promise<void> => {
         signal: signalForPosition,
         trigger: exitTrigger,
       });
+    }
+
+    if (WORKER_EXIT_TELEMETRY_ENABLED && exitEvaluations.length > 0) {
+      await persistServiceControl(session, {
+        lastExitEvaluations: exitEvaluations,
+        lastExitEvaluation: exitEvaluations,
+        adaptiveExitShadow: buildAdaptiveExitShadow({ session, evaluations: exitEvaluations }),
+        gridChopShadow: buildGridChopShadow({ session, evaluations: exitEvaluations }),
+      } as any);
     }
 
     if (positionsChanged) {
@@ -6083,12 +6430,12 @@ const executeTrade = async (session: RawSession): Promise<void> => {
         riskAdjustedAmountAtomic: null,
       };
 
-      if ((positionMint === SOL_MINT && sizing.skip) || exitAmountLamports <= 0) {
+      if (exitAmountLamports <= 0) {
         try {
           await persistLastSizing(session, {
             at: new Date().toISOString(),
             decision: 'skipped',
-            reason: (positionMint === SOL_MINT && sizing.skip) ? sizing.reason : 'no_exit_inventory',
+            reason: 'no_exit_inventory',
             balanceLamports: String(exitWalletBalanceAtomic),
             reserveLamports: String(exitReserveAtomic),
             tradableLamports: String(exitTradableAtomic),
@@ -6115,9 +6462,17 @@ const executeTrade = async (session: RawSession): Promise<void> => {
         log(
           'info',
           session.id,
-          `sizing skip (${(positionMint === SOL_MINT && sizing.skip) ? sizing.reason : 'no_exit_inventory'}): ${positionSymbol} balance=${exitWalletBalanceAtomic} reserve=${exitReserveAtomic} tradable=${exitTradableAtomic} exitAmount=${exitAmountLamports}`,
+          `sizing skip (no_exit_inventory): ${positionSymbol} balance=${exitWalletBalanceAtomic} reserve=${exitReserveAtomic} tradable=${exitTradableAtomic} exitAmount=${exitAmountLamports}`,
         );
         return;
+      }
+
+      if (positionMint === SOL_MINT && sizing.skip) {
+        log(
+          'info',
+          session.id,
+          `forced SOL exit bypassing entry sizing skip (${sizing.reason}): ${positionSymbol} balance=${exitWalletBalanceAtomic} reserve=${exitReserveAtomic} tradable=${exitTradableAtomic} exitAmount=${exitAmountLamports}`,
+        );
       }
 
       tradePlan = {
@@ -6464,6 +6819,15 @@ const executeTrade = async (session: RawSession): Promise<void> => {
       }
       const lockedClusters = getActiveStopLossLockedClusters(session, Date.now());
       const excludedClusters = new Set<string>([...cappedClusters, ...lockedClusters]);
+      const entryRejectCooldownMints = getActiveEntryRejectCooldownMints(session.id, Date.now());
+      const excludedScoutMints = new Set<string>([...openPositionMints, ...entryRejectCooldownMints]);
+      if (entryRejectCooldownMints.size > 0) {
+        log(
+          'info',
+          session.id,
+          `universe scout excluding ${entryRejectCooldownMints.size} recent rejected candidate(s): ${[...entryRejectCooldownMints].map((mint) => resolveTokenSymbol(mint)).join(',')}`,
+        );
+      }
 
       const scout = await scoutEntryUniverse({
         inputMint: entryInventory.inputMint,
@@ -6476,7 +6840,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
         lookbackSamples: strategyConfig.momentum.lookbackSamples,
         thresholdBps: strategyConfig.momentum.thresholdBps,
         requiredSignalSamples: MIN_ENTRY_SIGNAL_PERSISTENCE_SAMPLES,
-        excludedMints: openPositionMints,
+        excludedMints: excludedScoutMints,
         excludedClusters,
         useTrustedFallback: useBasicPairEntryFallback,
       });
@@ -6484,7 +6848,9 @@ const executeTrade = async (session: RawSession): Promise<void> => {
       if (!scout.bestMint) {
         const scoutSnapshot = buildUniverseScoutGateSnapshot(scout);
         const scoutBlockedReason = scoutSnapshot.routeFoundCount > 0
-          ? 'universe_scout_no_bullish_candidate'
+          ? (scout.selectableRanked.length > 0
+            ? 'universe_scout_no_bullish_candidate'
+            : 'universe_scout_no_preentry_eligible_candidate')
           : 'universe_scout_no_route';
         await persistTradeDecision(session, 'blocked', scoutBlockedReason);
         await persistLastTradeGate(session, {
@@ -6501,7 +6867,9 @@ const executeTrade = async (session: RawSession): Promise<void> => {
           session.id,
           scoutBlockedReason === 'universe_scout_no_bullish_candidate'
             ? `universe scout blocked entry: no bullish candidate (routes=${scoutSnapshot.routeFoundCount}/${scoutSnapshot.candidateCount}, bullish=${scoutSnapshot.bullishRouteCount})`
-            : `universe scout blocked entry: no route (candidates=${scout.candidates.length})`,
+            : scoutBlockedReason === 'universe_scout_no_preentry_eligible_candidate'
+              ? `universe scout blocked entry: no pre-entry eligible candidate (routes=${scoutSnapshot.routeFoundCount}/${scoutSnapshot.candidateCount}, bullish=${scoutSnapshot.bullishRouteCount})`
+              : `universe scout blocked entry: no route (candidates=${scout.candidates.length})`,
         );
         return;
       }
@@ -6635,6 +7003,41 @@ const executeTrade = async (session: RawSession): Promise<void> => {
       return;
     }
 
+    const appliesTrendingShapeGate = WORKER_TRENDING_ENTRY_SHAPE_GATE_ENABLED
+      && selectedEntryMint !== SOL_MINT
+      && !TRUSTED_ENTRY_UNIVERSE_MINT_SET.has(selectedEntryMint);
+    if (appliesTrendingShapeGate) {
+      const shapeGate = computeTrendingEntryShapeGate({
+        enabled: true,
+        prices: getMomentumTapeForMint(selectedEntryMint).map((sample) => sample.usdPrice),
+        minSamples: WORKER_TRENDING_ENTRY_SHAPE_MIN_SAMPLES,
+        chaseLookbackSamples: WORKER_TRENDING_ENTRY_CHASE_LOOKBACK_SAMPLES,
+        maxRecentSurgeBps: WORKER_TRENDING_ENTRY_MAX_RECENT_SURGE_BPS,
+        minPullbackFromHighBps: WORKER_TRENDING_ENTRY_MIN_PULLBACK_BPS,
+        minReclaimFromLowBps: WORKER_TRENDING_ENTRY_MIN_RECLAIM_BPS,
+        maxRangePositionBps: WORKER_TRENDING_ENTRY_MAX_RANGE_POSITION_BPS,
+        maxNegativeWindowMomentumBps: WORKER_TRENDING_ENTRY_MAX_NEGATIVE_WINDOW_BPS,
+      });
+
+      if (!shapeGate.allowed) {
+        await persistTradeDecision(session, 'blocked', shapeGate.reason);
+        await persistLastTradeGate(session, {
+          at: new Date().toISOString(),
+          decision: 'blocked',
+          reason: shapeGate.reason,
+          expectedEdgeBps: tokenEntrySignal.momentumBps,
+          estimatedCostBps: shapeGate.metrics?.recentSurgeBps ?? null,
+          safetyBufferBps: strategyConfig.momentum.edgeSafetyBufferBps,
+        });
+        log(
+          'info',
+          session.id,
+          `entry blocked: trending shape gate for ${resolveTokenSymbol(selectedEntryMint)} (${selectedEntryMint}) reason=${shapeGate.reason} samples=${shapeGate.metrics?.sampleCount ?? 'n/a'} window=${shapeGate.metrics?.windowMomentumBps ?? 'n/a'}bps surge=${shapeGate.metrics?.recentSurgeBps ?? 'n/a'}bps pullback=${shapeGate.metrics?.pullbackFromHighBps ?? 'n/a'}bps reclaim=${shapeGate.metrics?.reclaimFromLowBps ?? 'n/a'}bps rangePos=${shapeGate.metrics?.rangePositionBps ?? 'n/a'}bps`,
+        );
+        return;
+      }
+    }
+
     entryInventory.outputMint = selectedEntryMint;
     entryInventory.outputSymbol = resolveTokenSymbol(selectedEntryMint);
 
@@ -6712,6 +7115,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
     });
 
     if (!routeStability.stable) {
+      recordEntryRejectCooldown(session, selectedEntryMint, routeStability.reason);
       await persistTradeDecision(session, 'blocked', routeStability.reason);
       await persistLastTradeGate(session, {
         at: new Date().toISOString(),
@@ -6763,6 +7167,72 @@ const executeTrade = async (session: RawSession): Promise<void> => {
   let sizingReason: string | null = null;
   let observedPriceImpactBps: number | null = null;
   const forceExitExecution = shouldForceExitExecution(tradePlan.direction, tradePlan.exitReason);
+
+  const prePrepareEntryGate = computePrePrepareEntryGate({
+    direction: tradePlan.direction,
+    signalMomentumBps: tradePlan.signalSnapshot.momentumBps,
+    signalThresholdBps: tradePlan.signalSnapshot.strategy === 'momentum'
+      ? Math.max(
+        Number(tradePlan.signalSnapshot.thresholdBps ?? 0),
+        strategyConfig.momentum.thresholdBps,
+      )
+      : 0,
+    safetyBufferBps: strategyConfig.momentum.edgeSafetyBufferBps,
+  });
+
+  if (tradePlan.direction === 'enter_long') {
+    log(
+      'info',
+      session.id,
+      `pre-prepare entry gate v3: sourceRev=${WORKER_SOURCE_REV} momentumBps=${tradePlan.signalSnapshot.momentumBps ?? 'null'} signalThresholdBps=${tradePlan.signalSnapshot.thresholdBps ?? 'null'} configThresholdBps=${strategyConfig.momentum.thresholdBps} safetyBufferBps=${strategyConfig.momentum.edgeSafetyBufferBps} blocked=${prePrepareEntryGate ? 'true' : 'false'}`,
+    );
+  }
+
+  if (prePrepareEntryGate && !prePrepareEntryGate.allowed) {
+    recordTradePlanEntryRejectCooldown(session, tradePlan, prePrepareEntryGate.reason);
+    await persistTradeDecision(session, 'blocked', prePrepareEntryGate.reason);
+    await persistLastTradeGate(session, {
+      at: new Date().toISOString(),
+      decision: 'blocked',
+      reason: prePrepareEntryGate.reason,
+      expectedEdgeBps: prePrepareEntryGate.expectedEdgeBps,
+      estimatedCostBps: prePrepareEntryGate.estimatedCostBps,
+      safetyBufferBps: prePrepareEntryGate.safetyBufferBps,
+    });
+    try {
+      await persistLastSizing(session, {
+        at: new Date().toISOString(),
+        decision: 'skipped',
+        reason: prePrepareEntryGate.reason,
+        balanceLamports: String(balance),
+        reserveLamports: String(positionState.status === 'flat' ? MIN_SOL_OPERATING_RESERVE_LAMPORTS : tradePlan.inventory.reserveAtomic),
+        tradableLamports: String(positionState.status === 'flat' ? Math.max(0, balance - MIN_SOL_OPERATING_RESERVE_LAMPORTS) : tradePlan.inventory.tradableAtomic),
+        fractionBps: tradePlan.direction === 'enter_long' || tradePlan.direction === 'exit_long' ? 10000 : sizingPolicy.tradeFractionBps,
+        targetLamports: String(positionState.status === 'flat' ? 0 : tradePlan.inventory.targetAtomic),
+        minTradeLamports: String(positionState.status === 'flat' ? 0 : tradePlan.inventory.minTradeAtomic),
+        maxTradeLamports: String(positionState.status === 'flat' ? 0 : tradePlan.inventory.maxTradeAtomic),
+        amountLamports: null,
+        remainingRiskBudgetUsd,
+        quotedOutAmountAtomic: null,
+        minimumOutputAtomic: null,
+        priceImpactPct: null,
+        estimatedNetworkCostLamports: null,
+        estimatedNetworkCostOutputAtomic: null,
+        worstCaseSlippageOutputAtomic: null,
+        totalWorstCaseCostOutputAtomic: null,
+        riskAdjustedAmountLamports: null,
+        tradeContext: buildSizingTradeContext(tradePlan.inventory),
+      });
+    } catch (err) {
+      log('warn', session.id, `failed to persist lastSizing: ${String(err)}`);
+    }
+    log(
+      'info',
+      session.id,
+      `pre-prepare trade gate blocked v3 (${prePrepareEntryGate.reason}): sourceRev=${WORKER_SOURCE_REV} expectedEdgeBps=${prePrepareEntryGate.expectedEdgeBps} estimatedCostBps=${prePrepareEntryGate.estimatedCostBps} safetyBufferBps=${prePrepareEntryGate.safetyBufferBps}`,
+    );
+    return;
+  }
 
   for (let attempt = 1; attempt <= 2; attempt++) {
     log(
@@ -6921,6 +7391,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
   }
 
   if (!forceExitExecution && economics && (!economics.economicallyViable || !economics.withinRiskBudget)) {
+    recordTradePlanEntryRejectCooldown(session, tradePlan, sizingReason ?? 'economics_blocked');
     await persistTradeDecision(session, 'blocked', sizingReason ?? 'economics_blocked');
     await persistLastTradeGate(session, {
       at: new Date().toISOString(),
@@ -6979,6 +7450,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
   }
 
   if (tradeGate && !tradeGate.allowed) {
+    recordTradePlanEntryRejectCooldown(session, tradePlan, tradeGate.reason);
     await persistTradeDecision(session, 'blocked', tradeGate.reason);
     await persistLastTradeGate(session, {
       at: new Date().toISOString(),
@@ -7034,6 +7506,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
   }
 
   if (sizingReason === 'price_impact_too_high') {
+    recordTradePlanEntryRejectCooldown(session, tradePlan, sizingReason);
     await persistTradeDecision(session, 'blocked', sizingReason);
     await persistLastTradeGate(session, {
       at: new Date().toISOString(),
@@ -7322,8 +7795,8 @@ const getLastTradeAttemptMs = (session: RawSession): number => {
 };
 
 const hasExceededTargetDuration = (session: RawSession): boolean => {
-  const targetDurationMinutes = session.user_control?.targetDurationMinutes;
-  if (!targetDurationMinutes || targetDurationMinutes <= 0) return false;
+  const targetDurationMinutes = Number(session.user_control?.targetDurationMinutes);
+  if (!Number.isFinite(targetDurationMinutes) || targetDurationMinutes < 1) return false;
 
   const startedAtMs = session.started_at?.getTime() ?? session.requested_at.getTime();
   return Date.now() - startedAtMs >= targetDurationMinutes * 60_000;
@@ -7991,10 +8464,43 @@ const sweepFunds = async (session: RawSession): Promise<SweepResult> => {
   // the remaining SOL in place as recovery gas so a later sweep/liquidation (once
   // the owner ATA exists or the route is affordable) can complete the return path.
   // Only drain to exactly zero when nothing valued is being left behind.
+  // Solana caps a serialized transaction at 1232 bytes. A full session sweep can
+  // queue dozens of instructions (per-token ATA-create + transfer + close), which
+  // overruns a single transaction and previously threw `RangeError: encoding
+  // overruns Uint8Array` at serialize time -- bricking the entire return flow and
+  // stranding user funds. Pack the token instructions into size-bounded batches and
+  // send each sequentially, then sweep the remaining SOL last, so funds always
+  // return home (fail toward return).
+  const TX_SERIALIZED_SIZE_TARGET = 1180;
+
+  const probeBlockhash = (await rlGetLatestBlockhash()).blockhash;
+  const measureBatchSize = (instructions: TransactionInstruction[]): number =>
+    new VersionedTransaction(
+      new TransactionMessage({
+        payerKey: sessionPubkey,
+        recentBlockhash: probeBlockhash,
+        instructions,
+      }).compileToV0Message(),
+    ).serialize().length;
+
+  const tokenBatches: TransactionInstruction[][] = [];
+  for (const ix of ixs) {
+    const current = tokenBatches[tokenBatches.length - 1];
+    if (current && measureBatchSize([...current, ix]) <= TX_SERIALIZED_SIZE_TARGET) {
+      current.push(ix);
+    } else {
+      tokenBatches.push([ix]);
+    }
+  }
+
+  // Reserve the base fee for every transaction we are about to send (each token
+  // batch plus one final SOL-sweep tx) so the SOL sweep cannot overdraw the fee
+  // payer across multiple sequential transactions.
+  const totalSweepTxCount = tokenBatches.length + 1;
   const solToSend = computeSessionSolSweepLamports({
     solBalance,
     ownerAtaCreationCost,
-    txFeeLamports: TX_FEE_LAMPORTS,
+    txFeeLamports: TX_FEE_LAMPORTS * totalSweepTxCount,
     mayLeaveResidualState,
   });
 
@@ -8002,56 +8508,64 @@ const sweepFunds = async (session: RawSession): Promise<SweepResult> => {
     log(
       'warn',
       session.id,
-      `retaining ${Math.max(0, solBalance - ownerAtaCreationCost - TX_FEE_LAMPORTS)} lamports as recovery gas â€” a valued token position could not be swept home; not draining SOL to zero to avoid orphaning it`,
+      `retaining ${Math.max(0, solBalance - ownerAtaCreationCost - TX_FEE_LAMPORTS * totalSweepTxCount)} lamports as recovery gas -- a valued token position could not be swept home; not draining SOL to zero to avoid orphaning it`,
     );
   }
 
-  if (solToSend > 0) {
-    ixs.push(SystemProgram.transfer({
-      fromPubkey: sessionPubkey,
-      toPubkey: ownerPubkey,
-      lamports: solToSend,
-    }));
-    log('info', session.id, `queuing SOL sweep: ${solToSend} lamports â†’ ${ownerWallet}`);
-  }
-
-  if (ixs.length === 0) {
-    log('info', session.id, 'session wallet empty â€” nothing to sweep');
+  if (tokenBatches.length === 0 && solToSend <= 0) {
+    log('info', session.id, 'session wallet empty -- nothing to sweep');
     return getWalletSweepSnapshot(sessionPubkey);
   }
 
-  const { blockhash, lastValidBlockHeight } = await rlGetLatestBlockhash();
-  const message = new TransactionMessage({
-    payerKey: sessionPubkey,
-    recentBlockhash: blockhash,
-    instructions: ixs,
-  }).compileToV0Message();
+  const sendSweepBatch = async (instructions: TransactionInstruction[], label: string): Promise<boolean> => {
+    const { blockhash, lastValidBlockHeight } = await rlGetLatestBlockhash();
+    const message = new TransactionMessage({
+      payerKey: sessionPubkey,
+      recentBlockhash: blockhash,
+      instructions,
+    }).compileToV0Message();
 
-  const sweepTx = new VersionedTransaction(message);
-  sweepTx.sign([keypair]);
+    const sweepTx = new VersionedTransaction(message);
+    sweepTx.sign([keypair]);
 
-  const sig = await rlSendRawTransaction(sweepTx.serialize());
-  let confirmationSettled = false;
-  try {
-    const confirmation = await rlConfirmTransaction({ signature: sig, blockhash, lastValidBlockHeight });
-
-    if (confirmation.value.err) {
-      throw new Error(`sweep transaction failed: ${JSON.stringify(confirmation.value.err)}`);
-    }
-
-    confirmationSettled = true;
-    log('info', session.id, `sweep confirmed: ${sig}`);
-  } catch (error) {
-    if (isConfirmationExpiryError(error)) {
-      log('warn', session.id, `sweep confirmation expired for ${sig}; verifying wallet state directly`);
-    } else {
+    const sig = await rlSendRawTransaction(sweepTx.serialize());
+    try {
+      const confirmation = await rlConfirmTransaction({ signature: sig, blockhash, lastValidBlockHeight });
+      if (confirmation.value.err) {
+        throw new Error(`sweep transaction failed: ${JSON.stringify(confirmation.value.err)}`);
+      }
+      log('info', session.id, `sweep ${label} confirmed: ${sig}`);
+      return true;
+    } catch (error) {
+      if (isConfirmationExpiryError(error)) {
+        log('warn', session.id, `sweep ${label} confirmation expired for ${sig}; verifying wallet state directly`);
+        return false;
+      }
       throw error;
     }
+  };
+
+  let confirmationSettled = false;
+  for (let batchIndex = 0; batchIndex < tokenBatches.length; batchIndex += 1) {
+    const settled = await sendSweepBatch(
+      tokenBatches[batchIndex],
+      `token batch ${batchIndex + 1}/${tokenBatches.length}`,
+    );
+    confirmationSettled = confirmationSettled || settled;
+  }
+
+  if (solToSend > 0) {
+    log('info', session.id, `queuing SOL sweep: ${solToSend} lamports -> ${ownerWallet}`);
+    const settled = await sendSweepBatch(
+      [SystemProgram.transfer({ fromPubkey: sessionPubkey, toPubkey: ownerPubkey, lamports: solToSend })],
+      'SOL sweep',
+    );
+    confirmationSettled = confirmationSettled || settled;
   }
 
   const postSweepSnapshot = await waitForPostSweepSnapshot(session.id, sessionPubkey, preSweepSnapshot);
   if (!confirmationSettled && !sweepSnapshotChanged(preSweepSnapshot, postSweepSnapshot)) {
-    throw new Error(`sweep transaction ${sig} expired before confirmation and wallet state did not change`);
+    throw new Error('sweep expired before confirmation and wallet state did not change');
   }
 
   if (!mayLeaveResidualState && hasResidualWalletState(postSweepSnapshot)) {
@@ -8621,6 +9135,7 @@ console.log(JSON.stringify({
   service: 'roguezero-worker',
   status: 'starting',
   deployCanary: DEPLOY_CANARY,
+  sourceRev: WORKER_SOURCE_REV,
   configReady: configReport.readyForLiveIntegration,
   missingLiveValues: configReport.missingLiveValues,
   pollIntervalMs: POLL_MS,
@@ -8684,6 +9199,14 @@ console.log(JSON.stringify({
     universeScoutBlockPumpMintEntries: WORKER_BLOCK_PUMP_MINT_ENTRIES,
     universeScoutRequirePersistentBullish: WORKER_UNIVERSE_SCOUT_REQUIRE_PERSISTENT_BULLISH,
     universeScoutMaxEntryPriceImpactBps: WORKER_UNIVERSE_SCOUT_MAX_ENTRY_PRICE_IMPACT_BPS,
+    trendingEntryShapeGateEnabled: WORKER_TRENDING_ENTRY_SHAPE_GATE_ENABLED,
+    trendingEntryShapeMinSamples: WORKER_TRENDING_ENTRY_SHAPE_MIN_SAMPLES,
+    trendingEntryChaseLookbackSamples: WORKER_TRENDING_ENTRY_CHASE_LOOKBACK_SAMPLES,
+    trendingEntryMaxRecentSurgeBps: WORKER_TRENDING_ENTRY_MAX_RECENT_SURGE_BPS,
+    trendingEntryMinPullbackBps: WORKER_TRENDING_ENTRY_MIN_PULLBACK_BPS,
+    trendingEntryMinReclaimBps: WORKER_TRENDING_ENTRY_MIN_RECLAIM_BPS,
+    trendingEntryMaxRangePositionBps: WORKER_TRENDING_ENTRY_MAX_RANGE_POSITION_BPS,
+    trendingEntryMaxNegativeWindowBps: WORKER_TRENDING_ENTRY_MAX_NEGATIVE_WINDOW_BPS,
     maxConsecutiveLosses: WORKER_MAX_CONSECUTIVE_LOSSES,
     maxBadFillStreak: WORKER_MAX_BAD_FILL_STREAK,
     volatilitySizingEnabled: WORKER_VOLATILITY_SIZING_ENABLED,

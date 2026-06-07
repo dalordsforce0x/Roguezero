@@ -322,7 +322,6 @@ const API = '/api/rz';
 
 const DEFAULT_SESSION_REQUEST = {
   startingBalanceAtomic: '0',
-  targetDurationMinutes: 0,
   stopLossBehavior: 'stop' as const,
   riskLimits: {
     maxSessionLossUsd: 50,
@@ -1351,6 +1350,7 @@ export default function Home() {
       profitMode?: 'send_to_owner' | 'compound';
       profitPayoutToken?: 'SOL' | 'USDC';
       stopDisposition?: 'return_tokens' | 'liquidate';
+      clientActionSource?: string;
     },
   ) => {
     if (auth.status !== 'authorized') return;
@@ -1365,6 +1365,7 @@ export default function Home() {
           ...(options?.profitMode ? { profitMode: options.profitMode } : {}),
           ...(options?.profitPayoutToken ? { profitPayoutToken: options.profitPayoutToken } : {}),
           ...(options?.stopDisposition ? { stopDisposition: options.stopDisposition } : {}),
+          ...(options?.clientActionSource ? { clientActionSource: options.clientActionSource } : {}),
         }),
       });
       if (res.status === 403) {
@@ -1455,7 +1456,10 @@ export default function Home() {
 
     try {
       setStoppingSession(true);
-      await handleAction(primarySession.id, 'stop', { stopDisposition: disposition });
+      await handleAction(primarySession.id, 'stop', {
+        stopDisposition: disposition,
+        clientActionSource: `stop-modal:${disposition}`,
+      });
       setShowStopModal(false);
     } finally {
       setStoppingSession(false);
@@ -1978,7 +1982,10 @@ export default function Home() {
                           if (isRunning && !window.confirm('Stop this session? This ends the session and returns funds to your owner wallet.')) {
                             return;
                           }
-                          void handleAction(primarySession.id, 'stop', { stopDisposition: 'return_tokens' });
+                          void handleAction(primarySession.id, 'stop', {
+                            stopDisposition: 'return_tokens',
+                            clientActionSource: 'inline-stop-button:return_tokens',
+                          });
                         }
                       }}
                       disabled={!canStop || actioning === primarySession?.id}

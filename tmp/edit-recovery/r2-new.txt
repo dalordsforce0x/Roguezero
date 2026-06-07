@@ -1,0 +1,44 @@
+    // ENTRY QUALITY GATE. The decisive "is this token tradeable for profit" test:
+    // the take-profit this token can realistically REACH (its measured ATR x the
+    // take-profit ATR multiplier) must clear the measured round-trip cost (entry +
+    // exit impact + platform fee) by a safety ratio. This is what actually keeps
+    // us in liquid majors -- a token only survives if its own volatility can pay
+    // its own friction. Post-pump micro-caps whose exit toll dwarfs their leftover
+    // volatility are rejected here instead of bought and then force-sold at a loss.
+    if (WORKER_ENTRY_QUALITY_GATE_ENABLED) {
+      const candidateAtr = computeAtrFromTape(
+        getMomentumTapeForMint(selectedEntryMint),
+        strategyConfig.supertrend,
+      );
+      const roundTripCostBps =
+        (exitLiquidity.roundTripFrictionBps ?? exitLiquidity.exitImpactBps ?? 0)
+        + session.service_control.platformFeeBps;
+      const reachableTakeProfitBps = candidateAtr
+        ? candidateAtr.atrBps * positionExitPolicy.atrTakeProfitMultiplier
+        : null;
+      const qualityOk = reachableTakeProfitBps === null
+        ? !WORKER_ENTRY_QUALITY_REQUIRE_ATR
+        : reachableTakeProfitBps >= roundTripCostBps * WORKER_ENTRY_QUALITY_TP_COST_RATIO;
+      if (!qualityOk) {
+        await persistTradeDecision(session, 'blocked', 'entry_quality_below_threshold');
+        await persistLastTradeGate(session, {
+          at: new Date().toISOString(),
+          decision: 'blocked',
+          reason: 'entry_quality_below_threshold',
+          expectedEdgeBps: reachableTakeProfitBps !== null ? Math.round(reachableTakeProfitBps) : null,
+          estimatedCostBps: Math.round(roundTripCostBps),
+          safetyBufferBps: strategyConfig.momentum.edgeSafetyBufferBps,
+        });
+        log(
+          'info',
+          session.id,
+          `entry blocked: quality below threshold for ${entryInventory.outputSymbol} atrBps=${candidateAtr?.atrBps ?? 'n/a'} reachableTP=${reachableTakeProfitBps !== null ? Math.round(reachableTakeProfitBps) : 'n/a'}bps roundTripCost=${Math.round(roundTripCostBps)}bps ratio=${WORKER_ENTRY_QUALITY_TP_COST_RATIO}`,
+        );
+        return;
+      }
+    }
+
+    // Cache the measured exit toll for this mint so the exit cost floor can price
+    // take-profit/stop-loss against the REAL cost to get out (give-back fix),
+    // instead of the assumed risk_limits.maxSlippageBps.
+    if (WORKER_MEASURED_EXIT_COST_FLOOR_ENABLED) {

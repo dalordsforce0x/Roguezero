@@ -1,8 +1,7 @@
 /**
- * POST /api/sessions/[id]/stop — admin force-stop a session
+ * POST /api/sessions/[id]/stop — disabled by user-only stop invariant.
  */
 import { NextRequest, NextResponse } from 'next/server';
-import { forceStopSession } from '@/lib/db';
 
 export async function POST(
   _req: NextRequest,
@@ -10,11 +9,11 @@ export async function POST(
 ) {
   try {
     const { id } = await params;
-    const session = await forceStopSession(id);
-    if (!session) {
-      return NextResponse.json({ error: 'Session not found or already stopped' }, { status: 404 });
-    }
-    return NextResponse.json({ success: true, session });
+    return NextResponse.json({
+      success: false,
+      id,
+      error: 'Admin force-stop is disabled. Only the user can stop a trading session.',
+    }, { status: 403 });
   } catch (err) {
     console.error('[POST /api/sessions/[id]/stop]', err);
     return NextResponse.json({ error: String(err) }, { status: 500 });
