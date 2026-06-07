@@ -112,7 +112,7 @@ const FUNDING_POLL_FALLBACK_MS = Number(process.env.WORKER_FUNDING_POLL_FALLBACK
 // RPC at most this often. onAccountChange keeps it fresh between revalidations; the TTL is a
 // safety net against websocket gaps. Cuts the per-cycle pre-trade balance RPC for 350 bots.
 const BALANCE_CACHE_TTL_MS = Number(process.env.WORKER_BALANCE_CACHE_TTL_MS ?? 60000);
-const AWAITING_FUNDING_TIMEOUT_MINUTES = Number(process.env.WORKER_AWAITING_FUNDING_TIMEOUT_MINUTES ?? 120);
+const AWAITING_FUNDING_TIMEOUT_MINUTES = Number(process.env.WORKER_AWAITING_FUNDING_TIMEOUT_MINUTES ?? 3);
 const POST_SUBMIT_RECONCILE_GRACE_MS = Number(process.env.WORKER_POST_SUBMIT_RECONCILE_GRACE_MS ?? 10000);
 const STALE_SESSION_MINUTES = Number(process.env.WORKER_STALE_SESSION_MINUTES ?? 0);
 const EXECUTION_QUEUE_CLAIMS_PER_TICK = Number(process.env.WORKER_EXECUTION_QUEUE_CLAIMS_PER_TICK ?? 5);

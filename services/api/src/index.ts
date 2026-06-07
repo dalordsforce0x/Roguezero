@@ -3692,7 +3692,7 @@ app.post('/sessions', { config: { rateLimit: { max: 5, timeWindow: '1 minute' } 
     : 30;
   const normalizedTargetDurationMinutes = Number.isFinite(req.targetDurationMinutes) && req.targetDurationMinutes >= 1
     ? req.targetDurationMinutes
-    : 1440;
+    : 0;
 
   try {
     const session = await createSessionWithKey({
