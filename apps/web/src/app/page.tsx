@@ -1409,6 +1409,15 @@ export default function Home() {
       return;
     }
 
+    // The modal is already open for this ready session — do not re-seed the
+    // choices from the stored values. Background session polls give
+    // `primarySession` a fresh reference every cycle, which would otherwise
+    // re-run this effect and clobber the user's in-progress SOL/compound
+    // selection before they can hit "Save and Start".
+    if (showProfitModeModal) {
+      return;
+    }
+
     setProfitModeChoice(primarySession.userControl?.profitHandling?.mode ?? 'send_to_owner');
     setProfitPayoutTokenChoice(primarySession.userControl?.profitHandling?.payoutToken ?? 'USDC');
     setShowProfitModeModal(true);
