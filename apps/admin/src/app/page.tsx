@@ -1713,7 +1713,8 @@ export default function Home() {
   const [editingUser, setEditingUser] = useState<User | null>(null);
   const [editingGroup, setEditingGroup] = useState<UserGroup | null>(null);
   const [form, setForm]           = useState({ username: '', walletAddress: '', duration: '1month', maxWalletUsd: '10000', groupId: '' });
-  const [groupForm, setGroupForm] = useState({ name: '', botLimit: '1', existingUserId: '', newUsername: '', newWalletAddress: '', newDuration: '1month', newMaxWalletUsd: '10000' });
+  const [groupForm, setGroupForm] = useState({ name: '', botLimit: '1', addUserIds: [] as string[], removeUserIds: [] as string[], newUsername: '', newWalletAddress: '', newDuration: '1month', newMaxWalletUsd: '10000' });
+  const [groupUserSearch, setGroupUserSearch] = useState('');
   const [formBusy, setFormBusy]   = useState(false);
   const [assigning, setAssigning] = useState<string | null>(null);
   const [toggling, setToggling]   = useState<string | null>(null);
@@ -2060,7 +2061,8 @@ export default function Home() {
   async function handleCreateOrUpdateGroup(e: React.FormEvent) {
     e.preventDefault();
     setFormBusy(true);
-    const existingUserIds = groupForm.existingUserId ? [groupForm.existingUserId] : [];
+    const addUserIds = groupForm.addUserIds;
+    const removeUserIds = groupForm.removeUserIds;
     const newUsers = groupForm.newUsername && groupForm.newWalletAddress ? [{
       username: groupForm.newUsername,
       walletAddress: groupForm.newWalletAddress,
@@ -2073,17 +2075,19 @@ export default function Home() {
       body: JSON.stringify(editingGroup ? {
         name: groupForm.name,
         botLimit: Number(groupForm.botLimit),
-        addUserIds: existingUserIds,
+        addUserIds,
+        removeUserIds,
       } : {
         name: groupForm.name,
         botLimit: Number(groupForm.botLimit),
-        existingUserIds,
+        existingUserIds: addUserIds,
         newUsers,
       }),
     });
     setShowGroupModal(false);
     setEditingGroup(null);
-    setGroupForm({ name: '', botLimit: '1', existingUserId: '', newUsername: '', newWalletAddress: '', newDuration: '1month', newMaxWalletUsd: '10000' });
+    setGroupForm({ name: '', botLimit: '1', addUserIds: [], removeUserIds: [], newUsername: '', newWalletAddress: '', newDuration: '1month', newMaxWalletUsd: '10000' });
+    setGroupUserSearch('');
     setFormBusy(false);
     void loadUsers();
   }
@@ -2105,12 +2109,14 @@ export default function Home() {
     setGroupForm({
       name: group?.name ?? '',
       botLimit: String(group?.bot_limit ?? 1),
-      existingUserId: '',
+      addUserIds: [],
+      removeUserIds: [],
       newUsername: '',
       newWalletAddress: '',
       newDuration: '1month',
       newMaxWalletUsd: '10000',
     });
+    setGroupUserSearch('');
     setShowGroupModal(true);
   }
 
@@ -3230,18 +3236,84 @@ export default function Home() {
                   />
                 </div>
               </div>
+              {editingGroup && (() => {
+                const members = users.filter(u => u.group_id === editingGroup.id);
+                const remaining = members.filter(u => !groupForm.removeUserIds.includes(u.id)).length;
+                return (
+                  <div>
+                    <label className="block text-xs text-gray-400 mb-1.5">Current members ({remaining})</label>
+                    <div className="max-h-40 overflow-y-auto rounded-lg border border-gray-800 bg-gray-950/50 divide-y divide-gray-800/70">
+                      {members.length === 0 ? (
+                        <p className="text-xs text-gray-700 italic px-3 py-2">No members yet.</p>
+                      ) : members.map(u => {
+                        const marked = groupForm.removeUserIds.includes(u.id);
+                        return (
+                          <div key={u.id} className="flex items-center justify-between px-3 py-2">
+                            <div className={marked ? 'opacity-40 line-through' : ''}>
+                              <p className="text-sm text-white">{u.username}</p>
+                              <p className="text-[10px] text-gray-600 font-mono">{shortWallet(u.wallet_address)}</p>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => setGroupForm(f => ({
+                                ...f,
+                                removeUserIds: marked ? f.removeUserIds.filter(id => id !== u.id) : [...f.removeUserIds, u.id],
+                              }))}
+                              className={`text-[10px] px-2 py-1 rounded-md border transition-colors ${marked ? 'border-gray-700 text-gray-400 hover:text-white' : 'border-red-900 text-red-400 hover:text-red-200 hover:border-red-500'}`}
+                            >
+                              {marked ? 'Undo' : 'Remove'}
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                );
+              })()}
               <div>
-                <label className="block text-xs text-gray-400 mb-1.5">Add Existing User</label>
-                <select
-                  value={groupForm.existingUserId}
-                  onChange={e => setGroupForm(f => ({ ...f, existingUserId: e.target.value }))}
-                  className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2.5 text-sm text-white focus:outline-none focus:border-violet-500 transition-colors"
-                >
-                  <option value="">Choose a user...</option>
-                  {users.filter(u => !editingGroup || u.group_id !== editingGroup.id).map(user => (
-                    <option key={user.id} value={user.id}>{user.username} {user.group_name ? `(currently ${user.group_name})` : ''}</option>
-                  ))}
-                </select>
+                <label className="block text-xs text-gray-400 mb-1.5">Add users to this group</label>
+                <input
+                  type="text"
+                  value={groupUserSearch}
+                  onChange={e => setGroupUserSearch(e.target.value)}
+                  placeholder="Search by username or wallet…"
+                  className="w-full mb-2 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-xs text-white placeholder-gray-600 focus:outline-none focus:border-violet-500 transition-colors"
+                />
+                {(() => {
+                  const term = groupUserSearch.trim().toLowerCase();
+                  const candidates = users
+                    .filter(u => !editingGroup || u.group_id !== editingGroup.id)
+                    .filter(u => !term || u.username.toLowerCase().includes(term) || u.wallet_address.toLowerCase().includes(term));
+                  return (
+                    <div className="max-h-44 overflow-y-auto rounded-lg border border-gray-800 bg-gray-950/50 divide-y divide-gray-800/70">
+                      {candidates.length === 0 ? (
+                        <p className="text-xs text-gray-700 italic px-3 py-2">No matching users.</p>
+                      ) : candidates.map(u => {
+                        const checked = groupForm.addUserIds.includes(u.id);
+                        return (
+                          <label key={u.id} className="flex items-center gap-3 px-3 py-2 cursor-pointer hover:bg-gray-900/60">
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              onChange={() => setGroupForm(f => ({
+                                ...f,
+                                addUserIds: checked ? f.addUserIds.filter(id => id !== u.id) : [...f.addUserIds, u.id],
+                              }))}
+                              className="accent-violet-500"
+                            />
+                            <div className="flex-1 min-w-0">
+                              <p className="text-sm text-white truncate">{u.username}</p>
+                              <p className="text-[10px] text-gray-600 font-mono truncate">{shortWallet(u.wallet_address)}{u.group_name ? ` · currently ${u.group_name}` : ''}</p>
+                            </div>
+                          </label>
+                        );
+                      })}
+                    </div>
+                  );
+                })()}
+                {groupForm.addUserIds.length > 0 && (
+                  <p className="text-[10px] text-violet-300 mt-1.5">{groupForm.addUserIds.length} user{groupForm.addUserIds.length === 1 ? '' : 's'} will be added</p>
+                )}
               </div>
               {!editingGroup && (
                 <div className="rounded-lg border border-gray-800 bg-gray-950/50 p-3 space-y-3">
@@ -3283,7 +3355,7 @@ export default function Home() {
               <div className="flex gap-3 pt-1">
                 <button
                   type="button"
-                  onClick={() => { setShowGroupModal(false); setEditingGroup(null); }}
+                  onClick={() => { setShowGroupModal(false); setEditingGroup(null); setGroupUserSearch(''); }}
                   className="flex-1 bg-gray-800 hover:bg-gray-700 text-gray-300 text-sm font-medium py-2.5 rounded-lg transition-colors"
                 >
                   Cancel
