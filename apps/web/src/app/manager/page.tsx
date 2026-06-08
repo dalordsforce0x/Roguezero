@@ -79,11 +79,6 @@ const formatUsd = (value: number | undefined | null) => (
     : '—'
 );
 
-const formatExpiry = (iso: string | null) => {
-  if (!iso) return '—';
-  return new Date(iso).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-};
-
 const openPositionsOf = (session: ManagerSession | undefined): SessionPosition[] => {
   if (!session?.serviceControl) return [];
   const fromMap = Object.values(session.serviceControl.positionsState?.positions ?? {})
@@ -241,59 +236,72 @@ export default function ManagerPage() {
     );
   }
 
+  const settingsMode = selectedSession?.userControl?.profitHandling?.mode === 'compound' ? 'compound' : 'send to owner';
+  const payoutToken = selectedSession?.userControl?.profitHandling?.payoutToken ?? 'SOL';
+  const realized = selectedSession?.funding?.realizedPnlUsd;
+
   return (
     <div
-      className="flex min-h-screen flex-col bg-cover bg-center text-white"
-      style={{ backgroundImage: "url('/media/roguezerobg.png')" }}
+      className="flex min-h-screen flex-col text-white"
+      style={{ background: 'radial-gradient(circle at 50% -10%, #515151 0%, #343434 55%, #232323 100%)' }}
     >
       {/* ── Header ──────────────────────────────────────────────────── */}
-      <header className="flex items-center justify-between border-b border-cyan-200/15 bg-slate-950/70 px-6 py-3 backdrop-blur">
-        <a href="/" className="flex items-center gap-3 transition hover:opacity-80" title="Back to RogueZero">
+      <header className="grid grid-cols-[1fr_auto_1fr] items-start gap-4 px-8 pt-5 pb-3">
+        {/* left: logo back to main UI */}
+        <a href="/" className="flex items-center gap-3 justify-self-start transition hover:opacity-80" title="Back to RogueZero">
           {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img src="/rz-logo.png" alt="RogueZero" className="h-10 w-auto" />
-          <span className="text-[10px] uppercase tracking-[0.28em] text-cyan-300">access manage</span>
+          <img src="/rz-logo.png" alt="RogueZero" className="h-12 w-auto" />
         </a>
-        <div className="flex items-center gap-4">
-          <div className="text-right">
-            <div className="text-sm font-semibold text-emerald-400">{overview?.manager.name ?? 'Manager'}</div>
-            <div className="font-mono text-[11px] text-cyan-200/70">{overview?.manager.maskedKey ?? '—'}</div>
-          </div>
+
+        {/* center: Access Manage */}
+        <div className="self-center justify-self-center text-lg font-medium tracking-wide text-white underline underline-offset-4">
+          Access Manage
+        </div>
+
+        {/* right: sign-out pill + manager / access key */}
+        <div className="flex items-start justify-end gap-5 justify-self-end">
           <button
             type="button"
             onClick={() => void logout()}
-            className="rounded-lg border border-white/10 bg-black/40 px-3 py-1.5 text-xs text-cyan-100 transition hover:bg-black/60"
+            className="flex items-center gap-2 rounded-full bg-linear-to-b from-sky-400 to-blue-600 px-4 py-1.5 text-sm font-semibold text-white shadow-[0_2px_10px_rgba(37,99,235,0.45)] transition hover:brightness-110"
+            title="Sign out of the manager console"
           >
-            sign out
+            SIGN OUT
+            <span className="flex h-5 w-5 items-center justify-center rounded-full bg-white/25 text-[11px]">&#128100;</span>
           </button>
+          <div className="space-y-1 text-sm">
+            <div className="flex items-baseline gap-2">
+              <span className="text-white">Manager:</span>
+              <span className="min-w-45 border-b border-white/60 pb-0.5 font-medium text-emerald-300">
+                {overview?.manager.name ?? '—'}
+              </span>
+            </div>
+            <div className="flex items-baseline gap-2">
+              <span className="text-white">Access Key:</span>
+              <span className="min-w-45 border-b border-white/60 pb-0.5 font-mono text-cyan-200/80">
+                {overview?.manager.maskedKey ?? '—'}
+              </span>
+            </div>
+          </div>
         </div>
       </header>
 
-      {/* ── Body: two panes ────────────────────────────────────────── */}
-      <main className="flex flex-1 gap-4 overflow-hidden p-4">
-        {/* LEFT: groups + bot tiles */}
-        <aside className="flex w-85 shrink-0 flex-col overflow-y-auto rounded-xl border border-cyan-200/15 bg-slate-950/55 p-3">
-          <div className="mb-2 flex items-center justify-between px-1">
-            <span className="text-[10px] uppercase tracking-[0.22em] text-cyan-300/70">access manage</span>
-            <span className="text-[10px] text-cyan-300/50">
-              {overview?.groups.length ?? 0} groups · {overview?.users.length ?? 0} bots
-            </span>
-          </div>
-
-          <div className="space-y-4">
+      {/* ── Body: gallery | divider | detail ───────────────────────── */}
+      <main className="flex flex-1 gap-6 overflow-hidden px-8 pb-6">
+        {/* LEFT: wide controller-tile gallery */}
+        <section className="flex-1 overflow-y-auto pr-2">
+          <div className="space-y-7">
             {(overview?.groups ?? []).map((group) => {
               const groupUsers = (overview?.users ?? []).filter((u) => u.groupId === group.id);
               return (
                 <div key={group.id}>
-                  <div className="mb-2 flex items-center justify-between px-1">
-                    <span className="text-xs font-semibold text-cyan-100">{group.name}</span>
-                    <span className="text-[10px] text-cyan-300/55">{groupUsers.length}/{group.botLimit}</span>
+                  <div className="mb-3 text-lg font-medium text-white underline underline-offset-4">
+                    {group.name}
                   </div>
                   {groupUsers.length === 0 ? (
-                    <div className="rounded-lg border border-dashed border-white/10 px-3 py-4 text-center text-[11px] text-cyan-100/40">
-                      no bots in this group
-                    </div>
+                    <div className="text-sm text-white/35">no bots in this group</div>
                   ) : (
-                    <div className="grid grid-cols-2 gap-2">
+                    <div className="flex flex-wrap gap-x-6 gap-y-5">
                       {groupUsers.map((user) => {
                         const session = sessionByUser.get(user.id);
                         const live = LIVE_STATUSES.has(session?.status ?? '');
@@ -303,28 +311,34 @@ export default function ManagerPage() {
                             key={user.id}
                             type="button"
                             onClick={() => setSelectedUserId(user.id)}
-                            className={`group flex flex-col overflow-hidden rounded-lg border bg-black/40 text-left transition ${
-                              selected
-                                ? 'border-emerald-400 shadow-[0_0_18px_rgba(16,185,129,0.25)]'
-                                : 'border-white/10 hover:border-cyan-300/40'
-                            }`}
+                            className="group flex w-40 flex-col items-center gap-2"
                           >
-                            {/* tile thumbnail = controller screen preview */}
-                            <div className="relative flex h-16 items-center justify-center bg-linear-to-br from-slate-800/60 to-slate-950/60">
-                              {/* eslint-disable-next-line @next/next/no-img-element */}
-                              <img src="/rz-logo.png" alt="" className="h-7 w-auto opacity-30" />
-                              <span
-                                className={`absolute right-1.5 top-1.5 h-2 w-2 rounded-full ${
-                                  live ? 'bg-emerald-400 shadow-[0_0_6px_rgba(16,185,129,0.8)]' : 'bg-gray-600'
-                                }`}
-                              />
-                            </div>
-                            <div className="px-2 py-1.5">
-                              <div className="truncate text-[11px] font-medium text-white">{user.username}</div>
-                              <div className={`text-[9px] uppercase tracking-wider ${live ? 'text-emerald-400' : 'text-gray-500'}`}>
-                                {session?.status ?? 'idle'}
+                            {/* controller-screen tile */}
+                            <div
+                              className={`relative w-full overflow-hidden rounded-2xl p-1.5 shadow-[0_6px_16px_rgba(0,0,0,0.45)] transition ${
+                                selected
+                                  ? 'bg-linear-to-b from-lime-300/80 to-lime-600/60 ring-2 ring-lime-400'
+                                  : 'bg-linear-to-b from-gray-200/90 to-gray-400/80'
+                              }`}
+                            >
+                              <div className="relative aspect-4/3 w-full overflow-hidden rounded-xl bg-[#0a1420]">
+                                {/* eslint-disable-next-line @next/next/no-img-element */}
+                                <img
+                                  src="/media/bird-alpha-preview.png"
+                                  alt=""
+                                  className="absolute inset-0 h-full w-full object-cover opacity-90"
+                                />
+                                <span
+                                  className={`absolute right-2 top-2 h-2.5 w-2.5 rounded-full ${
+                                    live ? 'bg-emerald-400 shadow-[0_0_8px_rgba(16,185,129,0.9)]' : 'bg-gray-600'
+                                  }`}
+                                />
                               </div>
                             </div>
+                            {/* caption */}
+                            <span className="text-center text-sm text-lime-400 underline underline-offset-2">
+                              {user.username}/ {session?.status ?? 'idle'}
+                            </span>
                           </button>
                         );
                       })}
@@ -334,131 +348,113 @@ export default function ManagerPage() {
               );
             })}
             {(overview?.groups.length ?? 0) === 0 && (
-              <div className="rounded-lg border border-dashed border-white/10 px-3 py-6 text-center text-xs text-cyan-100/40">
-                no groups assigned to this manager
-              </div>
+              <div className="text-sm text-white/40">no groups assigned to this manager</div>
             )}
           </div>
-        </aside>
+        </section>
 
-        {/* RIGHT: device + info + chart */}
-        <section className="flex flex-1 flex-col gap-4 overflow-y-auto">
+        {/* DIVIDER */}
+        <div className="my-1 w-2 shrink-0 rounded-full bg-black/80" />
+
+        {/* RIGHT: quick view + info + pnl chart */}
+        <section className="flex w-110 shrink-0 flex-col gap-5 overflow-y-auto pr-1">
           {!selectedUser ? (
-            <div className="flex flex-1 items-center justify-center rounded-xl border border-cyan-200/15 bg-slate-950/45 text-sm text-cyan-100/50">
+            <div className="flex flex-1 items-center justify-center text-sm text-white/45">
               select a bot to view its console
             </div>
           ) : (
             <>
-              <div className="grid flex-1 grid-cols-1 gap-4 lg:grid-cols-[1.4fr_1fr]">
-                {/* QUICK VIEW device */}
-                <div className="flex flex-col rounded-xl border border-cyan-200/15 bg-slate-950/55 p-3">
-                  <div className="mb-2 flex items-center justify-between px-1">
-                    <span className="text-[10px] uppercase tracking-[0.22em] text-cyan-300/70">quick view</span>
-                    <span className="font-mono text-[10px] text-cyan-200/60">{selectedUser.username}</span>
-                  </div>
-                  <div className="relative flex-1 overflow-hidden rounded-lg border border-white/10 bg-black/50">
-                    {sessionLive ? (
-                      <iframe
-                        title={`bot-${selectedUser.id}`}
-                        src="/"
-                        className="h-full w-full"
-                      />
-                    ) : (
-                      <div className="flex h-full min-h-70 flex-col items-center justify-center gap-3 text-center">
-                        {/* eslint-disable-next-line @next/next/no-img-element */}
-                        <img src="/rz-logo.png" alt="" className="h-12 w-auto opacity-25" />
-                        <div className="text-xs text-cyan-100/55">embedded bot console</div>
-                        <button
-                          type="button"
-                          onClick={() => setSessionLive(true)}
-                          className="rounded-lg border border-cyan-300/25 bg-cyan-500/10 px-4 py-2 text-xs text-cyan-100 transition hover:bg-cyan-500/18"
-                        >
-                          go to session (sign in required)
-                        </button>
+              <div className="text-center text-lg font-medium text-white underline underline-offset-4">QUiCK VIEW</div>
+
+              {/* device frame */}
+              <div className="rounded-4xl bg-linear-to-b from-gray-100 to-gray-400 p-3 shadow-[0_10px_30px_rgba(0,0,0,0.5)]">
+                <div className="overflow-hidden rounded-[1.4rem] bg-black">
+                  {sessionLive ? (
+                    <iframe title={`bot-${selectedUser.id}`} src="/" className="h-80 w-full" />
+                  ) : (
+                    <div className="relative flex h-80 flex-col">
+                      {/* mini controller chrome */}
+                      <div className="flex items-center justify-between px-4 py-2 text-[9px] uppercase tracking-widest text-cyan-200/70">
+                        <span className="flex gap-2"><span>start</span><span>stop</span></span>
+                        <span className="flex gap-2"><span className="text-cyan-300">activity</span><span className="text-white/40">dashboard</span></span>
                       </div>
-                    )}
-                  </div>
-                </div>
-
-                {/* Info block */}
-                <div className="flex flex-col gap-3 rounded-xl border border-cyan-200/15 bg-slate-950/55 p-4">
-                  <div className="text-[10px] uppercase tracking-[0.22em] text-cyan-300/70">bot info</div>
-
-                  <InfoRow label="Username" value={selectedUser.username} />
-                  <InfoRow label="Owner wallet" value={shortWallet(selectedUser.walletAddress)} mono />
-                  <InfoRow
-                    label="Status"
-                    value={
-                      <span className={LIVE_STATUSES.has(selectedSession?.status ?? '') ? 'text-emerald-400' : 'text-gray-400'}>
-                        {selectedSession?.status ?? 'idle'}
-                      </span>
-                    }
-                  />
-                  <InfoRow
-                    label="Solscan"
-                    value={
-                      selectedSession?.sessionWallet ? (
-                        <a
-                          href={`https://solscan.io/account/${selectedSession.sessionWallet}`}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="font-mono text-cyan-300 hover:text-cyan-200"
-                        >
-                          {shortWallet(selectedSession.sessionWallet)}
-                        </a>
-                      ) : '—'
-                    }
-                  />
-
-                  <div className="grid grid-cols-2 gap-2 pt-1">
-                    <Stat label="Realized PnL" value={formatUsd(selectedSession?.funding?.realizedPnlUsd)} positive={(selectedSession?.funding?.realizedPnlUsd ?? 0) >= 0} />
-                    <Stat label="Unrealized" value={formatUsd(selectedSession?.funding?.unrealizedPnlUsd)} positive={(selectedSession?.funding?.unrealizedPnlUsd ?? 0) >= 0} />
-                    <Stat label="Fees captured" value={formatUsd(selectedSession?.funding?.capturedFeesUsd)} positive />
-                    <Stat label="Open positions" value={String(selectedPositions.length)} />
-                  </div>
-
-                  {selectedPositions.length > 0 && (
-                    <div className="space-y-1 rounded-lg border border-white/5 bg-black/30 p-2">
-                      {selectedPositions.slice(0, 4).map((pos, i) => (
-                        <div key={i} className="flex items-center justify-between text-[11px] text-cyan-100/75">
-                          <span>{pos.positionSymbol ?? shortWallet(pos.positionMint)}</span>
-                          <span className="font-mono">{pos.lastMarkedPriceUsd != null ? `$${pos.lastMarkedPriceUsd.toFixed(4)}` : '—'}</span>
-                        </div>
-                      ))}
+                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                      <img src="/media/bird-alpha-preview.png" alt="" className="absolute inset-0 z-0 h-full w-full object-contain opacity-80" />
+                      <div className="mt-auto px-4 py-3 text-center text-[10px] text-cyan-100/50">connect wallet to initialize controller.</div>
                     </div>
                   )}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setSessionLive(true)}
+                  className="mx-auto mt-2 block text-sm text-white underline underline-offset-2 transition hover:text-cyan-200"
+                >
+                  go to session (sign in required)
+                </button>
+              </div>
 
-                  <div className="mt-auto border-t border-white/10 pt-2">
-                    <div className="text-[10px] uppercase tracking-[0.22em] text-cyan-300/70">settings</div>
-                    <div className="mt-1 flex items-center justify-between text-[11px] text-cyan-100/75">
-                      <span>Profit handling</span>
-                      <span className="text-cyan-200">
-                        {selectedSession?.userControl?.profitHandling?.mode === 'compound' ? 'compound' : 'send to owner'}
-                      </span>
-                    </div>
-                    <div className="flex items-center justify-between text-[11px] text-cyan-100/75">
-                      <span>Payout token</span>
-                      <span className="text-cyan-200">{selectedSession?.userControl?.profitHandling?.payoutToken ?? '—'}</span>
-                    </div>
-                    <div className="flex items-center justify-between text-[11px] text-cyan-100/75">
-                      <span>License expiry</span>
-                      <span className="text-cyan-200">{formatExpiry(selectedUser.expiryDate)}</span>
-                    </div>
-                  </div>
+              {/* info block */}
+              <div className="space-y-1.5 text-center text-sm">
+                <InfoLine label="Username" value={selectedUser.username} />
+                <InfoLine label="license key" value={shortWallet(selectedUser.walletAddress)} mono />
+                <InfoLine
+                  label="Status"
+                  value={
+                    <span className={LIVE_STATUSES.has(selectedSession?.status ?? '') ? 'text-emerald-400' : 'text-gray-300'}>
+                      {selectedSession?.status ?? 'idle'}
+                    </span>
+                  }
+                />
+                <InfoLine
+                  label="Solscan Url"
+                  value={
+                    selectedSession?.sessionWallet ? (
+                      <a
+                        href={`https://solscan.io/account/${selectedSession.sessionWallet}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="font-mono text-cyan-300 hover:text-cyan-200"
+                      >
+                        {shortWallet(selectedSession.sessionWallet)}
+                      </a>
+                    ) : '—'
+                  }
+                />
+                <InfoLine
+                  label="PnL"
+                  value={
+                    <span className={(realized ?? 0) >= 0 ? 'text-emerald-400' : 'text-red-300'}>
+                      {formatUsd(realized)}
+                    </span>
+                  }
+                />
+                <InfoLine label="Open Positions" value={String(selectedPositions.length)} />
+                <div className="pt-1 text-white">
+                  <span className="underline underline-offset-2">Settings</span>
+                  <span className="text-white/80">: take profits ({payoutToken.toLowerCase()})</span>
+                </div>
+                <div className="text-white/80">
+                  {settingsMode === 'compound' ? 'compound' : 'send to owner'} /{' '}
+                  <span className="text-emerald-400">{settingsMode === 'compound' ? 'YES' : 'NO'}</span>
                 </div>
               </div>
 
-              {/* PnL chart */}
-              <div className="rounded-xl border border-cyan-200/15 bg-slate-950/55 p-4">
-                <div className="mb-2 flex items-center justify-between">
-                  <span className="text-[10px] uppercase tracking-[0.22em] text-cyan-300/70">pnl</span>
-                  <span className={`text-sm font-semibold ${(selectedSession?.funding?.realizedPnlUsd ?? 0) >= 0 ? 'text-emerald-400' : 'text-red-300'}`}>
-                    {formatUsd(selectedSession?.funding?.realizedPnlUsd)}
-                  </span>
-                </div>
-                <div className="flex h-28 items-center justify-center rounded-lg border border-white/5 bg-black/30 text-[11px] text-cyan-100/40">
-                  pnl chart
-                </div>
+              {/* pnl chart */}
+              <div className="rounded-md border border-cyan-300/30 bg-[#0a1018] p-2">
+                <svg viewBox="0 0 300 110" preserveAspectRatio="none" className="h-28 w-full">
+                  <defs>
+                    <pattern id="grid" width="20" height="18" patternUnits="userSpaceOnUse">
+                      <path d="M20 0H0V18" fill="none" stroke="rgba(56,189,248,0.12)" strokeWidth="1" />
+                    </pattern>
+                  </defs>
+                  <rect width="300" height="110" fill="url(#grid)" />
+                  <polyline
+                    fill="none"
+                    stroke="#7dd3fc"
+                    strokeWidth="1.6"
+                    points="6,96 30,92 36,70 54,74 66,46 78,58 96,30 108,44 126,40 150,58 168,52 186,66 204,58 222,40 240,46 258,22 276,30 294,8"
+                  />
+                </svg>
               </div>
             </>
           )}
@@ -468,22 +464,13 @@ export default function ManagerPage() {
   );
 }
 
-function InfoRow({ label, value, mono }: { label: string; value: React.ReactNode; mono?: boolean }) {
+function InfoLine({ label, value, mono }: { label: string; value: React.ReactNode; mono?: boolean }) {
   return (
-    <div className="flex items-center justify-between text-[11px]">
-      <span className="text-cyan-100/55">{label}</span>
-      <span className={`text-white ${mono ? 'font-mono' : ''}`}>{value}</span>
-    </div>
-  );
-}
-
-function Stat({ label, value, positive }: { label: string; value: string; positive?: boolean }) {
-  return (
-    <div className="rounded-lg border border-white/5 bg-black/30 p-2">
-      <div className="text-[9px] uppercase tracking-wider text-cyan-300/55">{label}</div>
-      <div className={`text-sm font-semibold ${positive === undefined ? 'text-white' : positive ? 'text-emerald-400' : 'text-red-300'}`}>
+    <div className="flex items-baseline justify-center gap-2">
+      <span className="text-white underline underline-offset-2">{label}:</span>
+      <span className={`min-w-37.5 border-b border-white/40 pb-0.5 text-left text-white ${mono ? 'font-mono' : ''}`}>
         {value}
-      </div>
+      </span>
     </div>
   );
 }
