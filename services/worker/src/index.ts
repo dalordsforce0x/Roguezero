@@ -5958,8 +5958,8 @@ const GRID_RANGE_MAX_WIDTH_BPS = Number(process.env.WORKER_GRID_RANGE_MAX_WIDTH_
 const GRID_BAND_EDGE_PCT = Number(process.env.WORKER_GRID_BAND_EDGE_PCT ?? 30);
 const GRID_BREAKOUT_MOVE_BPS = Number(process.env.WORKER_GRID_BREAKOUT_MOVE_BPS ?? 40);
 const GRID_MIN_SAMPLES = Number(process.env.WORKER_GRID_MIN_SAMPLES ?? 8);
-const GRID_RANGE_WINDOW = Number(process.env.WORKER_GRID_RANGE_WINDOW ?? 60);
-const GRID_RECENT_MOVE_LOOKBACK = Number(process.env.WORKER_GRID_RECENT_MOVE_LOOKBACK ?? 3);
+const GRID_RANGE_WINDOW = Number(process.env.WORKER_GRID_RANGE_WINDOW ?? 450);
+const GRID_RECENT_MOVE_LOOKBACK = Number(process.env.WORKER_GRID_RECENT_MOVE_LOOKBACK ?? 15);
 // Safety margin (bps) required ON TOP of the derived round-trip break-even before a grid
 // range is considered tradeable. Keeps grid signals honestly above worst-case cost.
 const GRID_PROFIT_MARGIN_BPS = Number(process.env.WORKER_GRID_PROFIT_MARGIN_BPS ?? 15);

@@ -535,7 +535,7 @@ export const getWorkerPricePollPolicy = (env: NodeJS.ProcessEnv): WorkerPricePol
   const pythPollMs = Number(env.WORKER_PYTH_POLL_MS ?? 3_000);
   const jupiterPricePollMs = Number(env.WORKER_JUPITER_PRICE_POLL_MS ?? 60_000);
   const maxConsecutiveFailures = Number(env.WORKER_PRICE_MAX_CONSECUTIVE_FAILURES ?? 10);
-  const sharedTapeSize = Number(env.WORKER_SHARED_MARKET_TAPE_SIZE ?? 120);
+  const sharedTapeSize = Number(env.WORKER_SHARED_MARKET_TAPE_SIZE ?? 900);
   return { pythPollMs, jupiterPricePollMs, maxConsecutiveFailures, sharedTapeSize };
 };
 
