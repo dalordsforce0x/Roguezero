@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { assignUsersToGroup, updateUserGroup, usersTableReady } from '@/lib/db';
+import { assignUsersToGroup, deleteUserGroup, updateUserGroup, usersTableReady } from '@/lib/db';
 
 const normalizeUserIds = (value: unknown): string[] => Array.isArray(value)
   ? value.filter((item): item is string => typeof item === 'string' && item.length > 0)
@@ -37,6 +37,21 @@ export async function PATCH(
     return NextResponse.json({ success: true, group });
   } catch (err) {
     console.error('[PATCH /api/user-groups/[id]]', err);
+    return NextResponse.json({ success: false, error: String(err) }, { status: 500 });
+  }
+}
+
+export async function DELETE(
+  _req: NextRequest,
+  { params }: { params: Promise<{ id: string }> },
+) {
+  try {
+    const { id } = await params;
+    await usersTableReady();
+    await deleteUserGroup(id);
+    return NextResponse.json({ success: true });
+  } catch (err) {
+    console.error('[DELETE /api/user-groups/[id]]', err);
     return NextResponse.json({ success: false, error: String(err) }, { status: 500 });
   }
 }

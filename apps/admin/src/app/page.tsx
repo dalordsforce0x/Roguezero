@@ -2183,6 +2183,16 @@ export default function Home() {
     void loadUsers();
   }
 
+  async function handleDeleteGroup(group: UserGroup) {
+    const memberCount = users.filter(u => u.group_id === group.id).length;
+    const warn = memberCount > 0
+      ? `Delete group "${group.name}"? Its ${memberCount} member${memberCount === 1 ? '' : 's'} will be removed from the group (users are NOT deleted). This cannot be undone.`
+      : `Delete group "${group.name}"? This cannot be undone.`;
+    if (!confirm(warn)) return;
+    await fetch(`/api/user-groups/${group.id}`, { method: 'DELETE' });
+    void loadUsers();
+  }
+
   async function handleToggleAccess(id: string, current: boolean) {
     setToggling(id);
     await fetch(`/api/users/${id}`, {
@@ -2390,12 +2400,20 @@ export default function Home() {
                           <h3 className="text-white font-semibold">{group.name}</h3>
                           <p className="text-xs text-gray-600 mt-1">{group.member_count} users · {group.bot_limit} bots allocated</p>
                         </div>
+                        <div className="flex items-center gap-2 shrink-0">
                         <button
                           onClick={() => openGroupModal(group)}
                           className="text-xs border border-gray-700 hover:border-violet-400 text-gray-400 hover:text-violet-200 px-3 py-1.5 rounded-md transition-colors"
                         >
                           Edit
                         </button>
+                        <button
+                          onClick={() => void handleDeleteGroup(group)}
+                          className="text-xs border border-gray-800 hover:border-red-500 text-gray-600 hover:text-red-300 px-3 py-1.5 rounded-md transition-colors"
+                        >
+                          Delete
+                        </button>
+                        </div>
                       </div>
                       <div className="mt-3 flex items-center gap-2">
                         <span className="text-[10px] uppercase tracking-wider text-gray-600">Manager</span>

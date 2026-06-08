@@ -227,6 +227,12 @@ export async function assignUsersToGroup(groupId: string | null, userIds: string
   );
 }
 
+export async function deleteUserGroup(id: string): Promise<void> {
+  // Detach members first so no user is left pointing at a deleted group.
+  await getPool().query(`UPDATE rz_users SET group_id = NULL, updated_at = NOW() WHERE group_id = $1`, [id]);
+  await getPool().query(`DELETE FROM rz_user_groups WHERE id = $1`, [id]);
+}
+
 // ── Manager (access-management) operations ───────────────────────────────────
 
 const MANAGER_SELECT = `
