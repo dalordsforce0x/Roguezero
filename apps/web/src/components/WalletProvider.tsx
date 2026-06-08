@@ -24,6 +24,7 @@ const PUBLIC_RPC_ENDPOINT = process.env.NEXT_PUBLIC_SOLANA_RPC_URL
   ?? clusterApiUrl(SOLANA_NETWORK);
 
 export function RZWalletProvider({ children }: { children: React.ReactNode }) {
+  'use no memo';
   const wallets = useMemo(
     () => [
       new PhantomWalletAdapter(),

@@ -850,6 +850,7 @@ function IntroGate({ mode, onUnlock }: GateProps) {
 // ── Main page ─────────────────────────────────────────────────────────────────
 
 export default function Home() {
+  'use no memo';
   const { connection } = useConnection();
   const { publicKey, disconnect, connecting, connected, sendTransaction } = useWallet();
   const { setVisible } = useWalletModal();
