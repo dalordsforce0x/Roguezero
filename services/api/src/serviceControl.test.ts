@@ -62,6 +62,8 @@ const baseServiceControl: SessionServiceControl = {
     maxAdverseBps: null,
     maxFavorableAt: null,
     maxAdverseAt: null,
+    entryQualityScore: null,
+    entryQualityBand: null,
     pendingExitReason: null,
     partialExitDone: false,
     exitReason: null,

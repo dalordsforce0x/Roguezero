@@ -326,6 +326,11 @@ export const sessionPositionStateSchema = z.object({
   maxFavorableAt: isoDatetimeSchema.nullable().default(null),
   maxAdverseBps: z.number().int().nullable().default(null),
   maxAdverseAt: isoDatetimeSchema.nullable().default(null),
+  // Entry-quality score (0..100) and band captured at the moment this position
+  // was opened, so the realized adverse excursion (maxAdverseBps) can later be
+  // correlated against entry quality. Shadow/diagnostic only; null when unscored.
+  entryQualityScore: z.number().int().min(0).max(100).nullable().default(null),
+  entryQualityBand: z.enum(['strong', 'fair', 'weak', 'reject']).nullable().default(null),
   pendingExitReason: sessionPositionExitReasonSchema.nullable().default(null),
   exitReason: sessionPositionExitReasonSchema.nullable().default(null),
   partialExitDone: z.boolean().default(false),
@@ -448,6 +453,8 @@ const defaultSessionPositionState: NonNullable<SessionServiceControl['positionSt
   maxFavorableAt: null,
   maxAdverseBps: null,
   maxAdverseAt: null,
+  entryQualityScore: null,
+  entryQualityBand: null,
   pendingExitReason: null,
   exitReason: null,
   partialExitDone: false,

@@ -1,5 +1,6 @@
 const SELLER_KEY = process.env.KEYAUTH_SELLER_KEY ?? '';
 const LICENSE_MASK = 'RogueZero-***-*-****-*';
+const MANAGER_LICENSE_MASK = 'RZer0BotLord***-*-****-*-*****-*********-**';
 
 const DURATION_DAYS: Record<string, number> = {
   '1month': 30,
@@ -7,7 +8,7 @@ const DURATION_DAYS: Record<string, number> = {
   '1year': 365,
 };
 
-export async function generateLicense(duration: string): Promise<string> {
+async function generateKeyWithMask(duration: string, mask: string, keyPrefix: string): Promise<string> {
   if (!SELLER_KEY) throw new Error('KEYAUTH_SELLER_KEY is not set');
 
   const days = DURATION_DAYS[duration] ?? 30;
@@ -16,7 +17,7 @@ export async function generateLicense(duration: string): Promise<string> {
   url.searchParams.set('type', 'add');
   url.searchParams.set('format', 'TXT');
   url.searchParams.set('expiry', days.toString());
-  url.searchParams.set('mask', LICENSE_MASK);
+  url.searchParams.set('mask', mask);
   url.searchParams.set('amount', '1');
 
   const res = await fetch(url.toString());
@@ -35,14 +36,22 @@ export async function generateLicense(duration: string): Promise<string> {
     // Not JSON or already threw above — fall through to text parse
   }
 
-  // Plain text — key starts with RogueZero
+  // Plain text — key starts with the mask prefix
   const key = text
     .split('\n')
     .map((l) => l.trim())
-    .find((l) => l.startsWith('RogueZero'));
+    .find((l) => l.startsWith(keyPrefix));
   if (key) return key;
 
   throw new Error(`Could not parse license key from KeyAuth response: ${text}`);
+}
+
+export async function generateLicense(duration: string): Promise<string> {
+  return generateKeyWithMask(duration, LICENSE_MASK, 'RogueZero');
+}
+
+export async function generateManagerLicense(duration: string): Promise<string> {
+  return generateKeyWithMask(duration, MANAGER_LICENSE_MASK, 'RZer0BotLord');
 }
 
 export function expiryDateFromDuration(duration: string): Date {

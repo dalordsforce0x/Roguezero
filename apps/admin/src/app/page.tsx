@@ -30,6 +30,21 @@ interface UserGroup {
   bot_limit: number;
   member_count: number;
   active_member_count: number;
+  manager_id: string | null;
+  manager_name: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+interface Manager {
+  id: string;
+  name: string;
+  management_key: string | null;
+  duration: string | null;
+  expiry_date: string | null;
+  access_enabled: boolean;
+  key_revealed_at: string | null;
+  group_count: number;
   created_at: string;
   updated_at: string;
 }
@@ -550,7 +565,7 @@ type TokenUniverseOverview = {
   }>;
 };
 
-type Tab = 'users' | 'user-groups' | 'overview' | 'rate-limits' | 'session-health' | 'token-universe';
+type Tab = 'users' | 'user-groups' | 'managers' | 'overview' | 'rate-limits' | 'session-health' | 'token-universe';
 
 type GateProps = {
   storageKey: string;
@@ -1685,6 +1700,7 @@ export default function Home() {
   const [tab, setTab]             = useState<Tab>('users');
   const [users, setUsers]         = useState<User[]>([]);
   const [groups, setGroups]       = useState<UserGroup[]>([]);
+  const [managers, setManagers]   = useState<Manager[]>([]);
   const [loading, setLoading]     = useState(true);
   const [activeSessions, setActiveSessions] = useState<Set<string>>(new Set());
   const [adminSessions, setAdminSessions] = useState<AdminSession[]>([]);
@@ -1701,6 +1717,11 @@ export default function Home() {
   const [formBusy, setFormBusy]   = useState(false);
   const [assigning, setAssigning] = useState<string | null>(null);
   const [toggling, setToggling]   = useState<string | null>(null);
+  const [showManagerModal, setShowManagerModal] = useState(false);
+  const [managerForm, setManagerForm] = useState({ name: '', duration: '1month' });
+  const [managerBusy, setManagerBusy] = useState(false);
+  const [managerAssigning, setManagerAssigning] = useState<string | null>(null);
+  const [managerToggling, setManagerToggling] = useState<string | null>(null);
   const [bgImage, setBgImage]     = useState<string | null>(null);
   const fileRef                   = useRef<HTMLInputElement>(null);
 
@@ -1721,11 +1742,17 @@ export default function Home() {
   const loadUsers = useCallback(async () => {
     setLoading(true);
     try {
-      const [res, groupsRes] = await Promise.all([fetch('/api/users'), fetch('/api/user-groups')]);
+      const [res, groupsRes, managersRes] = await Promise.all([
+        fetch('/api/users'),
+        fetch('/api/user-groups'),
+        fetch('/api/managers'),
+      ]);
       const data = await res.json() as { success: boolean; users: User[] };
       const groupsData = await groupsRes.json() as { success: boolean; groups: UserGroup[] };
+      const managersData = await managersRes.json() as { success: boolean; managers: Manager[] };
       setUsers(data.users ?? []);
       setGroups(groupsData.groups ?? []);
+      setManagers(managersData.managers ?? []);
     } finally {
       setLoading(false);
     }
@@ -2094,6 +2121,62 @@ export default function Home() {
     void loadUsers();
   }
 
+  async function handleCreateManager(e: React.FormEvent) {
+    e.preventDefault();
+    if (!managerForm.name.trim()) return;
+    setManagerBusy(true);
+    await fetch('/api/managers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: managerForm.name.trim(), duration: managerForm.duration }),
+    });
+    setShowManagerModal(false);
+    setManagerForm({ name: '', duration: '1month' });
+    setManagerBusy(false);
+    void loadUsers();
+  }
+
+  async function handleAssignManagerLicense(id: string) {
+    setManagerAssigning(id);
+    await fetch(`/api/managers/${id}/assign-license`, { method: 'POST' });
+    setManagerAssigning(null);
+    void loadUsers();
+  }
+
+  async function handleToggleManagerAccess(id: string, current: boolean) {
+    setManagerToggling(id);
+    await fetch(`/api/managers/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ accessEnabled: !current }),
+    });
+    setManagerToggling(null);
+    void loadUsers();
+  }
+
+  async function handleDeleteManager(id: string) {
+    if (!confirm('Remove this manager? Their groups will be unbound. This cannot be undone.')) return;
+    await fetch(`/api/managers/${id}`, { method: 'DELETE' });
+    void loadUsers();
+  }
+
+  async function handleBindGroupToManager(groupId: string, managerId: string) {
+    if (managerId) {
+      await fetch(`/api/managers/${managerId}/assign-groups`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ groupIds: [groupId] }),
+      });
+    } else {
+      await fetch('/api/managers/unassign-groups', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ groupIds: [groupId] }),
+      });
+    }
+    void loadUsers();
+  }
+
   async function handleToggleAccess(id: string, current: boolean) {
     setToggling(id);
     await fetch(`/api/users/${id}`, {
@@ -2170,6 +2253,7 @@ export default function Home() {
             { id: 'overview',    label: 'Overview' },
             { id: 'users',       label: 'Users' },
             { id: 'user-groups', label: 'Groups' },
+            { id: 'managers',    label: 'Managers' },
             { id: 'session-health', label: 'Session Health' },
             { id: 'token-universe', label: 'Token Universe' },
             { id: 'rate-limits', label: 'Rate Limits' },
@@ -2307,6 +2391,19 @@ export default function Home() {
                           Edit
                         </button>
                       </div>
+                      <div className="mt-3 flex items-center gap-2">
+                        <span className="text-[10px] uppercase tracking-wider text-gray-600">Manager</span>
+                        <select
+                          value={group.manager_id ?? ''}
+                          onChange={(e) => void handleBindGroupToManager(group.id, e.target.value)}
+                          className="flex-1 bg-gray-950 border border-gray-800 text-xs text-white rounded-md px-2 py-1.5 outline-none focus:border-cyan-400/40"
+                        >
+                          <option value="">— unassigned —</option>
+                          {managers.map((m) => (
+                            <option key={m.id} value={m.id}>{m.name}</option>
+                          ))}
+                        </select>
+                      </div>
                       <div className="mt-4 space-y-2">
                         {members.length === 0 ? (
                           <p className="text-xs text-gray-700 italic">No users assigned yet.</p>
@@ -2321,6 +2418,96 @@ export default function Home() {
                             </span>
                           </div>
                         ))}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Managers Tab */}
+        {tab === 'managers' && (
+          <div className="space-y-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm font-medium text-white">Access managers</p>
+                <p className="text-xs text-gray-600 mt-0.5">A manager holds one management key that unlocks every bot across all groups assigned to them.</p>
+              </div>
+              <button
+                onClick={() => setShowManagerModal(true)}
+                className="bg-cyan-600 hover:bg-cyan-500 text-white text-sm font-medium px-4 py-2 rounded-lg transition-colors"
+              >
+                + Add Manager
+              </button>
+            </div>
+            {managers.length === 0 ? (
+              <div className="py-20 text-center text-gray-600 text-sm">No managers yet — create one to delegate multi-bot control.</div>
+            ) : (
+              <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4">
+                {managers.map((m) => {
+                  const boundGroups = groups.filter((g) => g.manager_id === m.id);
+                  const expired = isExpired(m.expiry_date);
+                  return (
+                    <div key={m.id} className="bg-gray-900/80 border border-gray-800 rounded-xl p-4">
+                      <div className="flex items-start justify-between gap-3">
+                        <div>
+                          <h3 className="text-white font-semibold">{m.name}</h3>
+                          <p className="text-xs text-gray-600 mt-1">{m.group_count} groups · {m.duration ?? '—'}</p>
+                        </div>
+                        <span className={m.access_enabled && !expired ? 'text-[10px] text-emerald-400' : 'text-[10px] text-gray-600'}>
+                          {m.access_enabled && !expired ? 'active' : expired ? 'expired' : 'disabled'}
+                        </span>
+                      </div>
+
+                      <div className="mt-3">
+                        {m.management_key ? (
+                          <div className="flex items-center gap-2 rounded-lg bg-gray-950/70 border border-gray-800 px-3 py-2">
+                            <span className="font-mono text-[10px] text-cyan-200 flex-1 min-w-0 truncate">{m.management_key}</span>
+                            <button
+                              onClick={() => m.management_key && void navigator.clipboard.writeText(m.management_key)}
+                              className="shrink-0 text-[9px] text-gray-600 hover:text-emerald-400 transition-colors"
+                            >
+                              copy
+                            </button>
+                          </div>
+                        ) : (
+                          <button
+                            onClick={() => void handleAssignManagerLicense(m.id)}
+                            disabled={managerAssigning === m.id}
+                            className="w-full text-xs border border-cyan-700 hover:border-cyan-400 text-cyan-300 hover:text-cyan-100 px-3 py-2 rounded-md transition-colors disabled:opacity-40"
+                          >
+                            {managerAssigning === m.id ? 'generating…' : 'Generate management key'}
+                          </button>
+                        )}
+                      </div>
+
+                      <div className="mt-3 space-y-1">
+                        {boundGroups.length === 0 ? (
+                          <p className="text-xs text-gray-700 italic">No groups bound. Assign groups from the Groups tab.</p>
+                        ) : boundGroups.map((g) => (
+                          <div key={g.id} className="flex items-center justify-between rounded-lg bg-gray-950/60 border border-gray-800/70 px-3 py-1.5">
+                            <span className="text-xs text-white">{g.name}</span>
+                            <span className="text-[10px] text-gray-600">{g.member_count} bots</span>
+                          </div>
+                        ))}
+                      </div>
+
+                      <div className="mt-4 flex items-center gap-2">
+                        <button
+                          onClick={() => void handleToggleManagerAccess(m.id, m.access_enabled)}
+                          disabled={managerToggling === m.id}
+                          className="flex-1 text-xs border border-gray-700 hover:border-gray-500 text-gray-400 hover:text-white px-3 py-1.5 rounded-md transition-colors disabled:opacity-40"
+                        >
+                          {m.access_enabled ? 'Disable' : 'Enable'}
+                        </button>
+                        <button
+                          onClick={() => void handleDeleteManager(m.id)}
+                          className="text-xs border border-gray-800 hover:border-red-500 text-gray-600 hover:text-red-300 px-3 py-1.5 rounded-md transition-colors"
+                        >
+                          Delete
+                        </button>
                       </div>
                     </div>
                   );
@@ -3107,6 +3294,57 @@ export default function Home() {
                   className="flex-1 bg-violet-600 hover:bg-violet-500 disabled:opacity-50 text-white text-sm font-medium py-2.5 rounded-lg transition-colors"
                 >
                   {formBusy ? 'Saving…' : editingGroup ? 'Save Group' : 'Create Group'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {showManagerModal && (
+        <div
+          className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 px-4"
+          onClick={(e) => { if (e.target === e.currentTarget) setShowManagerModal(false); }}
+        >
+          <div className="bg-gray-900 border border-gray-700 rounded-xl p-7 w-full max-w-md shadow-2xl">
+            <h2 className="text-base font-semibold text-white mb-1">Add Manager</h2>
+            <p className="text-xs text-gray-600 mb-5">Create an access manager, then generate their management key and bind groups from the Groups tab.</p>
+            <form onSubmit={(e) => void handleCreateManager(e)} className="space-y-4">
+              <div>
+                <label className="block text-xs text-gray-400 mb-1.5">Manager Name</label>
+                <input
+                  type="text"
+                  required
+                  value={managerForm.name}
+                  onChange={e => setManagerForm(f => ({ ...f, name: e.target.value }))}
+                  placeholder="e.g. Desk Lead — East"
+                  className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2.5 text-sm text-white placeholder-gray-600 focus:outline-none focus:border-cyan-500 transition-colors"
+                />
+              </div>
+              <div>
+                <label className="block text-xs text-gray-400 mb-1.5">Key Duration</label>
+                <select
+                  value={managerForm.duration}
+                  onChange={e => setManagerForm(f => ({ ...f, duration: e.target.value }))}
+                  className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2.5 text-sm text-white focus:outline-none focus:border-cyan-500 transition-colors"
+                >
+                  {DURATIONS.map(opt => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
+                </select>
+              </div>
+              <div className="flex gap-3 pt-1">
+                <button
+                  type="button"
+                  onClick={() => setShowManagerModal(false)}
+                  className="flex-1 bg-gray-800 hover:bg-gray-700 text-gray-300 text-sm font-medium py-2.5 rounded-lg transition-colors"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={managerBusy}
+                  className="flex-1 bg-cyan-600 hover:bg-cyan-500 disabled:opacity-50 text-white text-sm font-medium py-2.5 rounded-lg transition-colors"
+                >
+                  {managerBusy ? 'Creating…' : 'Create Manager'}
                 </button>
               </div>
             </form>

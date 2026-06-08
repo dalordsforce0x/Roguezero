@@ -4,6 +4,7 @@ import {
   computeTrendingEntryShapeGate,
   computePrePrepareEntryGate,
   computeEntryQualityScore,
+  classifyTapeRegime,
   computeFullExitAmountAtomic,
   computeGasRefillPlan,
   computeRetryMinimumTradeAmountAtomic,
@@ -210,6 +211,49 @@ test('computeEntryQualityScore band + wouldEnter track the thresholds', () => {
   assert.ok(['strong', 'fair', 'weak', 'reject'].includes(result.band));
   assert.equal(result.wouldEnter, result.score >= baseEntryQualityInput.enterThreshold);
   assert.ok(result.score >= 0 && result.score <= 100);
+});
+
+test('computeEntryQualityScore treats a flat/no-range tape as neutral, not a chased top', () => {
+  // Perfectly flat tape: range is 0. The old default scored this as buying the
+  // top (rangePositionBps=10000 -> rangePosition=0). It must now be neutral.
+  const flat = computeEntryQualityScore({
+    ...baseEntryQualityInput,
+    prices: [1, 1, 1, 1, 1, 1, 1, 1],
+  });
+
+  assert.equal(flat.metrics?.rangePositionBps, 5_000);
+  assert.ok(flat.components.rangePosition > 0.5, `flat tape rangePosition should be neutral, got ${flat.components.rangePosition}`);
+});
+
+test('classifyTapeRegime calls a straight directional run a trend', () => {
+  const regime = classifyTapeRegime({
+    prices: [1, 1.01, 1.02, 1.03, 1.04, 1.05, 1.06, 1.07],
+    minSamples: 8,
+    trendEfficiencyThreshold: 0.6,
+  });
+
+  assert.equal(regime, 'trend');
+});
+
+test('classifyTapeRegime calls an oscillating tape chop', () => {
+  const regime = classifyTapeRegime({
+    prices: [1, 1.02, 0.99, 1.03, 0.98, 1.02, 0.99, 1.01],
+    minSamples: 8,
+    trendEfficiencyThreshold: 0.6,
+  });
+
+  assert.equal(regime, 'chop');
+});
+
+test('classifyTapeRegime treats a flat tape as chop and is unknown below min samples', () => {
+  assert.equal(
+    classifyTapeRegime({ prices: [1, 1, 1, 1, 1], minSamples: 5, trendEfficiencyThreshold: 0.6 }),
+    'chop',
+  );
+  assert.equal(
+    classifyTapeRegime({ prices: [1, 1.01], minSamples: 8, trendEfficiencyThreshold: 0.6 }),
+    'unknown',
+  );
 });
 
 test('computeStopLossThresholdBps keeps stop-loss independent from cost floor', () => {

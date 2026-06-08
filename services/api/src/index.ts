@@ -71,6 +71,14 @@ import {
   verifyWebAccessSession,
 } from './accessStore.js';
 import {
+  managerTablesReady,
+  verifyManagerLicense,
+  getManagerById,
+  getGroupsForManager,
+  getUsersForManager,
+  managerCanAccessUser,
+} from './managerStore.js';
+import {
   getLiveRuntimeControl,
   runtimeControlStoreReady,
 } from './runtimeControlStore.js';
@@ -430,6 +438,8 @@ const upsertPositionEntry = (params: {
     maxAdverseBps: params.existingPosition?.maxAdverseBps ?? null,
     maxFavorableAt: params.existingPosition?.maxFavorableAt ?? null,
     maxAdverseAt: params.existingPosition?.maxAdverseAt ?? null,
+    entryQualityScore: params.existingPosition?.entryQualityScore ?? null,
+    entryQualityBand: params.existingPosition?.entryQualityBand ?? null,
     pendingExitReason: null,
     partialExitDone: params.existingPosition?.partialExitDone ?? false,
     exitReason: null,
@@ -2406,6 +2416,13 @@ void accessTablesReady()
   .catch((error) => {
     app.log.error({ error }, 'access store initialization failed');
   });
+void managerTablesReady()
+  .then(() => {
+    app.log.info('manager store ready');
+  })
+  .catch((error) => {
+    app.log.error({ error }, 'manager store initialization failed');
+  });
 void runtimeControlStoreReady()
   .then(() => {
     app.log.info('runtime control store ready');
@@ -3605,7 +3622,99 @@ app.post('/access/session', async (request, reply) => {
   }
 });
 
-// â”€â”€ Session routes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── Manager (access-management) routes ───────────────────────────────────────
+// A manager holds a management license key bound to one or more groups.
+// Authenticating with that key grants read + control over every user/bot in
+// those groups. The manager never takes fund custody; the wallet-signed user
+// UI is unaffected and funds always return to each bot's bound owner wallet.
+
+app.post('/manager/license-auth', async (request, reply) => {
+  const body = (request.body ?? {}) as Record<string, unknown>;
+  const managementKey = asOptionalString(body.managementKey ?? body.licenseKey);
+
+  if (!managementKey) {
+    return reply.status(400).send({ error: 'managementKey is required' });
+  }
+
+  try {
+    const manager = await verifyManagerLicense(managementKey);
+    const groups = await getGroupsForManager(manager.id);
+    const users = await getUsersForManager(manager.id);
+
+    return {
+      ok: true,
+      manager,
+      groups,
+      users,
+      groupCount: groups.length,
+      userCount: users.length,
+    };
+  } catch (error) {
+    app.log.error({ error }, 'failed to validate manager license key');
+    const details = error instanceof Error ? error.message : String(error);
+    const status = details === 'Manager not found'
+      ? 404
+      : ['Access disabled', 'License expired', 'License key not assigned'].includes(details)
+        ? 403
+        : 500;
+    return reply.status(status).send({ error: 'Failed to validate manager license key', details });
+  }
+});
+
+app.get('/manager/:managerId/overview', async (request, reply) => {
+  const { managerId } = request.params as { managerId: string };
+
+  try {
+    const manager = await getManagerById(managerId);
+    if (!manager) {
+      return reply.status(404).send({ error: 'Manager not found' });
+    }
+    if (!manager.accessEnabled) {
+      return reply.status(403).send({ error: 'Access disabled' });
+    }
+
+    const groups = await getGroupsForManager(managerId);
+    const users = await getUsersForManager(managerId);
+    return { manager, groups, users, groupCount: groups.length, userCount: users.length };
+  } catch (error) {
+    app.log.error({ error, managerId }, 'failed to load manager overview');
+    return reply.status(500).send({ error: 'Failed to load manager overview' });
+  }
+});
+
+app.get('/manager/:managerId/sessions', async (request, reply) => {
+  const { managerId } = request.params as { managerId: string };
+  const query = request.query as Record<string, string | undefined>;
+  const status = query.status ? query.status.split(',') : undefined;
+  const limit = query.limit ? Math.min(Number(query.limit), 200) : 100;
+
+  try {
+    const manager = await getManagerById(managerId);
+    if (!manager) {
+      return reply.status(404).send({ error: 'Manager not found' });
+    }
+    if (!manager.accessEnabled) {
+      return reply.status(403).send({ error: 'Access disabled' });
+    }
+
+    const users = await getUsersForManager(managerId);
+    const userIds = new Set(users.map((u) => u.id));
+
+    const sessionGroups = await Promise.all(
+      users.map((u) => listSessions({ userId: u.id, status, limit })),
+    );
+    // Defense in depth: only return sessions whose user is inside the manager's scope.
+    const sessions = sessionGroups.flat().filter((s) => userIds.has((s as { userId?: string }).userId ?? ''));
+
+    return { sessions, count: sessions.length };
+  } catch (error) {
+    app.log.error({ error, managerId }, 'failed to list manager sessions');
+    return reply.status(500).send({ error: 'Failed to list manager sessions' });
+  }
+});
+
+// ── Session routes ──────────────────────────────────────────────────────────
+
 
 app.post('/sessions', { config: { rateLimit: { max: 5, timeWindow: '1 minute' } } }, async (request, reply) => {
   const body = (request.body ?? {}) as Record<string, unknown>;

@@ -65,6 +65,21 @@ export interface RzUserGroup {
   bot_limit: number;
   member_count: number;
   active_member_count: number;
+  manager_id: string | null;
+  manager_name: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface RzManager {
+  id: string;
+  name: string;
+  management_key: string | null;
+  duration: string | null;
+  expiry_date: string | null;
+  access_enabled: boolean;
+  key_revealed_at: string | null;
+  group_count: number;
   created_at: string;
   updated_at: string;
 }
@@ -101,8 +116,22 @@ export async function usersTableReady(): Promise<void> {
     );
     ALTER TABLE rz_user_groups
       ADD COLUMN IF NOT EXISTS bot_limit INTEGER NOT NULL DEFAULT 1,
+      ADD COLUMN IF NOT EXISTS manager_id UUID,
       ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+    CREATE TABLE IF NOT EXISTS rz_managers (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      name TEXT NOT NULL,
+      management_key TEXT UNIQUE,
+      duration TEXT,
+      expiry_date TIMESTAMPTZ,
+      access_enabled BOOLEAN NOT NULL DEFAULT false,
+      key_revealed_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS rz_managers_key_idx ON rz_managers(management_key);
+    CREATE INDEX IF NOT EXISTS rz_user_groups_manager_idx ON rz_user_groups(manager_id);
     CREATE TABLE IF NOT EXISTS trusted_web_devices (
       device_id_hash TEXT PRIMARY KEY,
       user_id TEXT NOT NULL,
@@ -156,11 +185,14 @@ export async function listUserGroups(): Promise<RzUserGroup[]> {
       g.bot_limit,
       COUNT(u.id)::int AS member_count,
       COUNT(u.id) FILTER (WHERE u.access_enabled AND (u.expiry_date IS NULL OR u.expiry_date > NOW()))::int AS active_member_count,
+      g.manager_id,
+      m.name AS manager_name,
       g.created_at,
       g.updated_at
     FROM rz_user_groups g
     LEFT JOIN rz_users u ON u.group_id = g.id
-    GROUP BY g.id
+    LEFT JOIN rz_managers m ON m.id = g.manager_id
+    GROUP BY g.id, m.name
     ORDER BY g.name ASC`
   );
   return rows;
@@ -170,7 +202,7 @@ export async function createUserGroup(name: string, botLimit: number): Promise<R
   const { rows } = await getPool().query<RzUserGroup>(
     `INSERT INTO rz_user_groups (name, bot_limit)
      VALUES ($1, $2)
-     RETURNING id, name, bot_limit, 0::int AS member_count, 0::int AS active_member_count, created_at, updated_at`,
+     RETURNING id, name, bot_limit, 0::int AS member_count, 0::int AS active_member_count, manager_id, NULL::text AS manager_name, created_at, updated_at`,
     [name, botLimit]
   );
   return rows[0];
@@ -181,7 +213,7 @@ export async function updateUserGroup(id: string, name: string, botLimit: number
     `UPDATE rz_user_groups
      SET name = $1, bot_limit = $2, updated_at = NOW()
      WHERE id = $3
-     RETURNING id, name, bot_limit, 0::int AS member_count, 0::int AS active_member_count, created_at, updated_at`,
+     RETURNING id, name, bot_limit, 0::int AS member_count, 0::int AS active_member_count, manager_id, NULL::text AS manager_name, created_at, updated_at`,
     [name, botLimit, id]
   );
   return rows[0];
@@ -192,6 +224,103 @@ export async function assignUsersToGroup(groupId: string | null, userIds: string
   await getPool().query(
     `UPDATE rz_users SET group_id = $1, updated_at = NOW() WHERE id = ANY($2::uuid[])`,
     [groupId, userIds]
+  );
+}
+
+// ── Manager (access-management) operations ───────────────────────────────────
+
+const MANAGER_SELECT = `
+      m.id,
+      m.name,
+      m.management_key,
+      m.duration,
+      m.expiry_date,
+      m.access_enabled,
+      m.key_revealed_at,
+      COUNT(g.id)::int AS group_count,
+      m.created_at,
+      m.updated_at
+    FROM rz_managers m
+    LEFT JOIN rz_user_groups g ON g.manager_id = m.id`;
+
+export async function listManagers(): Promise<RzManager[]> {
+  const { rows } = await getPool().query<RzManager>(
+    `SELECT ${MANAGER_SELECT}
+    GROUP BY m.id
+    ORDER BY m.created_at DESC`
+  );
+  return rows;
+}
+
+export async function getManagerById(id: string): Promise<RzManager | null> {
+  const { rows } = await getPool().query<RzManager>(
+    `SELECT ${MANAGER_SELECT}
+    WHERE m.id = $1
+    GROUP BY m.id`,
+    [id]
+  );
+  return rows[0] ?? null;
+}
+
+export async function createManager(name: string, duration: string): Promise<RzManager> {
+  const { rows } = await getPool().query<RzManager>(
+    `INSERT INTO rz_managers (name, duration)
+     VALUES ($1, $2)
+     RETURNING id, name, management_key, duration, expiry_date, access_enabled, key_revealed_at, 0::int AS group_count, created_at, updated_at`,
+    [name, duration]
+  );
+  return rows[0];
+}
+
+export async function assignManagerLicense(
+  id: string,
+  managementKey: string,
+  expiryDate: Date,
+): Promise<RzManager> {
+  await getPool().query(
+    `UPDATE rz_managers
+     SET management_key = $1, expiry_date = $2, access_enabled = true, updated_at = NOW()
+     WHERE id = $3`,
+    [managementKey, expiryDate, id]
+  );
+  const manager = await getManagerById(id);
+  if (!manager) throw new Error('Manager not found');
+  return manager;
+}
+
+export async function toggleManagerAccess(id: string, enabled: boolean): Promise<RzManager> {
+  await getPool().query(
+    `UPDATE rz_managers
+     SET access_enabled = $1, updated_at = NOW()
+     WHERE id = $2`,
+    [enabled, id]
+  );
+  const manager = await getManagerById(id);
+  if (!manager) throw new Error('Manager not found');
+  return manager;
+}
+
+export async function updateManagerName(id: string, name: string): Promise<RzManager> {
+  await getPool().query(
+    `UPDATE rz_managers SET name = $1, updated_at = NOW() WHERE id = $2`,
+    [name, id]
+  );
+  const manager = await getManagerById(id);
+  if (!manager) throw new Error('Manager not found');
+  return manager;
+}
+
+export async function deleteManager(id: string): Promise<void> {
+  // Unbind groups first so they are not orphaned with a dangling manager_id.
+  await getPool().query(`UPDATE rz_user_groups SET manager_id = NULL, updated_at = NOW() WHERE manager_id = $1`, [id]);
+  await getPool().query(`DELETE FROM rz_managers WHERE id = $1`, [id]);
+}
+
+export async function assignGroupsToManager(managerId: string | null, groupIds: string[]): Promise<void> {
+  if (groupIds.length === 0) return;
+  await getPool().query(
+    `UPDATE rz_user_groups SET manager_id = $1, updated_at = NOW() WHERE id = ANY($2::uuid[])`,
+    [managerId, groupIds]
   );
 }
 

@@ -1857,7 +1857,9 @@ export default function Home() {
       <header className="px-6 py-4 flex items-center justify-between flex-shrink-0">
         <div>
           {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img src="/rz-logo.png" alt="RogueZero" className="h-16 w-auto" />
+          <a href="/manager" title="Access Manager" aria-label="Access Manager">
+            <img src="/rz-logo.png" alt="RogueZero" className="h-16 w-auto cursor-pointer transition hover:opacity-80" />
+          </a>
         </div>
 
         {connected && publicKey ? (

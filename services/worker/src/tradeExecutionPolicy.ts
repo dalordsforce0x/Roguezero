@@ -268,7 +268,11 @@ export const computeEntryQualityScore = (params: {
     pullbackFromHighBps: high > 0 ? Math.max(0, Math.round(((high - current) / high) * 10_000)) : 0,
     reclaimFromLowBps: low > 0 ? Math.max(0, Math.round(((current - low) / low) * 10_000)) : 0,
     lastStepMomentumBps: computePriceMoveBps(previous, current),
-    rangePositionBps: range > 0 ? Math.round(((current - low) / range) * 10_000) : 10_000,
+    // When the window has no real range (flat/stale tape) the position is
+    // undefined, not "at the top". Default to the neutral midpoint (5000) so a
+    // dead tape is not falsely scored as buying a local high (which the old
+    // 10_000 default did, tanking rangePosition to 0 and skewing the score).
+    rangePositionBps: range > 0 ? Math.round(((current - low) / range) * 10_000) : 5_000,
   };
 
   const idealPullbackBps = Math.max(1, Math.round(params.idealPullbackBps));
@@ -356,6 +360,43 @@ export const computeEntryQualityScore = (params: {
     metrics,
     reason: `entry_quality_${band}`,
   };
+};
+
+/**
+ * Cheap chop-vs-trend classifier for the entry-quality score's regimeAlignment
+ * component. Uses the Kaufman-style efficiency ratio: net directional move over
+ * the window divided by the summed absolute path length. A high ratio means the
+ * tape went somewhere in a straight line (trend); a low ratio means it oscillated
+ * without net progress (chop). A perfectly flat tape has no path and is treated
+ * as chop (no trend to align with). Returns 'unknown' until enough samples exist.
+ *
+ * Pure: no side effects.
+ */
+export const classifyTapeRegime = (params: {
+  prices: readonly number[];
+  minSamples: number;
+  // Efficiency ratio (0..1) at/above which the window is considered a trend.
+  trendEfficiencyThreshold: number;
+}): 'chop' | 'trend' | 'unknown' => {
+  const prices = params.prices.filter((price) => Number.isFinite(price) && price > 0);
+  const minSamples = Math.max(3, Math.floor(params.minSamples));
+  if (prices.length < minSamples) {
+    return 'unknown';
+  }
+
+  const window = prices.slice(-minSamples);
+  let pathSum = 0;
+  for (let index = 1; index < window.length; index += 1) {
+    pathSum += Math.abs(window[index] - window[index - 1]);
+  }
+  if (pathSum <= 0) {
+    return 'chop';
+  }
+
+  const netMove = Math.abs(window[window.length - 1] - window[0]);
+  const efficiency = netMove / pathSum;
+  const threshold = Math.min(1, Math.max(0, params.trendEfficiencyThreshold));
+  return efficiency >= threshold ? 'trend' : 'chop';
 };
 
 export const computeFullExitAmountAtomic = (params: {

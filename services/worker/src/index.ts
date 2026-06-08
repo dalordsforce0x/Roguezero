@@ -69,6 +69,7 @@ import {
   computeGasRefillPlan,
   computeTrendingEntryShapeGate,
   computeEntryQualityScore,
+  classifyTapeRegime,
   resolveTradeGateAssessment,
   shouldApplyPostExitSolReserveProtection,
   shouldForceExitExecution,
@@ -351,6 +352,7 @@ const WORKER_ENTRY_QUALITY_MAX_HEALTHY_IMPACT_BPS = Number(process.env.WORKER_EN
 const WORKER_ENTRY_QUALITY_STRONG_SCORE = Number(process.env.WORKER_ENTRY_QUALITY_STRONG_SCORE ?? 70);
 const WORKER_ENTRY_QUALITY_FAIR_SCORE = Number(process.env.WORKER_ENTRY_QUALITY_FAIR_SCORE ?? 50);
 const WORKER_ENTRY_QUALITY_ENTER_THRESHOLD = Number(process.env.WORKER_ENTRY_QUALITY_ENTER_THRESHOLD ?? 55);
+const WORKER_ENTRY_QUALITY_TREND_EFFICIENCY_THRESHOLD = Number(process.env.WORKER_ENTRY_QUALITY_TREND_EFFICIENCY_THRESHOLD ?? 0.6);
 const RUNTIME_CONTROL_KEY = 'global_live_runtime';
 const RUNTIME_CONTROL_REFRESH_MS = Number(process.env.RUNTIME_CONTROL_REFRESH_MS ?? 5000);
 let liveSpeedProfileName: RuntimeSpeedProfileName = normalizeRuntimeSpeedProfileName(process.env.WORKER_SPEED_PROFILE);
@@ -1152,6 +1154,8 @@ const tokenUniverseSymbolByMint = new Map<string, string>();
 const latestJupiterUsdByMint = new Map<string, number>();
 const previousJupiterUsdByMint = new Map<string, number>();
 const latestJupiterDecimalsByMint = new Map<string, number>();
+const latestPriceImpactBpsByMint = new Map<string, number>();
+const pendingEntryQualityByMint = new Map<string, { score: number; band: string }>();
 
 const TOKEN_UNIVERSE_REFRESH_MS = Number(process.env.WORKER_TOKEN_UNIVERSE_REFRESH_MS ?? 60000);
 const TOKEN_UNIVERSE_TABLE_CANDIDATES = (process.env.RZ_TOKEN_UNIVERSE_TABLES
@@ -2414,6 +2418,9 @@ const applyTokenUniverseAutoSort = async () => {
     const outAmountAtomic = parseUnsignedNumeric(routeCheck.data?.build?.outAmount);
     const routeFound = routeCheck.ok && Boolean(outAmountAtomic && outAmountAtomic > 0);
     const priceImpactBps = parseQuotePriceImpactBps(routeCheck.data?.build?.priceImpactPct ?? null);
+    if (priceImpactBps !== null) {
+      latestPriceImpactBpsByMint.set(mint, priceImpactBps);
+    }
     const usdPrice = latestJupiterUsdByMint.get(mint) ?? null;
     const priorUsdPrice = previousJupiterUsdByMint.get(mint) ?? null;
     const momentumBps = computePriceMomentumBps(usdPrice, priorUsdPrice);
@@ -6301,7 +6308,9 @@ const ensureExitShadowHistoryReady = async () => {
           ADD COLUMN IF NOT EXISTS partial_net_bps INTEGER,
           ADD COLUMN IF NOT EXISTS grid_range_width_bps INTEGER,
           ADD COLUMN IF NOT EXISTS grid_price_position_pct INTEGER,
-          ADD COLUMN IF NOT EXISTS grid_recent_move_bps INTEGER
+          ADD COLUMN IF NOT EXISTS grid_recent_move_bps INTEGER,
+          ADD COLUMN IF NOT EXISTS entry_quality_score INTEGER,
+          ADD COLUMN IF NOT EXISTS entry_quality_band TEXT
       `))
       .then(() => dbPool.query(`
         CREATE INDEX IF NOT EXISTS exit_shadow_decisions_session_time_idx
@@ -6423,6 +6432,8 @@ const appendExitShadowHistory = async (
       intOrNull(grid?.rangeWidthBps),
       intOrNull(grid?.pricePositionPct),
       intOrNull(grid?.recentMoveBps),
+      intOrNull(evaluation.entryQualityScore),
+      evaluation.entryQualityBand ? String(evaluation.entryQualityBand) : null,
     ]);
   }
 
@@ -6431,7 +6442,7 @@ const appendExitShadowHistory = async (
   try {
     await ensureExitShadowHistoryReady();
     const dbPool = getPool();
-    const cols = 30;
+    const cols = 32;
     const columnCasts = [
       '::uuid', '::uuid', '::text', '::text', '::text', '::text',
       '::boolean', '::text',
@@ -6442,6 +6453,7 @@ const appendExitShadowHistory = async (
       '::int', '::int',
       '::int', '::int', '::boolean', '::int',
       '::int', '::int', '::int',
+      '::int', '::text',
     ];
     const valuesSql = rows
       .map((_, rowIndex) => {
@@ -6461,7 +6473,8 @@ const appendExitShadowHistory = async (
           thresholds, evaluation,
           honest_floor_bps, net_after_partial_bps,
           partial_trigger_bps, partial_sell_bps, partial_fired, partial_net_bps,
-          grid_range_width_bps, grid_price_position_pct, grid_recent_move_bps
+          grid_range_width_bps, grid_price_position_pct, grid_recent_move_bps,
+          entry_quality_score, entry_quality_band
         ) VALUES ${valuesSql}
       `,
       rows.flat(),
@@ -6851,6 +6864,17 @@ const executeTrade = async (session: RawSession): Promise<void> => {
         ? (strategySignalByKey.get(positionStrategy) ?? buildSessionSignalForStrategy(positionStrategy, pythTape, strategyConfig))
         : buildRuntimeSignalForMint(mint, positionStrategy, strategyConfig);
       const exitTrigger = evaluateExitTrigger(session, position, signalForPosition);
+      const stashedEntryQuality = pendingEntryQualityByMint.get(`${session.id}:${mint}`) ?? null;
+      const resolvedEntryQualityScore = position.entryQualityScore ?? stashedEntryQuality?.score ?? null;
+      const resolvedEntryQualityBand = position.entryQualityBand ?? stashedEntryQuality?.band ?? null;
+      if (position.entryQualityScore === null && resolvedEntryQualityScore !== null) {
+        nextPositions[mint] = {
+          ...(nextPositions[mint] ?? position),
+          entryQualityScore: resolvedEntryQualityScore,
+          entryQualityBand: resolvedEntryQualityBand as SessionPositionState['entryQualityBand'],
+        };
+        positionsChanged = true;
+      }
       exitEvaluations.push({
         at: new Date().toISOString(),
         mint,
@@ -6863,6 +6887,8 @@ const executeTrade = async (session: RawSession): Promise<void> => {
         trailingDrawdownBps: exitTrigger.trailingDrawdownBps,
         maxFavorableBps: position.maxFavorableBps ?? null,
         maxAdverseBps: position.maxAdverseBps ?? null,
+        entryQualityScore: resolvedEntryQualityScore,
+        entryQualityBand: resolvedEntryQualityBand,
         entryPriceUsd: position.entryPriceUsd,
         markPriceUsd: exitTrigger.markPriceUsd,
         highWaterPriceUsd: position.highWaterPriceUsd,
@@ -6876,7 +6902,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
       if (!exitTrigger.shouldExit) {
         if (position.pendingExitReason !== null) {
           nextPositions[mint] = {
-            ...position,
+            ...(nextPositions[mint] ?? position),
             pendingExitReason: null,
           };
           positionsChanged = true;
@@ -7607,8 +7633,12 @@ const executeTrade = async (session: RawSession): Promise<void> => {
         prices: getMomentumTapeForMint(selectedEntryMint).map((sample) => sample.usdPrice),
         minSamples: WORKER_ENTRY_QUALITY_MIN_SAMPLES,
         chaseLookbackSamples: WORKER_ENTRY_QUALITY_CHASE_LOOKBACK_SAMPLES,
-        regime: null,
-        priceImpactBps: null,
+        regime: classifyTapeRegime({
+          prices: getMomentumTapeForMint(selectedEntryMint).map((sample) => sample.usdPrice),
+          minSamples: WORKER_ENTRY_QUALITY_MIN_SAMPLES,
+          trendEfficiencyThreshold: WORKER_ENTRY_QUALITY_TREND_EFFICIENCY_THRESHOLD,
+        }),
+        priceImpactBps: latestPriceImpactBpsByMint.get(selectedEntryMint) ?? null,
         idealPullbackBps: WORKER_ENTRY_QUALITY_IDEAL_PULLBACK_BPS,
         maxHealthyPullbackBps: WORKER_ENTRY_QUALITY_MAX_HEALTHY_PULLBACK_BPS,
         maxHealthyPriceImpactBps: WORKER_ENTRY_QUALITY_MAX_HEALTHY_IMPACT_BPS,
@@ -7616,6 +7646,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
         fairScore: WORKER_ENTRY_QUALITY_FAIR_SCORE,
         enterThreshold: WORKER_ENTRY_QUALITY_ENTER_THRESHOLD,
       });
+      pendingEntryQualityByMint.set(`${session.id}:${selectedEntryMint}`, { score: entryQuality.score, band: entryQuality.band });
       const eqSymbol = resolveTokenSymbol(selectedEntryMint);
       const eqClass = getTokenTradeClass(selectedEntryMint, eqSymbol);
       const eqC = entryQuality.components;

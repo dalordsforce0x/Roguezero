@@ -4,9 +4,11 @@ import type { NextRequest } from 'next/server';
 export const ACCESS_TOKEN_COOKIE = 'rz_access_token';
 export const DEVICE_ID_COOKIE = 'rz_device_id';
 export const TEMP_GATE_COOKIE = 'rz_temp_gate';
+export const MANAGER_SESSION_COOKIE = 'rz_manager_session';
 export const ACCESS_TRUST_HOURS = 6;
 export const TEMP_GATE_TTL_SECONDS = 30 * 60;
 export const ACCESS_TTL_SECONDS = ACCESS_TRUST_HOURS * 60 * 60;
+export const MANAGER_SESSION_TTL_SECONDS = 6 * 60 * 60;
 
 const getApiBaseUrls = () => {
   const candidates = [
@@ -103,3 +105,45 @@ export const callInternalApi = async <T>(path: string, init?: {
 };
 
 export const buildTrustedUntilIso = () => new Date(Date.now() + (ACCESS_TTL_SECONDS * 1000)).toISOString();
+
+// ── Manager session (stateless, HMAC-signed cookie) ──────────────────────────
+// A manager has no wallet/device. We mint a signed cookie carrying the manager
+// id + expiry, verified with RZ_INTERNAL_SECRET. No DB session row needed.
+
+type ManagerSessionPayload = {
+  managerId: string;
+  name: string;
+  exp: number; // epoch seconds
+};
+
+const base64UrlEncode = (input: string) => Buffer.from(input, 'utf8').toString('base64url');
+const base64UrlDecode = (input: string) => Buffer.from(input, 'base64url').toString('utf8');
+
+const signManagerPayload = (encodedPayload: string) => createHash('sha256')
+  .update(`${encodedPayload}.${getInternalSecret()}`)
+  .digest('base64url');
+
+export const createManagerSessionToken = (managerId: string, name: string) => {
+  const payload: ManagerSessionPayload = {
+    managerId,
+    name,
+    exp: Math.floor(Date.now() / 1000) + MANAGER_SESSION_TTL_SECONDS,
+  };
+  const encoded = base64UrlEncode(JSON.stringify(payload));
+  return `${encoded}.${signManagerPayload(encoded)}`;
+};
+
+export const verifyManagerSessionToken = (token: string | null | undefined): ManagerSessionPayload | null => {
+  if (!token) return null;
+  const [encoded, signature] = token.split('.');
+  if (!encoded || !signature) return null;
+  if (signManagerPayload(encoded) !== signature) return null;
+  try {
+    const payload = JSON.parse(base64UrlDecode(encoded)) as ManagerSessionPayload;
+    if (!payload.managerId || typeof payload.exp !== 'number') return null;
+    if (payload.exp * 1000 <= Date.now()) return null;
+    return payload;
+  } catch {
+    return null;
+  }
+};
