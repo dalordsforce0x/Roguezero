@@ -302,6 +302,17 @@ const WORKER_PARTIAL_TP_MAX_FRACTION_BPS = Number(process.env.WORKER_PARTIAL_TP_
 // token-class aware (runners get a wider take-profit leash; majors/betas bank quicker). Floors
 // and the no-TP-below-breakeven rule are unchanged, so stops are never disabled.
 const WORKER_TOKEN_CLASS_EXIT_PROFILES_ENABLED = process.env.WORKER_TOKEN_CLASS_EXIT_PROFILES_ENABLED === 'true';
+// Class-weighted entry sizing (Noah-only, default OFF): reallocate capital away from the
+// token class that structurally cannot clear the ~50bps round-trip break-even (trend_liquid,
+// median peak ~21bps, 62% of position-time) toward the classes that do (sol_beta/long_tail/
+// major). This is SIZING, not a gate: it never blocks an entry, only scales its notional.
+// Multipliers are bps of the base entry size (10000 = 1.0x). With the flag OFF the sizing is
+// computed for shadow telemetry only and never applied.
+const WORKER_CLASS_ENTRY_SIZING_ENABLED = process.env.WORKER_CLASS_ENTRY_SIZING_ENABLED === 'true';
+const WORKER_CLASS_SIZE_MAJOR_BPS = Number(process.env.WORKER_CLASS_SIZE_MAJOR_BPS ?? 10000);
+const WORKER_CLASS_SIZE_SOL_BETA_BPS = Number(process.env.WORKER_CLASS_SIZE_SOL_BETA_BPS ?? 10000);
+const WORKER_CLASS_SIZE_TREND_LIQUID_BPS = Number(process.env.WORKER_CLASS_SIZE_TREND_LIQUID_BPS ?? 5000);
+const WORKER_CLASS_SIZE_LONG_TAIL_BPS = Number(process.env.WORKER_CLASS_SIZE_LONG_TAIL_BPS ?? 10000);
 const WORKER_EXIT_SHADOW_HISTORY_ENABLED = process.env.WORKER_EXIT_SHADOW_HISTORY_ENABLED !== 'false';
 const WORKER_ADAPTIVE_EXIT_CANARY_SESSION_ID = process.env.WORKER_ADAPTIVE_EXIT_CANARY_SESSION_ID?.trim() || null;
 // Sessions are ephemeral (a fresh session_wallet + session id every funding cycle), so
@@ -5604,6 +5615,43 @@ const getTokenClassExitProfile = (tokenClass: TokenTradeClass): TokenClassExitPr
   }
 };
 
+const getTokenClassSizeMultiplierBps = (tokenClass: TokenTradeClass): number => {
+  switch (tokenClass) {
+    case 'major':
+      return WORKER_CLASS_SIZE_MAJOR_BPS;
+    case 'sol_beta':
+      return WORKER_CLASS_SIZE_SOL_BETA_BPS;
+    case 'trend_liquid':
+      return WORKER_CLASS_SIZE_TREND_LIQUID_BPS;
+    case 'long_tail':
+    default:
+      return WORKER_CLASS_SIZE_LONG_TAIL_BPS;
+  }
+};
+
+// Computes the class-weighted entry size for a candidate token. Always runs (so the shadow
+// line records what it WOULD do); the caller only applies the result when the flag is enabled
+// and canary-scoped. Never blocks: if the down-sized amount would fall below the min trade,
+// the base amount is left unchanged (we shrink effort on a weak class, we do not gate it out).
+const computeClassEntrySizing = (params: {
+  mint: string;
+  symbol?: string | null;
+  inventory: TradeInventoryContext;
+}): {
+  tokenClass: TokenTradeClass;
+  multiplierBps: number;
+  baseAmountAtomic: number;
+  adjustedAmountAtomic: number;
+  belowMinTrade: boolean;
+} => {
+  const tokenClass = getTokenTradeClass(params.mint, params.symbol);
+  const multiplierBps = getTokenClassSizeMultiplierBps(tokenClass);
+  const baseAmountAtomic = params.inventory.amountAtomic ?? 0;
+  const adjustedAmountAtomic = Math.floor((baseAmountAtomic * multiplierBps) / 10_000);
+  const belowMinTrade = adjustedAmountAtomic < params.inventory.minTradeAtomic;
+  return { tokenClass, multiplierBps, baseAmountAtomic, adjustedAmountAtomic, belowMinTrade };
+};
+
 const isCanaryShadowEnabled = (session: RawSession, enabled: boolean): boolean => {
   if (!enabled) return false;
   // No scoping configured at all => shadow applies to every session.
@@ -7546,6 +7594,36 @@ const executeTrade = async (session: RawSession): Promise<void> => {
         'info',
         session.id,
         `entry size reduced by volatility: ${entryInventory.outputSymbol} amount ${originalAmount} â†’ ${volatilitySizing.adjustedAmountAtomic} scale=${volatilitySizing.sizeScaleBps}bps vol=${volatilitySizing.volatilityBps}bps`,
+      );
+    }
+
+    const classSizing = computeClassEntrySizing({
+      mint: selectedEntryMint,
+      symbol: entryInventory.outputSymbol,
+      inventory: entryInventory,
+    });
+    const classSizingActive = isCanaryShadowEnabled(session, WORKER_CLASS_ENTRY_SIZING_ENABLED);
+    if (classSizing.multiplierBps !== 10_000) {
+      log(
+        'info',
+        session.id,
+        `class-sizing ${classSizingActive ? 'apply' : 'shadow'}: ${entryInventory.outputSymbol} class=${classSizing.tokenClass} mult=${(classSizing.multiplierBps / 10_000).toFixed(2)}x base=${classSizing.baseAmountAtomic} would=${classSizing.adjustedAmountAtomic}${classSizing.belowMinTrade ? ' (below_min_trade=kept_base)' : ''}`,
+      );
+    }
+    if (
+      classSizingActive
+      && classSizing.multiplierBps !== 10_000
+      && !classSizing.belowMinTrade
+      && classSizing.adjustedAmountAtomic > 0
+      && classSizing.adjustedAmountAtomic < (entryInventory.amountAtomic ?? 0)
+    ) {
+      const preClassAmount = entryInventory.amountAtomic ?? 0;
+      entryInventory.amountAtomic = classSizing.adjustedAmountAtomic;
+      entryInventory.riskAdjustedAmountAtomic = classSizing.adjustedAmountAtomic;
+      log(
+        'info',
+        session.id,
+        `entry size adjusted by class: ${entryInventory.outputSymbol} class=${classSizing.tokenClass} amount ${preClassAmount} -> ${classSizing.adjustedAmountAtomic} mult=${(classSizing.multiplierBps / 10_000).toFixed(2)}x`,
       );
     }
 
