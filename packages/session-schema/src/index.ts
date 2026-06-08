@@ -318,6 +318,7 @@ export const sessionPositionStateSchema = z.object({
   maxAdverseAt: isoDatetimeSchema.nullable().default(null),
   pendingExitReason: sessionPositionExitReasonSchema.nullable().default(null),
   exitReason: sessionPositionExitReasonSchema.nullable().default(null),
+  partialExitDone: z.boolean().default(false),
 });
 
 export const sessionPositionsStateSchema = z.object({
@@ -439,6 +440,7 @@ const defaultSessionPositionState: NonNullable<SessionServiceControl['positionSt
   maxAdverseAt: null,
   pendingExitReason: null,
   exitReason: null,
+  partialExitDone: false,
 };
 
 const defaultSessionPositionsState: SessionPositionsState = {

@@ -293,6 +293,11 @@ const WORKER_GRID_CHOP_SHADOW_ENABLED = process.env.WORKER_GRID_CHOP_SHADOW_ENAB
 // honest break-even telemetry below, NOT by the live exit cost-floor. The live floor still uses the
 // conservative maxSlippage cap; this measures what a partial-TP would net against ACTUAL friction.
 const WORKER_EXIT_EXPECTED_SLIPPAGE_BPS = Number(process.env.WORKER_EXIT_EXPECTED_SLIPPAGE_BPS ?? 15);
+// Step 4 (real exec, Noah-only, default OFF): when enabled + canary-scoped, the worker may sell a
+// token-class fraction of a position that has cleared its honest-break-even partial-TP trigger,
+// but only when no hard exit (stop/TP/reversal) is competing that cycle. One partial per position.
+const WORKER_PARTIAL_TP_ENABLED = process.env.WORKER_PARTIAL_TP_ENABLED === 'true';
+const WORKER_PARTIAL_TP_MAX_FRACTION_BPS = Number(process.env.WORKER_PARTIAL_TP_MAX_FRACTION_BPS ?? 6000);
 const WORKER_EXIT_SHADOW_HISTORY_ENABLED = process.env.WORKER_EXIT_SHADOW_HISTORY_ENABLED !== 'false';
 const WORKER_ADAPTIVE_EXIT_CANARY_SESSION_ID = process.env.WORKER_ADAPTIVE_EXIT_CANARY_SESSION_ID?.trim() || null;
 // Sessions are ephemeral (a fresh session_wallet + session id every funding cycle), so
@@ -3987,6 +3992,7 @@ type TradeExecutionPlan = {
   scannerStrategy: StrategyKey;
   entryStrategy: StrategyKey | null;
   exitStrategy: StrategyKey | null;
+  partialFractionBps?: number | null;
 };
 
 type ExitTriggerDecision = {
@@ -6518,6 +6524,17 @@ const executeTrade = async (session: RawSession): Promise<void> => {
       position: SessionPositionState;
       signal: NonNullable<Session['serviceControl']['lastSignal']>;
       trigger: ExitTriggerDecision;
+      partialFractionBps?: number | null;
+    }> = [];
+    // Step 4 partial-TP (Noah-only, flag-gated). Collected during the exit scan; only promoted
+    // into an exit when NO hard exit competes this cycle (hard exits always win).
+    const partialTpActive = isCanaryShadowEnabled(session, WORKER_PARTIAL_TP_ENABLED);
+    const partialCandidates: Array<{
+      mint: string;
+      position: SessionPositionState;
+      signal: NonNullable<Session['serviceControl']['lastSignal']>;
+      trigger: ExitTriggerDecision;
+      sellBps: number;
     }> = [];
 
     for (const { mint, position } of openPositions) {
@@ -6558,6 +6575,14 @@ const executeTrade = async (session: RawSession): Promise<void> => {
           };
           positionsChanged = true;
         }
+        if (partialTpActive && !position.partialExitDone) {
+          const partialTokenClass = getTokenTradeClass(mint, getPositionSymbol(position));
+          const partialHonestFloorBps = WORKER_EXIT_EXPECTED_SLIPPAGE_BPS + Number(session.service_control.platformFeeBps ?? 0);
+          const partialEval = computePartialTpShadow(partialTokenClass, exitTrigger.pnlBps, partialHonestFloorBps);
+          if (partialEval.fired) {
+            partialCandidates.push({ mint, position, signal: signalForPosition, trigger: exitTrigger, sellBps: partialEval.sellBps });
+          }
+        }
         continue;
       }
 
@@ -6591,6 +6616,23 @@ const executeTrade = async (session: RawSession): Promise<void> => {
         positions: nextPositions,
       });
       positionState = summarizePositionsState(positionsState, session.service_control.positionState ?? undefined);
+    }
+
+    if (exitCandidates.length === 0 && partialTpActive && partialCandidates.length > 0) {
+      partialCandidates.sort((a, b) => (b.trigger.pnlBps ?? 0) - (a.trigger.pnlBps ?? 0));
+      const bestPartial = partialCandidates[0];
+      exitCandidates.push({
+        mint: bestPartial.mint,
+        position: bestPartial.position,
+        signal: bestPartial.signal,
+        trigger: { ...bestPartial.trigger, reason: 'take_profit' },
+        partialFractionBps: bestPartial.sellBps,
+      });
+      log(
+        'info',
+        session.id,
+        `partial-tp candidate promoted: ${getPositionSymbol(bestPartial.position)} pnl=${bestPartial.trigger.pnlBps} sellBps=${bestPartial.sellBps}`,
+      );
     }
 
     if (exitCandidates.length > 0) {
@@ -6653,11 +6695,14 @@ const executeTrade = async (session: RawSession): Promise<void> => {
         );
       }
       const exitTradableAtomic = Math.max(0, exitWalletBalanceAtomic - exitReserveAtomic);
-      const exitAmountLamports = computeFullExitAmountAtomic({
+      const fullExitAmountLamports = computeFullExitAmountAtomic({
         walletBalanceAtomic: exitWalletBalanceAtomic,
         reserveAtomic: exitReserveAtomic,
         positionQuantityAtomic: positionState.quantityAtomic,
       });
+      const exitAmountLamports = selectedExit.partialFractionBps != null
+        ? Math.max(0, Math.floor((fullExitAmountLamports * Math.min(selectedExit.partialFractionBps, WORKER_PARTIAL_TP_MAX_FRACTION_BPS)) / 10000))
+        : fullExitAmountLamports;
 
       const sellInventory: TradeInventoryContext = {
         inputMint: positionMint,
@@ -6727,6 +6772,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
         scannerStrategy: activeStrategy,
         entryStrategy: selectedExit.position.entryStrategy ?? null,
         exitStrategy: selectedExit.position.entryStrategy ?? activeStrategy,
+        partialFractionBps: selectedExit.partialFractionBps ?? null,
       };
     }
   }
@@ -7965,6 +8011,25 @@ const executeTrade = async (session: RawSession): Promise<void> => {
   consecutiveSimFailures.delete(session.id);
 
   await persistTradeDecision(session, 'submitted', submit.data.status ?? 'submitted');
+
+  if (tradePlan.direction === 'exit_long' && tradePlan.partialFractionBps != null) {
+    try {
+      const partialMint = tradePlan.inventory.inputMint;
+      const existingPartialPosition = positionsState.positions[partialMint];
+      if (existingPartialPosition) {
+        positionsState = await persistPositionsState(session, {
+          activePositionMint: positionsState.activePositionMint,
+          positions: {
+            ...positionsState.positions,
+            [partialMint]: { ...existingPartialPosition, partialExitDone: true, pendingExitReason: null },
+          },
+        });
+      }
+      log('info', session.id, `partial-tp marked done: ${tradePlan.inventory.inputSymbol} fraction=${tradePlan.partialFractionBps}bps`);
+    } catch (err) {
+      log('warn', session.id, `failed to mark partial-tp done: ${String(err)}`);
+    }
+  }
 
   if (tradePlan.direction === 'enter_long') {
     const nextScannerStrategy = getNextStrategyInSequence(
