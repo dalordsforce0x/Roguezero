@@ -6184,9 +6184,9 @@ const computePartialTpShadow = (
 ): { triggerBps: number; sellBps: number; fired: boolean; netBps: number | null } => {
   const profile =
     tokenClass === 'major'
-      ? { marginBps: 50, sellBps: 3000 }
+      ? { marginBps: 7, sellBps: 4000 }
       : tokenClass === 'sol_beta'
-        ? { marginBps: 20, sellBps: 3500 }
+        ? { marginBps: 8, sellBps: 3500 }
         : tokenClass === 'trend_liquid'
           ? { marginBps: 15, sellBps: 4000 }
           : { marginBps: 10, sellBps: 5000 };
