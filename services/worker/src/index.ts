@@ -298,6 +298,10 @@ const WORKER_EXIT_EXPECTED_SLIPPAGE_BPS = Number(process.env.WORKER_EXIT_EXPECTE
 // but only when no hard exit (stop/TP/reversal) is competing that cycle. One partial per position.
 const WORKER_PARTIAL_TP_ENABLED = process.env.WORKER_PARTIAL_TP_ENABLED === 'true';
 const WORKER_PARTIAL_TP_MAX_FRACTION_BPS = Number(process.env.WORKER_PARTIAL_TP_MAX_FRACTION_BPS ?? 6000);
+// Phase 4 (Noah-only, default OFF): when enabled + canary-scoped, exit ATR multipliers become
+// token-class aware (runners get a wider take-profit leash; majors/betas bank quicker). Floors
+// and the no-TP-below-breakeven rule are unchanged, so stops are never disabled.
+const WORKER_TOKEN_CLASS_EXIT_PROFILES_ENABLED = process.env.WORKER_TOKEN_CLASS_EXIT_PROFILES_ENABLED === 'true';
 const WORKER_EXIT_SHADOW_HISTORY_ENABLED = process.env.WORKER_EXIT_SHADOW_HISTORY_ENABLED !== 'false';
 const WORKER_ADAPTIVE_EXIT_CANARY_SESSION_ID = process.env.WORKER_ADAPTIVE_EXIT_CANARY_SESSION_ID?.trim() || null;
 // Sessions are ephemeral (a fresh session_wallet + session id every funding cycle), so
@@ -5581,6 +5585,25 @@ const getTokenTradeClass = (mint: string, symbol?: string | null): TokenTradeCla
   return 'long_tail';
 };
 
+type TokenClassExitProfile = { takeProfitMult: number; stopLossMult: number; trailingStopMult: number };
+
+// Per-class ATR exit multipliers. Baseline global was TP 1.8 / SL 1.0 / trail 0.8.
+// long_tail = runners -> wide TP leash so a real move runs; slightly wider SL to ride noise; trailing locks.
+// major / sol_beta / trend_liquid -> tighter TP so chop-prone names bank quicker. All floored downstream.
+const getTokenClassExitProfile = (tokenClass: TokenTradeClass): TokenClassExitProfile => {
+  switch (tokenClass) {
+    case 'major':
+      return { takeProfitMult: 1.4, stopLossMult: 1.0, trailingStopMult: 0.7 };
+    case 'sol_beta':
+      return { takeProfitMult: 1.6, stopLossMult: 1.0, trailingStopMult: 0.8 };
+    case 'trend_liquid':
+      return { takeProfitMult: 1.7, stopLossMult: 1.0, trailingStopMult: 0.8 };
+    case 'long_tail':
+    default:
+      return { takeProfitMult: 2.6, stopLossMult: 1.2, trailingStopMult: 1.0 };
+  }
+};
+
 const isCanaryShadowEnabled = (session: RawSession, enabled: boolean): boolean => {
   if (!enabled) return false;
   // No scoping configured at all => shadow applies to every session.
@@ -5603,6 +5626,15 @@ const computeDynamicExitThresholds = (
 ): DynamicExitThresholds => {
   const costFloorBps = computeExitCostFloorBps(session);
   const atrBps = positionState.lastComputedAtrBps ?? null;
+  // Token-class exit profile (flag-gated, Noah-scoped). OFF => exact global multipliers as before.
+  const exitProfilesActive = isCanaryShadowEnabled(session, WORKER_TOKEN_CLASS_EXIT_PROFILES_ENABLED);
+  const exitProfile: TokenClassExitProfile = exitProfilesActive
+    ? getTokenClassExitProfile(getTokenTradeClass(positionState.positionMint ?? '', positionState.positionSymbol))
+    : {
+        takeProfitMult: positionExitPolicy.atrTakeProfitMultiplier,
+        stopLossMult: positionExitPolicy.atrStopLossMultiplier,
+        trailingStopMult: positionExitPolicy.atrTrailingStopMultiplier,
+      };
 
   // Time-decay take-profit ladder: a fresh position must clear its full target,
   // but as it ages the required take-profit decays linearly toward the cost
@@ -5638,15 +5670,15 @@ const computeDynamicExitThresholds = (
   return {
     takeProfitBps: applyTakeProfitTimeDecay(Math.max(
       costFloorBps,
-      Math.round(atrBps * positionExitPolicy.atrTakeProfitMultiplier * (1 + signalStrengthBoost)),
+      Math.round(atrBps * exitProfile.takeProfitMult * (1 + signalStrengthBoost)),
     )),
     stopLossBps: Math.max(
       costFloorBps,
-      Math.round(atrBps * positionExitPolicy.atrStopLossMultiplier),
+      Math.round(atrBps * exitProfile.stopLossMult),
     ),
     trailingStopBps: Math.max(
       costFloorBps,
-      Math.round(atrBps * positionExitPolicy.atrTrailingStopMultiplier),
+      Math.round(atrBps * exitProfile.trailingStopMult),
     ),
     atrBps,
     costFloorBps,
