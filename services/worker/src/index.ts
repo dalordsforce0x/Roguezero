@@ -5894,13 +5894,19 @@ const buildAdaptiveExitShadow = (params: {
 const buildGridChopShadow = (params: {
   session: RawSession;
   evaluations: Array<Record<string, unknown>>;
+  sessionIsChop: boolean;
 }) => {
   const enabled = isCanaryShadowEnabled(params.session, WORKER_GRID_CHOP_SHADOW_ENABLED);
-  const marketRegime = enabled && params.evaluations.some((evaluation) => evaluation.signalRegime === 'flat')
-    ? 'chop' as const
-    : enabled
-      ? 'trend' as const
-      : 'unknown' as const;
+  // Chop detection keys off the SESSION-level strategy signal regime (the momentum /
+  // mean-reversion tape read), NOT the per-position exit signalRegime. The latter
+  // never reported 'flat' even in obvious chop, so the virtual grid stayed disabled
+  // in the exact ranging conditions it exists for. params.sessionIsChop is computed
+  // from the live session strategy signals at the call site.
+  const marketRegime = !enabled
+    ? 'unknown' as const
+    : params.sessionIsChop
+      ? 'chop' as const
+      : 'trend' as const;
 
   return {
     at: new Date().toISOString(),
@@ -6502,8 +6508,12 @@ const executeTrade = async (session: RawSession): Promise<void> => {
     }
 
     if (WORKER_EXIT_TELEMETRY_ENABLED && exitEvaluations.length > 0) {
+      // Session-level chop read: any active/scanned strategy signal reporting a flat
+      // (ranging) regime means the market is chopping, which is when the virtual grid
+      // shadow should observe. Sourced from the live session signals, not per-position.
+      const sessionIsChop = Array.from(strategySignalByKey.values()).some((signal) => signal.regime === 'flat');
       const adaptiveExitShadow = buildAdaptiveExitShadow({ session, evaluations: exitEvaluations });
-      const gridChopShadow = buildGridChopShadow({ session, evaluations: exitEvaluations });
+      const gridChopShadow = buildGridChopShadow({ session, evaluations: exitEvaluations, sessionIsChop });
       await persistServiceControl(session, {
         lastExitEvaluations: exitEvaluations,
         lastExitEvaluation: exitEvaluations,
