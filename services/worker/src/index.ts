@@ -1975,7 +1975,18 @@ const parseQuotePriceImpactBps = (priceImpactPct: string | null | undefined): nu
     : Math.round(absoluteImpact * 100);
 };
 
+// Per-tick price/signal telemetry is high-frequency; throttle to stay well under Railway's
+// 500 logs/sec replica cap (which was dropping messages). 0 disables throttling.
+const WORKER_TICK_LOG_MIN_INTERVAL_MS = Number(process.env.WORKER_TICK_LOG_MIN_INTERVAL_MS ?? 5000);
+let lastSignalLogMs = 0;
+let lastPriceLogMs = 0;
+
 const logSignalEvent = (event: object) => {
+  const nowMs = Date.now();
+  if (WORKER_TICK_LOG_MIN_INTERVAL_MS > 0 && (nowMs - lastSignalLogMs) < WORKER_TICK_LOG_MIN_INTERVAL_MS) {
+    return;
+  }
+  lastSignalLogMs = nowMs;
   console.log(JSON.stringify({
     service: 'roguezero-worker',
     kind: 'signal',
@@ -1985,6 +1996,11 @@ const logSignalEvent = (event: object) => {
 };
 
 const logPriceEvent = (event: object) => {
+  const nowMs = Date.now();
+  if (WORKER_TICK_LOG_MIN_INTERVAL_MS > 0 && (nowMs - lastPriceLogMs) < WORKER_TICK_LOG_MIN_INTERVAL_MS) {
+    return;
+  }
+  lastPriceLogMs = nowMs;
   console.log(JSON.stringify({
     service: 'roguezero-worker',
     kind: 'price',
