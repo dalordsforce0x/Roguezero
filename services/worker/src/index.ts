@@ -290,6 +290,12 @@ const WORKER_EXIT_TELEMETRY_ENABLED = process.env.WORKER_EXIT_TELEMETRY_ENABLED 
 const WORKER_ADAPTIVE_EXIT_SHADOW_ENABLED = process.env.WORKER_ADAPTIVE_EXIT_SHADOW_ENABLED === 'true';
 const WORKER_GRID_CHOP_SHADOW_ENABLED = process.env.WORKER_GRID_CHOP_SHADOW_ENABLED === 'true';
 const WORKER_ADAPTIVE_EXIT_CANARY_SESSION_ID = process.env.WORKER_ADAPTIVE_EXIT_CANARY_SESSION_ID?.trim() || null;
+// Sessions are ephemeral (a fresh session_wallet + session id every funding cycle), so
+// pinning the canary to a single session id forces an env change + redeploy every time a
+// new Noah session is created. Scoping by the stable OWNER wallet (the DaLordsForce test
+// wallet that funds Noah) lets every new ephemeral Noah session auto-enroll as the canary
+// with zero redeploy. Real customer wallets never match, so they are never shadow-scoped.
+const WORKER_ADAPTIVE_EXIT_CANARY_OWNER_WALLET = process.env.WORKER_ADAPTIVE_EXIT_CANARY_OWNER_WALLET?.trim() || null;
 const WORKER_TRENDING_ENTRY_CHASE_LOOKBACK_SAMPLES = Number(process.env.WORKER_TRENDING_ENTRY_CHASE_LOOKBACK_SAMPLES ?? 4);
 const WORKER_TRENDING_ENTRY_MAX_RECENT_SURGE_BPS = Number(process.env.WORKER_TRENDING_ENTRY_MAX_RECENT_SURGE_BPS ?? 80);
 const WORKER_TRENDING_ENTRY_MIN_PULLBACK_BPS = Number(process.env.WORKER_TRENDING_ENTRY_MIN_PULLBACK_BPS ?? 35);
@@ -5550,7 +5556,17 @@ const getTokenTradeClass = (mint: string, symbol?: string | null): TokenTradeCla
 
 const isCanaryShadowEnabled = (session: RawSession, enabled: boolean): boolean => {
   if (!enabled) return false;
-  return WORKER_ADAPTIVE_EXIT_CANARY_SESSION_ID === null || WORKER_ADAPTIVE_EXIT_CANARY_SESSION_ID === session.id;
+  // No scoping configured at all => shadow applies to every session.
+  if (WORKER_ADAPTIVE_EXIT_CANARY_SESSION_ID === null && WORKER_ADAPTIVE_EXIT_CANARY_OWNER_WALLET === null) {
+    return true;
+  }
+  // Stable owner-wallet match: every ephemeral Noah session funded by this wallet enrolls
+  // automatically, so we never have to repoint a session id + redeploy per session.
+  if (WORKER_ADAPTIVE_EXIT_CANARY_OWNER_WALLET !== null && session.owner_wallet === WORKER_ADAPTIVE_EXIT_CANARY_OWNER_WALLET) {
+    return true;
+  }
+  // Exact session-id pin still works for one-off precision targeting.
+  return WORKER_ADAPTIVE_EXIT_CANARY_SESSION_ID !== null && WORKER_ADAPTIVE_EXIT_CANARY_SESSION_ID === session.id;
 };
 
 const computeDynamicExitThresholds = (
