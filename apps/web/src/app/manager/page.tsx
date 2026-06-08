@@ -58,6 +58,28 @@ type ManagerSession = {
     positionsState?: { positions?: Record<string, SessionPosition> };
     positionState?: SessionPosition;
     rotationState?: { activeStrategy?: string };
+    healthState?: {
+      state?: string;
+      severity?: string;
+      reason?: string | null;
+      detail?: string | null;
+      updatedAt?: string;
+    };
+    lastSignal?: {
+      at?: string;
+      status?: string;
+      regime?: string | null;
+      momentumBps?: number | null;
+      signal?: string | null;
+      strategy?: string | null;
+    };
+    lastTradeGate?: {
+      at?: string;
+      decision?: string;
+      reason?: string;
+      expectedEdgeBps?: number | null;
+      estimatedCostBps?: number | null;
+    };
   };
 };
 
@@ -126,8 +148,16 @@ export default function ManagerPage() {
   }, [loadOverview]);
 
   useEffect(() => {
-    if (phase === 'ready') void loadSessions();
-  }, [phase, loadSessions]);
+    if (phase !== 'ready') return;
+    void loadSessions();
+    // Poll live data every 10s so the manager console reflects current state.
+    const overviewTimer = setInterval(() => { void loadOverview(); }, 30_000);
+    const sessionTimer = setInterval(() => { void loadSessions(); }, 10_000);
+    return () => {
+      clearInterval(overviewTimer);
+      clearInterval(sessionTimer);
+    };
+  }, [phase, loadSessions, loadOverview]);
 
   const submitKey = useCallback(async () => {
     if (!managementKey.trim()) return;
@@ -311,9 +341,9 @@ export default function ManagerPage() {
                             key={user.id}
                             type="button"
                             onClick={() => setSelectedUserId(user.id)}
-                            className="group flex w-40 flex-col items-center gap-2"
+                            className="group flex w-44 flex-col items-center gap-2"
                           >
-                            {/* controller-screen tile */}
+                            {/* controller-screen tile = live mini render of the bot screen */}
                             <div
                               className={`relative w-full overflow-hidden rounded-2xl p-1.5 shadow-[0_6px_16px_rgba(0,0,0,0.45)] transition ${
                                 selected
@@ -321,15 +351,12 @@ export default function ManagerPage() {
                                   : 'bg-linear-to-b from-gray-200/90 to-gray-400/80'
                               }`}
                             >
-                              <div className="relative aspect-4/3 w-full overflow-hidden rounded-xl bg-[#0a1420]">
-                                {/* eslint-disable-next-line @next/next/no-img-element */}
-                                <img
-                                  src="/media/bird-alpha-preview.png"
-                                  alt=""
-                                  className="absolute inset-0 h-full w-full object-cover opacity-90"
-                                />
+                              <div className="relative overflow-hidden rounded-xl">
+                                <ScaledScreen width={160}>
+                                  <BotScreen user={user} session={session} />
+                                </ScaledScreen>
                                 <span
-                                  className={`absolute right-2 top-2 h-2.5 w-2.5 rounded-full ${
+                                  className={`absolute right-2 top-2 z-10 h-2.5 w-2.5 rounded-full ${
                                     live ? 'bg-emerald-400 shadow-[0_0_8px_rgba(16,185,129,0.9)]' : 'bg-gray-600'
                                   }`}
                                 />
@@ -372,16 +399,9 @@ export default function ManagerPage() {
                   {sessionLive ? (
                     <iframe title={`bot-${selectedUser.id}`} src="/" className="h-80 w-full" />
                   ) : (
-                    <div className="relative flex h-80 flex-col">
-                      {/* mini controller chrome */}
-                      <div className="flex items-center justify-between px-4 py-2 text-[9px] uppercase tracking-widest text-cyan-200/70">
-                        <span className="flex gap-2"><span>start</span><span>stop</span></span>
-                        <span className="flex gap-2"><span className="text-cyan-300">activity</span><span className="text-white/40">dashboard</span></span>
-                      </div>
-                      {/* eslint-disable-next-line @next/next/no-img-element */}
-                      <img src="/media/bird-alpha-preview.png" alt="" className="absolute inset-0 z-0 h-full w-full object-contain opacity-80" />
-                      <div className="mt-auto px-4 py-3 text-center text-[10px] text-cyan-100/50">connect wallet to initialize controller.</div>
-                    </div>
+                    <ScaledScreen width={400}>
+                      <BotScreen user={selectedUser} session={selectedSession} />
+                    </ScaledScreen>
                   )}
                 </div>
                 <button
@@ -474,3 +494,138 @@ function InfoLine({ label, value, mono }: { label: string; value: React.ReactNod
     </div>
   );
 }
+
+// Base design size for the controller screen; the gallery tile and the device
+// frame both render this and scale it to their target width (whole-screen view).
+const SCREEN_W = 360;
+const SCREEN_H = 270;
+
+function ScaledScreen({ width, children }: { width: number; children: React.ReactNode }) {
+  const scale = width / SCREEN_W;
+  return (
+    <div style={{ width, height: SCREEN_H * scale }} className="overflow-hidden">
+      <div
+        style={{ width: SCREEN_W, height: SCREEN_H, transform: `scale(${scale})`, transformOrigin: 'top left' }}
+      >
+        {children}
+      </div>
+    </div>
+  );
+}
+
+const HEALTH_LABELS: Record<string, { text: string; tone: string }> = {
+  active_trading: { text: 'ACTIVE · TRADING', tone: 'text-emerald-400' },
+  waiting_market: { text: 'WAITING · MARKET', tone: 'text-cyan-300' },
+  blocked: { text: 'BLOCKED', tone: 'text-amber-400' },
+  exit_blocked: { text: 'EXIT BLOCKED', tone: 'text-amber-400' },
+  gas_danger: { text: 'GAS DANGER', tone: 'text-red-400' },
+  recovery_required: { text: 'RECOVERY', tone: 'text-red-400' },
+  stopping: { text: 'STOPPING', tone: 'text-red-300' },
+  stopped: { text: 'STOPPED', tone: 'text-gray-400' },
+  error: { text: 'ERROR', tone: 'text-red-400' },
+};
+
+const tidy = (raw: string | null | undefined) =>
+  raw ? raw.replace(/_/g, ' ') : null;
+
+const fmtUsdScreen = (v: number | undefined | null) =>
+  typeof v === 'number' && Number.isFinite(v) ? `${v >= 0 ? '+' : '-'}$${Math.abs(v).toFixed(2)}` : '$0.00';
+
+/**
+ * Live mini-render of the bot's controller screen. Driven entirely by the
+ * session payload, so it reflects true current state (status, signal, position,
+ * PnL, gate decision). Rendered at a fixed SCREEN_W×SCREEN_H and scaled by the
+ * caller for tiles vs the device frame.
+ */
+function BotScreen({ user, session }: { user: ManagerUser; session: ManagerSession | undefined }) {
+  const svc = session?.serviceControl;
+  const status = session?.status ?? 'idle';
+  const live = LIVE_STATUSES.has(status);
+  const health = svc?.healthState?.state ?? (live ? 'waiting_market' : 'stopped');
+  const healthMeta = HEALTH_LABELS[health] ?? { text: status.toUpperCase(), tone: 'text-cyan-300' };
+
+  const positions = openPositionsOf(session);
+  const pos = positions[0];
+  const strategy = svc?.rotationState?.activeStrategy ?? svc?.lastSignal?.strategy ?? null;
+  const signal = svc?.lastSignal;
+  const gate = svc?.lastTradeGate;
+
+  const realized = session?.funding?.realizedPnlUsd ?? 0;
+  const unrealized = session?.funding?.unrealizedPnlUsd ?? 0;
+
+  return (
+    <div
+      style={{ width: SCREEN_W, height: SCREEN_H }}
+      className="flex flex-col bg-[#070d16] font-mono text-cyan-100"
+    >
+      {/* tab bar */}
+      <div className="flex items-center justify-between border-b border-cyan-300/15 bg-black/40 px-3 py-1.5 text-[10px] uppercase tracking-widest">
+        <span className="flex gap-2">
+          <span className={live ? 'text-emerald-400' : 'text-white/35'}>start</span>
+          <span className={status === 'stopping' || status === 'stopped' ? 'text-red-400' : 'text-white/35'}>stop</span>
+        </span>
+        <span className="flex gap-2">
+          <span className="text-cyan-300">activity</span>
+          <span className="text-white/35">dashboard</span>
+        </span>
+      </div>
+
+      {/* status row */}
+      <div className="flex items-center justify-between px-3 pt-2">
+        <span className="truncate text-[11px] text-white">{user.username}</span>
+        <span className={`text-[10px] font-semibold ${healthMeta.tone}`}>{healthMeta.text}</span>
+      </div>
+
+      {/* strategy / signal */}
+      <div className="px-3 pt-1 text-[9px] text-cyan-200/70">
+        <div>strategy: <span className="text-cyan-100">{tidy(strategy) ?? '—'}</span></div>
+        <div>
+          signal: <span className="text-cyan-100">{tidy(signal?.signal) ?? tidy(signal?.regime) ?? 'scanning'}</span>
+          {typeof signal?.momentumBps === 'number' && (
+            <span className="text-white/45"> · {signal.momentumBps >= 0 ? '+' : ''}{signal.momentumBps}bps</span>
+          )}
+        </div>
+      </div>
+
+      {/* position panel */}
+      <div className="mx-3 mt-2 flex-1 rounded border border-cyan-300/15 bg-black/30 p-2 text-[9px]">
+        {pos ? (
+          <div className="space-y-1">
+            <div className="flex justify-between">
+              <span className="text-cyan-200/70">position</span>
+              <span className="text-emerald-300">{pos.positionSymbol ?? shortWallet(pos.positionMint)}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-cyan-200/70">entry</span>
+              <span>{pos.entryPriceUsd != null ? `$${pos.entryPriceUsd.toFixed(5)}` : '—'}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-cyan-200/70">mark</span>
+              <span>{pos.lastMarkedPriceUsd != null ? `$${pos.lastMarkedPriceUsd.toFixed(5)}` : '—'}</span>
+            </div>
+          </div>
+        ) : (
+          <div className="flex h-full flex-col items-center justify-center gap-1 text-center text-cyan-200/55">
+            <span>flat · no open position</span>
+            {gate?.reason && (
+              <span className="text-[8px] text-amber-400/80">gate: {tidy(gate.reason)}</span>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* pnl footer */}
+      <div className="flex items-center justify-between border-t border-cyan-300/15 px-3 py-2 text-[10px]">
+        <span>
+          <span className="text-cyan-200/60">realized </span>
+          <span className={realized >= 0 ? 'text-emerald-400' : 'text-red-400'}>{fmtUsdScreen(realized)}</span>
+        </span>
+        <span>
+          <span className="text-cyan-200/60">unreal </span>
+          <span className={unrealized >= 0 ? 'text-emerald-400' : 'text-red-400'}>{fmtUsdScreen(unrealized)}</span>
+        </span>
+      </div>
+    </div>
+  );
+}
+
