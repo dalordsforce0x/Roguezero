@@ -63,6 +63,7 @@ const baseServiceControl: SessionServiceControl = {
     maxFavorableAt: null,
     maxAdverseAt: null,
     pendingExitReason: null,
+    partialExitDone: false,
     exitReason: null,
   },
 };

@@ -431,6 +431,7 @@ const upsertPositionEntry = (params: {
     maxFavorableAt: params.existingPosition?.maxFavorableAt ?? null,
     maxAdverseAt: params.existingPosition?.maxAdverseAt ?? null,
     pendingExitReason: null,
+    partialExitDone: params.existingPosition?.partialExitDone ?? false,
     exitReason: null,
   };
 };
