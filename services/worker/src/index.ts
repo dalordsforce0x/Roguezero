@@ -1080,19 +1080,31 @@ const WORKER_ANTI_CHURN_HARD_STOP_BPS = Math.max(0, Number(process.env.WORKER_AN
 const geckoCandleLimiter = createSharedTokenBucket({
   pool: sharedRatePool,
   key: 'geckoterminal-ohlcv',
-  maxTokens: Math.max(1, Math.min(5, GECKO_CANDLE_RPM)),
+  // Small burst: GeckoTerminal 429s after ~4 rapid calls, so cap the burst at 2
+  // and let the refill rate (RPM/60) carry the steady-state spacing.
+  maxTokens: 2,
   refillRatePerSec: GECKO_CANDLE_RPM / 60,
 });
 const geckoCandleFeed = createGeckoTerminalCandleFeed({
   acquire: () => geckoCandleLimiter.acquire(),
   fetchJson: async (url) => {
-    try {
-      const res = await fetch(url, { headers: { accept: 'application/json' } });
-      if (!res.ok) return null;
-      return await res.json();
-    } catch {
-      return null;
+    // Retry on 429 with linear backoff (cloud egress IPs get rate-limited more
+    // aggressively than residential). Non-429 errors fail fast -> null -> the
+    // feed falls back to the live tape for that mint.
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        const res = await fetch(url, { headers: { accept: 'application/json' } });
+        if (res.status === 429) {
+          await new Promise((resolve) => setTimeout(resolve, 3000 * (attempt + 1)));
+          continue;
+        }
+        if (!res.ok) return null;
+        return await res.json();
+      } catch {
+        return null;
+      }
     }
+    return null;
   },
   log: (entry) => console.warn(JSON.stringify({
     level: 'warn', service: 'roguezero-worker', ...entry, ts: new Date().toISOString(),
@@ -10147,8 +10159,12 @@ const startTokenAdmissionSchedule = (): void => {
 
 const runGeckoCandleRefreshTick = async (): Promise<void> => {
   if (!GECKO_CANDLES_ENABLED) return;
-  const mints = (tokenUniverseActiveMints.length ? tokenUniverseActiveMints : tokenUniverseMints)
-    .filter((mint) => mint && mint !== SOL_MINT);
+  // Only the trusted liquid majors: these are the mints the entry-quality / shape
+  // / ATR gates actually apply to, AND the only ones GeckoTerminal indexes with
+  // real 1-min OHLCV. Feeding the full universe (incl. pump.fun) just burns the
+  // rate budget on tokens that always return no_pool.
+  const mints = TRUSTED_ENTRY_UNIVERSE_MINTS
+    .filter((mint) => mint && mint !== SOL_MINT && !STABLE_ENTRY_TARGET_MINTS.has(mint));
   if (mints.length === 0) return;
   try {
     const result = await geckoCandleFeed.refreshMints(mints);
