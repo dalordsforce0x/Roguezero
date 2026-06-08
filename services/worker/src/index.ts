@@ -30,6 +30,7 @@ import {
   type Mint as SplTokenMint,
 } from '@solana/spl-token';
 import { createMonthlyBudgetGovernor, createSharedTokenBucket, getExponentialBackoffDelayMs } from '@roguezero/provider-governor';
+import { createGeckoTerminalCandleFeed } from './geckoTerminalCandles.js';
 import {
   createRoundRobinKeySelector,
   computeTradeAmountLamports,
@@ -1061,6 +1062,42 @@ const heliusLimiter = createSharedTokenBucket({
   maxTokens: HELIUS_RPC_BURST,
   refillRatePerSec: HELIUS_RPC_RPS,
 });
+
+// â”€â”€ GeckoTerminal shared 1-min candle feed â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// One fleet-wide feed (never one fetch per bot). Routed through its own governor
+// bucket so the free ~30 req/min GeckoTerminal ceiling is never breached. Feeds
+// real 1-min candle history into the ATR cost gate, the entry scorer, and the
+// ATR exit stops -- all of which were previously blind on the thin live tape.
+const GECKO_CANDLES_ENABLED = process.env.WORKER_GECKO_CANDLES_ENABLED !== 'false';
+const GECKO_CANDLE_REFRESH_MS = Math.max(60_000, Number(process.env.WORKER_GECKO_CANDLE_REFRESH_MS ?? 300_000));
+const GECKO_CANDLE_RPM = Math.max(1, Math.min(28, Number(process.env.WORKER_GECKO_CANDLE_RPM ?? 20)));
+const GECKO_CANDLE_MIN_SAMPLES = Math.max(5, Number(process.env.WORKER_GECKO_CANDLE_MIN_SAMPLES ?? 30));
+// Anti-churn: backtest showed sub-2-min stop_loss exits are ~all losers (-146bps,
+// 3.4% win) -- we stop out inside entry-slippage noise. Hold past the window unless
+// the loss is a genuine blowout past the hard floor.
+const WORKER_ANTI_CHURN_MIN_HOLD_MS = Math.max(0, Number(process.env.WORKER_ANTI_CHURN_MIN_HOLD_MS ?? 120_000));
+const WORKER_ANTI_CHURN_HARD_STOP_BPS = Math.max(0, Number(process.env.WORKER_ANTI_CHURN_HARD_STOP_BPS ?? 250));
+const geckoCandleLimiter = createSharedTokenBucket({
+  pool: sharedRatePool,
+  key: 'geckoterminal-ohlcv',
+  maxTokens: Math.max(1, Math.min(5, GECKO_CANDLE_RPM)),
+  refillRatePerSec: GECKO_CANDLE_RPM / 60,
+});
+const geckoCandleFeed = createGeckoTerminalCandleFeed({
+  acquire: () => geckoCandleLimiter.acquire(),
+  fetchJson: async (url) => {
+    try {
+      const res = await fetch(url, { headers: { accept: 'application/json' } });
+      if (!res.ok) return null;
+      return await res.json();
+    } catch {
+      return null;
+    }
+  },
+  log: (entry) => console.warn(JSON.stringify({
+    level: 'warn', service: 'roguezero-worker', ...entry, ts: new Date().toISOString(),
+  })),
+});
 const heliusMonthlyBudget = createMonthlyBudgetGovernor({
   pool: sharedRatePool,
   key: 'helius-credits',
@@ -1934,6 +1971,27 @@ const getMomentumTapeForMint = (mint: string): readonly MarketTapePoint[] => {
     return sharedMarketTape.solUsdPyth;
   }
   return jupiterMomentumTapeByMint.get(mint) ?? [];
+};
+
+// Prefer real 1-min GeckoTerminal candle history for shape/ATR decisions on
+// non-SOL majors. The live Jupiter tape for these tokens is a thin ~60s drift
+// poll -- too short to build an ATR (needs ~120 samples) or a meaningful shape,
+// so the scorer/cost gate were blind and failed open. Candles give the exact
+// 1-min series the entry-shape calibration proved predictive. Falls back to the
+// live tape when candles are missing/stale so behavior is never worse than before.
+const getCandleBackedPriceTape = (
+  mint: string,
+): readonly { usdPrice: number; sampledAt: string }[] => {
+  if (mint === SOL_MINT) {
+    return sharedMarketTape.solUsdPyth;
+  }
+  if (GECKO_CANDLES_ENABLED && geckoCandleFeed.hasFreshCandles(mint)) {
+    const candles = geckoCandleFeed.getTape(mint);
+    if (candles.length >= GECKO_CANDLE_MIN_SAMPLES) {
+      return candles;
+    }
+  }
+  return getMomentumTapeForMint(mint);
 };
 
 const getSharedMarketTapeSummary = () => ({
@@ -5880,7 +5938,7 @@ const refreshPositionsMarks = async (
     const atr = computeAtrFromTape(
       mint === SOL_MINT
         ? sharedMarketTape.solUsdPyth
-        : getMomentumTapeForMint(mint),
+        : getCandleBackedPriceTape(mint),
       strategyConfig.supertrend,
     );
     const markedAt = new Date().toISOString();
@@ -5976,6 +6034,10 @@ const evaluateExitTrigger = (
   const pnlBps = computeReturnBps(positionState.entryPriceUsd, markPriceUsd);
   const trailingDrawdownBps = computeReturnBps(positionState.highWaterPriceUsd, markPriceUsd);
   const thresholds = computeDynamicExitThresholds(session, positionState, signalSnapshot);
+  const exitEntryAtMs = positionState.entryAt ? Date.parse(positionState.entryAt) : NaN;
+  const positionAgeMs = Number.isFinite(exitEntryAtMs)
+    ? Math.max(0, Date.now() - exitEntryAtMs)
+    : Number.POSITIVE_INFINITY;
 
   if (pnlBps !== null && pnlBps >= thresholds.takeProfitBps) {
     return {
@@ -5989,14 +6051,22 @@ const evaluateExitTrigger = (
   }
 
   if (pnlBps !== null && pnlBps <= -thresholds.stopLossBps) {
-    return {
-      shouldExit: true,
-      reason: 'stop_loss',
-      markPriceUsd,
-      pnlBps,
-      trailingDrawdownBps,
-      thresholds,
-    };
+    // Anti-churn: suppress the stop inside the min-hold window unless the loss is a
+    // genuine blowout past the hard floor. Recovering positions then exit via
+    // take_profit/trailing; true disasters still cut immediately.
+    const withinAntiChurnHold = WORKER_ANTI_CHURN_MIN_HOLD_MS > 0
+      && positionAgeMs < WORKER_ANTI_CHURN_MIN_HOLD_MS
+      && pnlBps > -WORKER_ANTI_CHURN_HARD_STOP_BPS;
+    if (!withinAntiChurnHold) {
+      return {
+        shouldExit: true,
+        reason: 'stop_loss',
+        markPriceUsd,
+        pnlBps,
+        trailingDrawdownBps,
+        thresholds,
+      };
+    }
   }
 
   if (
@@ -7652,7 +7722,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
     // entries on trusted majors that bypass the trending shape gate yet still
     // bleed, using catastrophic-shape thresholds calibrated from real history.
     if (WORKER_ENTRY_QUALITY_SHADOW_ENABLED || WORKER_ENTRY_QUALITY_GATE_ENABLED) {
-      const entryQualityPrices = getMomentumTapeForMint(selectedEntryMint).map((sample) => sample.usdPrice);
+      const entryQualityPrices = getCandleBackedPriceTape(selectedEntryMint).map((sample) => sample.usdPrice);
       const entryQuality = computeEntryQualityScore({
         prices: entryQualityPrices,
         minSamples: WORKER_ENTRY_QUALITY_MIN_SAMPLES,
@@ -7720,7 +7790,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
     if (appliesTrendingShapeGate) {
       const shapeGate = computeTrendingEntryShapeGate({
         enabled: true,
-        prices: getMomentumTapeForMint(selectedEntryMint).map((sample) => sample.usdPrice),
+        prices: getCandleBackedPriceTape(selectedEntryMint).map((sample) => sample.usdPrice),
         minSamples: WORKER_TRENDING_ENTRY_SHAPE_MIN_SAMPLES,
         chaseLookbackSamples: WORKER_TRENDING_ENTRY_CHASE_LOOKBACK_SAMPLES,
         maxRecentSurgeBps: WORKER_TRENDING_ENTRY_MAX_RECENT_SURGE_BPS,
@@ -10075,6 +10145,41 @@ const startTokenAdmissionSchedule = (): void => {
   }, Math.max(0, TOKEN_ADMISSION_SCHEDULE_INITIAL_DELAY_MS));
 };
 
+const runGeckoCandleRefreshTick = async (): Promise<void> => {
+  if (!GECKO_CANDLES_ENABLED) return;
+  const mints = (tokenUniverseActiveMints.length ? tokenUniverseActiveMints : tokenUniverseMints)
+    .filter((mint) => mint && mint !== SOL_MINT);
+  if (mints.length === 0) return;
+  try {
+    const result = await geckoCandleFeed.refreshMints(mints);
+    const coverage = geckoCandleFeed.getCoverage();
+    console.log(JSON.stringify({
+      level: 'info', service: 'roguezero-worker', kind: 'gecko_candle_refresh',
+      requested: mints.length, refreshed: result.refreshed, failed: result.failed,
+      freshMints: coverage.freshMints, ts: new Date().toISOString(),
+    }));
+  } catch (error) {
+    console.warn(JSON.stringify({
+      level: 'warn', service: 'roguezero-worker', kind: 'gecko_candle_refresh_failed',
+      error: error instanceof Error ? error.message : String(error), ts: new Date().toISOString(),
+    }));
+  }
+};
+
+const startGeckoCandleLoop = (): void => {
+  if (!GECKO_CANDLES_ENABLED) {
+    console.log('[worker] gecko candle feed disabled by env');
+    return;
+  }
+  console.log('[worker] gecko candle feed enabled', JSON.stringify({
+    refreshMs: GECKO_CANDLE_REFRESH_MS, rpm: GECKO_CANDLE_RPM,
+  }));
+  setTimeout(() => {
+    void runGeckoCandleRefreshTick();
+    setInterval(() => { void runGeckoCandleRefreshTick(); }, GECKO_CANDLE_REFRESH_MS);
+  }, 10_000);
+};
+
 const boot = async () => {
   try {
     await refreshLiveRuntimeControl(true);
@@ -10088,6 +10193,7 @@ const boot = async () => {
 
   startPriceLoops();
   startTokenAdmissionSchedule();
+  startGeckoCandleLoop();
   await runLoop();
 };
 

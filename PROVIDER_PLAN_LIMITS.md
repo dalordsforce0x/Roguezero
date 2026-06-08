@@ -31,6 +31,26 @@ Source: `https://www.helius.dev/pricing`.
   - LaserStream gRPC
   - Priority chat support
 
+## GeckoTerminal (free, no API key)
+
+Source: GeckoTerminal public API (`https://api.geckoterminal.com/api/v2`, Beta). Data via GeckoTerminal (https://www.geckoterminal.com) — attribution appreciated.
+
+- Price: free, no API key required
+- Rate limit: ~30 requests/minute (documented Beta limit; varies with traffic)
+- Used for: a single fleet-wide shared 1-min OHLCV candle feed for the active token
+  universe (token-pool lookup + `/ohlcv/minute`). One feed serves every bot — never one
+  fetch per bot.
+
+RogueZero usage (built-in defaults, `services/worker/src/index.ts`):
+
+- DB-backed governor bucket `geckoterminal-ohlcv`, default **20 req/min** fleet ceiling
+  (`WORKER_GECKO_CANDLE_RPM`, capped at 28 to stay under the ~30/min limit), burst 5.
+- Refresh cadence: every 5 min (`WORKER_GECKO_CANDLE_REFRESH_MS`, default 300000).
+- Pool addresses cached ~24h (rarely change), so a refresh of ~40 tokens costs ~40 OHLCV
+  calls + occasional pool lookups, spread by the bucket well under 30/min.
+- Feature flag `WORKER_GECKO_CANDLES_ENABLED` (default on); the feed fails open — a
+  GeckoTerminal outage degrades to the live Jupiter tape, never blocks trading.
+
 ## RogueZero capacity note
 
 The code defaults now equal the real **90%-of-cap fleet ceilings** (10% safety headroom) and consume the upgraded provider headroom without requiring env overrides. The rate-limit buckets are DB-backed and shared fleet-wide across worker + API by key, so these are combined-fleet limits, not per-process.
@@ -72,6 +92,10 @@ The defaults already match the 90% fleet caps. Only override if you want differe
 - `HELIUS_RPC_BURST` (default min(20, RPS))
 - `WORKER_BASE_CONCURRENT_CAPACITY` (default 350)
 - `WORKER_SPEED_PROFILE` (startup hint only; auto-shift manages live mode)
+- `WORKER_GECKO_CANDLES_ENABLED` (default on)
+- `WORKER_GECKO_CANDLE_RPM` (default 20, hard-capped 28)
+- `WORKER_GECKO_CANDLE_REFRESH_MS` (default 300000)
+- `WORKER_GECKO_CANDLE_MIN_SAMPLES` (default 30; min candles before a token's feed is trusted for shape/ATR)
 
 ## Practical interpretation
 
