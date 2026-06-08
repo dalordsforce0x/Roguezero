@@ -5,6 +5,7 @@ import {
   computePrePrepareEntryGate,
   computeEntryQualityScore,
   classifyTapeRegime,
+  evaluateEntryQualityGate,
   computeFullExitAmountAtomic,
   computeGasRefillPlan,
   computeRetryMinimumTradeAmountAtomic,
@@ -254,6 +255,58 @@ test('classifyTapeRegime treats a flat tape as chop and is unknown below min sam
     classifyTapeRegime({ prices: [1, 1.01], minSamples: 8, trendEfficiencyThreshold: 0.6 }),
     'unknown',
   );
+});
+
+const gateThresholds = {
+  maxRangePositionBps: 9_000,
+  maxRecentSurgeBps: 120,
+  minPullbackFromHighBps: 8,
+};
+
+test('evaluateEntryQualityGate fails open while the tape is warming up', () => {
+  const warming = computeEntryQualityScore({ ...baseEntryQualityInput, prices: [1, 1.01, 1.005] });
+  const decision = evaluateEntryQualityGate({ result: warming, ...gateThresholds });
+  assert.equal(decision.allowed, true);
+  assert.equal(decision.reason, 'entry_quality_warming_up');
+});
+
+test('evaluateEntryQualityGate blocks buying the top of the range', () => {
+  // Strictly ascending into the high: current sits at the range top.
+  const chasedTop = computeEntryQualityScore({
+    ...baseEntryQualityInput,
+    prices: [1, 1.002, 1.004, 1.007, 1.01, 1.016, 1.024, 1.035],
+  });
+  const decision = evaluateEntryQualityGate({ result: chasedTop, ...gateThresholds });
+  assert.equal(decision.allowed, false);
+  assert.ok(
+    ['entry_quality_range_top', 'entry_quality_chase_surge', 'entry_quality_no_pullback'].includes(decision.reason),
+    `expected a catastrophic-shape reject, got ${decision.reason}`,
+  );
+});
+
+test('evaluateEntryQualityGate blocks chasing a vertical surge', () => {
+  const surge = computeEntryQualityScore({
+    ...baseEntryQualityInput,
+    prices: [1, 1, 1, 1, 1, 1.01, 1.03, 1.07],
+  });
+  const decision = evaluateEntryQualityGate({
+    result: surge,
+    maxRangePositionBps: 10_000, // disable the range check to isolate surge
+    maxRecentSurgeBps: 120,
+    minPullbackFromHighBps: 0,
+  });
+  assert.equal(decision.allowed, false);
+  assert.equal(decision.reason, 'entry_quality_chase_surge');
+});
+
+test('evaluateEntryQualityGate allows a reclaimed pullback entry', () => {
+  const reclaimed = computeEntryQualityScore({
+    ...baseEntryQualityInput,
+    prices: [1, 1.006, 1.014, 1.02, 1.015, 1.009, 1.011, 1.014],
+  });
+  const decision = evaluateEntryQualityGate({ result: reclaimed, ...gateThresholds });
+  assert.equal(decision.allowed, true);
+  assert.equal(decision.reason, 'entry_quality_ok');
 });
 
 test('computeStopLossThresholdBps keeps stop-loss independent from cost floor', () => {

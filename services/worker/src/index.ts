@@ -70,6 +70,7 @@ import {
   computeTrendingEntryShapeGate,
   computeEntryQualityScore,
   classifyTapeRegime,
+  evaluateEntryQualityGate,
   resolveTradeGateAssessment,
   shouldApplyPostExitSolReserveProtection,
   shouldForceExitExecution,
@@ -344,7 +345,7 @@ const WORKER_TRENDING_ENTRY_MAX_NEGATIVE_WINDOW_BPS = Number(process.env.WORKER_
 // entry the canary is about to take so we can correlate score vs realized MAE
 // (the -70 bps adverse-excursion problem) before letting it gate a live entry.
 const WORKER_ENTRY_QUALITY_SHADOW_ENABLED = process.env.WORKER_ENTRY_QUALITY_SHADOW_ENABLED !== 'false';
-const WORKER_ENTRY_QUALITY_MIN_SAMPLES = Number(process.env.WORKER_ENTRY_QUALITY_MIN_SAMPLES ?? 8);
+const WORKER_ENTRY_QUALITY_MIN_SAMPLES = Number(process.env.WORKER_ENTRY_QUALITY_MIN_SAMPLES ?? 15);
 const WORKER_ENTRY_QUALITY_CHASE_LOOKBACK_SAMPLES = Number(process.env.WORKER_ENTRY_QUALITY_CHASE_LOOKBACK_SAMPLES ?? 3);
 const WORKER_ENTRY_QUALITY_IDEAL_PULLBACK_BPS = Number(process.env.WORKER_ENTRY_QUALITY_IDEAL_PULLBACK_BPS ?? 40);
 const WORKER_ENTRY_QUALITY_MAX_HEALTHY_PULLBACK_BPS = Number(process.env.WORKER_ENTRY_QUALITY_MAX_HEALTHY_PULLBACK_BPS ?? 150);
@@ -353,6 +354,26 @@ const WORKER_ENTRY_QUALITY_STRONG_SCORE = Number(process.env.WORKER_ENTRY_QUALIT
 const WORKER_ENTRY_QUALITY_FAIR_SCORE = Number(process.env.WORKER_ENTRY_QUALITY_FAIR_SCORE ?? 50);
 const WORKER_ENTRY_QUALITY_ENTER_THRESHOLD = Number(process.env.WORKER_ENTRY_QUALITY_ENTER_THRESHOLD ?? 55);
 const WORKER_ENTRY_QUALITY_TREND_EFFICIENCY_THRESHOLD = Number(process.env.WORKER_ENTRY_QUALITY_TREND_EFFICIENCY_THRESHOLD ?? 0.6);
+// Live entry-quality GATE (fleet-wide). Applied to trusted majors that currently
+// bypass the trending shape gate yet still bleed. Thresholds calibrated from the
+// 4-day round-trip backtest: buying the top of the range (rangePos>~9000: 21% win,
+// -222bps), chasing a vertical surge (recentSurge>~120: 33% win deteriorating to 0%
+// at >300), and buying the exact local high (pullback<~8: 25% win, -209bps) were
+// the loss tail. Fails open while the tape is warming up. Reversible via env.
+const WORKER_ENTRY_QUALITY_GATE_ENABLED = process.env.WORKER_ENTRY_QUALITY_GATE_ENABLED !== 'false';
+const WORKER_ENTRY_QUALITY_GATE_MAX_RANGE_BPS = Number(process.env.WORKER_ENTRY_QUALITY_GATE_MAX_RANGE_BPS ?? 9000);
+const WORKER_ENTRY_QUALITY_GATE_MAX_SURGE_BPS = Number(process.env.WORKER_ENTRY_QUALITY_GATE_MAX_SURGE_BPS ?? 120);
+const WORKER_ENTRY_QUALITY_GATE_MIN_PULLBACK_BPS = Number(process.env.WORKER_ENTRY_QUALITY_GATE_MIN_PULLBACK_BPS ?? 8);
+// Strategies disabled fleet-wide. The 4-day backtest showed momentum at 10% win /
+// -204bps (n=20) vs supertrend 51% win / -19bps -- momentum is an indefensible
+// bleeder, so it is removed from entry selection by default. Reversible via env
+// (set WORKER_DISABLED_STRATEGIES='' to re-enable everything).
+const WORKER_DISABLED_STRATEGIES = new Set(
+  (process.env.WORKER_DISABLED_STRATEGIES ?? 'momentum')
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0),
+);
 const RUNTIME_CONTROL_KEY = 'global_live_runtime';
 const RUNTIME_CONTROL_REFRESH_MS = Number(process.env.RUNTIME_CONTROL_REFRESH_MS ?? 5000);
 let liveSpeedProfileName: RuntimeSpeedProfileName = normalizeRuntimeSpeedProfileName(process.env.WORKER_SPEED_PROFILE);
@@ -6665,11 +6686,12 @@ const executeTrade = async (session: RawSession): Promise<void> => {
   // Resolve which strategy this session should use (respect enabled flags)
   const strategyUniverse = session.service_control.strategyUniverse ?? [];
   const enabledStrategies = strategyUniverse
-    .filter((strategy) => strategy.enabled)
+    .filter((strategy) => strategy.enabled && !WORKER_DISABLED_STRATEGIES.has(strategy.key))
     .map((strategy) => strategy.key as StrategyKey);
 
   const configuredActiveStrategy = (session.service_control.rotationState?.activeStrategy ?? 'momentum') as StrategyKey;
-  const fallbackStrategy = enabledStrategies[0] ?? 'momentum';
+  const fallbackStrategy = enabledStrategies[0]
+    ?? (WORKER_DISABLED_STRATEGIES.has('supertrend') ? 'momentum' : 'supertrend');
   const activeStrategy = enabledStrategies.includes(configuredActiveStrategy)
     ? configuredActiveStrategy
     : fallbackStrategy;
@@ -7625,16 +7647,18 @@ const executeTrade = async (session: RawSession): Promise<void> => {
       return;
     }
 
-    // Entry-quality score (SHADOW, canary-only, no gating). Scores the entry the
-    // worker is about to take so we can later join score -> realized MAE and prove
-    // whether a live entry-quality gate would cut the systematic adverse excursion.
-    if (WORKER_ENTRY_QUALITY_SHADOW_ENABLED && isCanaryShadowEnabled(session, true)) {
+    // Entry-quality score + LIVE GATE. The score is computed for every entry and
+    // stashed for the shadow score->MAE correlation log. The GATE then blocks
+    // entries on trusted majors that bypass the trending shape gate yet still
+    // bleed, using catastrophic-shape thresholds calibrated from real history.
+    if (WORKER_ENTRY_QUALITY_SHADOW_ENABLED || WORKER_ENTRY_QUALITY_GATE_ENABLED) {
+      const entryQualityPrices = getMomentumTapeForMint(selectedEntryMint).map((sample) => sample.usdPrice);
       const entryQuality = computeEntryQualityScore({
-        prices: getMomentumTapeForMint(selectedEntryMint).map((sample) => sample.usdPrice),
+        prices: entryQualityPrices,
         minSamples: WORKER_ENTRY_QUALITY_MIN_SAMPLES,
         chaseLookbackSamples: WORKER_ENTRY_QUALITY_CHASE_LOOKBACK_SAMPLES,
         regime: classifyTapeRegime({
-          prices: getMomentumTapeForMint(selectedEntryMint).map((sample) => sample.usdPrice),
+          prices: entryQualityPrices,
           minSamples: WORKER_ENTRY_QUALITY_MIN_SAMPLES,
           trendEfficiencyThreshold: WORKER_ENTRY_QUALITY_TREND_EFFICIENCY_THRESHOLD,
         }),
@@ -7650,11 +7674,44 @@ const executeTrade = async (session: RawSession): Promise<void> => {
       const eqSymbol = resolveTokenSymbol(selectedEntryMint);
       const eqClass = getTokenTradeClass(selectedEntryMint, eqSymbol);
       const eqC = entryQuality.components;
-      log(
-        'info',
-        session.id,
-        `entry-quality shadow: ${eqSymbol} (${selectedEntryMint}) class=${eqClass} score=${entryQuality.score} band=${entryQuality.band} wouldEnter=${entryQuality.wouldEnter} pull=${eqC.pullback.toFixed(2)} reclaim=${eqC.reclaim.toFixed(2)} rangePos=${eqC.rangePosition.toFixed(2)} surge=${eqC.surgeRestraint.toFixed(2)} liq=${eqC.liquidity.toFixed(2)} pbHighBps=${entryQuality.metrics?.pullbackFromHighBps ?? 'na'} reclaimLowBps=${entryQuality.metrics?.reclaimFromLowBps ?? 'na'} rangeBps=${entryQuality.metrics?.rangePositionBps ?? 'na'}`,
-      );
+      if (isCanaryShadowEnabled(session, true)) {
+        log(
+          'info',
+          session.id,
+          `entry-quality shadow: ${eqSymbol} (${selectedEntryMint}) class=${eqClass} score=${entryQuality.score} band=${entryQuality.band} wouldEnter=${entryQuality.wouldEnter} pull=${eqC.pullback.toFixed(2)} reclaim=${eqC.reclaim.toFixed(2)} rangePos=${eqC.rangePosition.toFixed(2)} surge=${eqC.surgeRestraint.toFixed(2)} liq=${eqC.liquidity.toFixed(2)} pbHighBps=${entryQuality.metrics?.pullbackFromHighBps ?? 'na'} reclaimLowBps=${entryQuality.metrics?.reclaimFromLowBps ?? 'na'} rangeBps=${entryQuality.metrics?.rangePositionBps ?? 'na'}`,
+        );
+      }
+
+      // LIVE GATE: trusted majors (non-SOL) only. SOL is base rotation; non-trusted
+      // tokens are handled by the trending shape gate below -> one gate per entry.
+      const appliesEntryQualityGate = WORKER_ENTRY_QUALITY_GATE_ENABLED
+        && selectedEntryMint !== SOL_MINT
+        && TRUSTED_ENTRY_UNIVERSE_MINT_SET.has(selectedEntryMint);
+      if (appliesEntryQualityGate) {
+        const eqGate = evaluateEntryQualityGate({
+          result: entryQuality,
+          maxRangePositionBps: WORKER_ENTRY_QUALITY_GATE_MAX_RANGE_BPS,
+          maxRecentSurgeBps: WORKER_ENTRY_QUALITY_GATE_MAX_SURGE_BPS,
+          minPullbackFromHighBps: WORKER_ENTRY_QUALITY_GATE_MIN_PULLBACK_BPS,
+        });
+        if (!eqGate.allowed) {
+          await persistTradeDecision(session, 'blocked', eqGate.reason);
+          await persistLastTradeGate(session, {
+            at: new Date().toISOString(),
+            decision: 'blocked',
+            reason: eqGate.reason,
+            expectedEdgeBps: tokenEntrySignal.momentumBps,
+            estimatedCostBps: entryQuality.metrics?.recentSurgeBps ?? null,
+            safetyBufferBps: strategyConfig.momentum.edgeSafetyBufferBps,
+          });
+          log(
+            'info',
+            session.id,
+            `entry blocked: entry-quality gate for ${eqSymbol} (${selectedEntryMint}) reason=${eqGate.reason} score=${entryQuality.score} pbHighBps=${entryQuality.metrics?.pullbackFromHighBps ?? 'na'} surgeBps=${entryQuality.metrics?.recentSurgeBps ?? 'na'} rangeBps=${entryQuality.metrics?.rangePositionBps ?? 'na'}`,
+          );
+          return;
+        }
+      }
     }
 
     const appliesTrendingShapeGate = WORKER_TRENDING_ENTRY_SHAPE_GATE_ENABLED

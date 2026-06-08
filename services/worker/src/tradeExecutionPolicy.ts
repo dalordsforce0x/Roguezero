@@ -399,6 +399,52 @@ export const classifyTapeRegime = (params: {
   return efficiency >= threshold ? 'trend' : 'chop';
 };
 
+export type EntryQualityGateDecision = {
+  allowed: boolean;
+  reason: string;
+};
+
+/**
+ * Live entry-quality gate. Decides whether an entry should be ALLOWED based on
+ * the shape primitives the 4-day round-trip backtest proved separate winners
+ * from the catastrophic loss tail. These thresholds are measured, not guessed:
+ *
+ *   - rangePositionBps > ~9000 (buying the top of the recent range):
+ *       21% win, -222 bps mean.
+ *   - recentSurgeBps > ~300 (chasing a vertical spike): 0% win, -561 bps;
+ *       100-300 bps: 33% win, -174 bps.
+ *   - pullbackFromHighBps < ~10 (buying the exact local high): 25% win,
+ *       -209 bps; a 10-50 bps pullback: 67% win, -17 bps.
+ *
+ * Fails OPEN while the tape is warming up (no shape data) so a worker restart /
+ * deploy never freezes all trading until the per-mint tape refills. The composite
+ * score is intentionally NOT used to gate here (its mapping to realized outcomes
+ * is still being validated in the shadow log); only the directly-measured
+ * primitives block. Pure: no side effects.
+ */
+export const evaluateEntryQualityGate = (params: {
+  result: EntryQualityScoreResult;
+  maxRangePositionBps: number;
+  maxRecentSurgeBps: number;
+  minPullbackFromHighBps: number;
+}): EntryQualityGateDecision => {
+  const metrics = params.result.metrics;
+  // No shape data yet (tape warming up) => allow, do not freeze trading.
+  if (metrics === null || params.result.reason === 'entry_quality_warming_up') {
+    return { allowed: true, reason: 'entry_quality_warming_up' };
+  }
+  if (metrics.rangePositionBps > Math.max(0, Math.round(params.maxRangePositionBps))) {
+    return { allowed: false, reason: 'entry_quality_range_top' };
+  }
+  if (metrics.recentSurgeBps > Math.max(0, Math.round(params.maxRecentSurgeBps))) {
+    return { allowed: false, reason: 'entry_quality_chase_surge' };
+  }
+  if (metrics.pullbackFromHighBps < Math.max(0, Math.round(params.minPullbackFromHighBps))) {
+    return { allowed: false, reason: 'entry_quality_no_pullback' };
+  }
+  return { allowed: true, reason: 'entry_quality_ok' };
+};
+
 export const computeFullExitAmountAtomic = (params: {
   walletBalanceAtomic: number;
   reserveAtomic: number;
