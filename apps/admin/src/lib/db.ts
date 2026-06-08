@@ -473,6 +473,8 @@ export interface TokenUniverseTokenRow {
   confirmedTradeCount7d: number;
   lastTradedAt: string | null;
   currentlyActive: boolean;
+  marketCapUsd: number | null;
+  marketCapRank: number | null;
 }
 
 export interface TokenUniverseOverview {
@@ -1169,6 +1171,22 @@ export async function getTokenUniverseOverview(): Promise<TokenUniverseOverview>
       .map((row) => [row.mint, Number(row.active_session_count ?? '0')]),
   );
 
+  // CoinGecko market-cap context (best-effort; table may not exist on older deployments).
+  const marketDataResult = await pool.query<{
+    mint: string;
+    market_cap_usd: string | null;
+    market_cap_rank: number | null;
+  }>(
+    `SELECT mint::text AS mint, market_cap_usd, market_cap_rank FROM public.rz_token_marketdata`,
+  ).catch(() => ({ rows: [] as Array<{ mint: string; market_cap_usd: string | null; market_cap_rank: number | null }> }));
+
+  const marketDataByMint = new Map(
+    marketDataResult.rows.map((row) => [row.mint, {
+      marketCapUsd: row.market_cap_usd === null ? null : Number(row.market_cap_usd),
+      marketCapRank: row.market_cap_rank === null ? null : Number(row.market_cap_rank),
+    }]),
+  );
+
   const configuredByMint = new Map(configuredTokens.map((token) => [token.mint, token]));
   const allMints = new Set<string>([
     ...configuredTokens.map((token) => token.mint),
@@ -1180,6 +1198,7 @@ export async function getTokenUniverseOverview(): Promise<TokenUniverseOverview>
     const configured = configuredByMint.get(mint);
     const trades = tradeStatsByMint.get(mint);
     const activeSessionCount = activeByMint.get(mint) ?? 0;
+    const marketData = marketDataByMint.get(mint);
 
     return {
       mint,
@@ -1191,6 +1210,8 @@ export async function getTokenUniverseOverview(): Promise<TokenUniverseOverview>
       confirmedTradeCount7d: trades?.confirmedTradeCount7d ?? 0,
       lastTradedAt: trades?.lastTradedAt ?? null,
       currentlyActive: activeSessionCount > 0,
+      marketCapUsd: marketData?.marketCapUsd ?? null,
+      marketCapRank: marketData?.marketCapRank ?? null,
     };
   }).sort((a, b) => {
     if (b.currentlyActive !== a.currentlyActive) return Number(b.currentlyActive) - Number(a.currentlyActive);

@@ -371,6 +371,24 @@ function formatDateTime(iso: string | null) {
     minute: '2-digit',
   });
 }
+function formatMarketCap(capUsd: number | null, rank: number | null) {
+  if (capUsd === null || !Number.isFinite(capUsd) || capUsd <= 0) {
+    return <span className="text-gray-600">—</span>;
+  }
+  const abs = Math.abs(capUsd);
+  const text = abs >= 1_000_000_000
+    ? `$${(capUsd / 1_000_000_000).toFixed(2)}B`
+    : abs >= 1_000_000
+      ? `$${(capUsd / 1_000_000).toFixed(1)}M`
+      : `$${Math.round(capUsd / 1_000)}k`;
+  const tone = abs >= 10_000_000 ? 'text-emerald-300' : abs >= 1_000_000 ? 'text-gray-300' : 'text-amber-400';
+  return (
+    <span className={tone}>
+      {text}
+      {rank && rank > 0 ? <span className="ml-1 text-[10px] text-gray-600">#{rank}</span> : null}
+    </span>
+  );
+}
 function lamportsToSolString(lamports: string | null) {
   if (!lamports) return '—';
   const numeric = Number(lamports);
@@ -562,6 +580,8 @@ type TokenUniverseOverview = {
     confirmedTradeCount7d: number;
     lastTradedAt: string | null;
     currentlyActive: boolean;
+    marketCapUsd: number | null;
+    marketCapRank: number | null;
   }>;
 };
 
@@ -3046,6 +3066,7 @@ export default function Home() {
                               <tr className="text-left text-[10px] uppercase tracking-wider text-gray-600 border-b border-gray-800">
                                 <th className="py-2 pr-3">Token</th>
                                 <th className="py-2 pr-3">Why allowed</th>
+                                <th className="py-2 pr-3">Market Cap</th>
                                 <th className="py-2 pr-3">Priority</th>
                                 <th className="py-2 pr-3">Trades (7d)</th>
                                 <th className="py-2 pr-3">Confirmed (7d)</th>
@@ -3063,6 +3084,7 @@ export default function Home() {
                                   <td className="py-2 pr-3 text-emerald-300">
                                     {token.notes?.replace('admitted:', 'route-approved · ').replace('core-seed', 'core seed') ?? 'approved'}
                                   </td>
+                                  <td className="py-2 pr-3">{formatMarketCap(token.marketCapUsd, token.marketCapRank)}</td>
                                   <td className="py-2 pr-3 text-gray-300">{token.priority}</td>
                                   <td className="py-2 pr-3 text-gray-300">{token.tradeCount7d}</td>
                                   <td className="py-2 pr-3 text-gray-300">{token.confirmedTradeCount7d}</td>

@@ -58,7 +58,10 @@ const TOKEN_SAFETY_BLOCK_PUMP_MINTS = parseBoolEnv(process.env.TOKEN_ADMISSION_B
 // floor/rank ceiling is configured (>0). Tokens CoinGecko doesn't list are never rejected on
 // market-cap grounds unless TOKEN_ADMISSION_REQUIRE_COINGECKO_LISTING is explicitly set true.
 const COINGECKO_ENRICH_ENABLED = parseBoolEnv(process.env.TOKEN_ADMISSION_COINGECKO_ENABLED, true);
-const TOKEN_SAFETY_MIN_MARKET_CAP_USD = Number(process.env.TOKEN_ADMISSION_MIN_MARKET_CAP_USD ?? 0);
+// Default $250k floor: blocks literal dust the discovery feeds (top-trending/recent) can surface,
+// while leaving the whole legit memecoin range tradeable. Additive-only feeder => this only gates
+// NEW admissions; it never disables an existing universe row. Raise to 1_000_000 for stricter.
+const TOKEN_SAFETY_MIN_MARKET_CAP_USD = Number(process.env.TOKEN_ADMISSION_MIN_MARKET_CAP_USD ?? 250_000);
 const TOKEN_SAFETY_MAX_MARKET_CAP_RANK = Number(process.env.TOKEN_ADMISSION_MAX_MARKET_CAP_RANK ?? 0);
 const TOKEN_SAFETY_REQUIRE_COINGECKO_LISTING = parseBoolEnv(process.env.TOKEN_ADMISSION_REQUIRE_COINGECKO_LISTING, false);
 
