@@ -7504,9 +7504,18 @@ const executeTrade = async (session: RawSession): Promise<void> => {
     }
 
     if (!tradePlan) {
-      const entryStrategyForPlan = selectedEntryStrategy;
-      const entrySignalForPlan = selectedEntrySignal;
-      if (!entryStrategyForPlan || !entrySignalForPlan) {
+      // Decouple token entries from SOL/USD direction. Previously selectedEntryStrategy
+      // was set ONLY when a strategy was bullish on the SOL/USD tape, so a ripping token
+      // was never entered unless SOL was also pumping. Now, when SOL/USD has no bullish
+      // trigger, we fall back to the active strategy as the per-token signal basis and let
+      // the universe scout find a token that is persistently bullish on its OWN tape. The
+      // scout enforces per-token persistent bullishness + flat-regime fallback suppression,
+      // so this never buys chop. We only hard-block when the scout is disabled AND SOL/USD
+      // produced no trigger (no other way to choose a target).
+      const solStrategyTriggered = selectedEntryStrategy !== null && selectedEntrySignal !== null;
+      const entryStrategyForPlan = selectedEntryStrategy ?? activeStrategy;
+      const entrySignalForPlan = selectedEntrySignal ?? runtimeSignal;
+      if (!WORKER_UNIVERSE_SCOUT_ENABLED && !solStrategyTriggered) {
         await persistTradeDecision(session, 'blocked', 'no_strategy_entry_signal');
         await persistLastTradeGate(session, {
           at: new Date().toISOString(),
