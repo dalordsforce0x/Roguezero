@@ -321,6 +321,17 @@ const WORKER_ADAPTIVE_EXIT_CANARY_SESSION_ID = process.env.WORKER_ADAPTIVE_EXIT_
 // wallet that funds Noah) lets every new ephemeral Noah session auto-enroll as the canary
 // with zero redeploy. Real customer wallets never match, so they are never shadow-scoped.
 const WORKER_ADAPTIVE_EXIT_CANARY_OWNER_WALLET = process.env.WORKER_ADAPTIVE_EXIT_CANARY_OWNER_WALLET?.trim() || null;
+// Graduated-features model: a comma-separated set of feature keys that have been promoted
+// from Noah-only canary testing to the whole fleet. A lever is live for a normal customer
+// session only if its flag is enabled AND its key is listed here. Noah (the canary owner
+// wallet / session-id pin) always runs every enabled lever regardless of this list, so it
+// stays our dedicated training bot. Empty/unset => nothing graduated (Noah-only).
+const WORKER_GRADUATED_FEATURES = new Set(
+  (process.env.WORKER_GRADUATED_FEATURES ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0),
+);
 const WORKER_TRENDING_ENTRY_CHASE_LOOKBACK_SAMPLES = Number(process.env.WORKER_TRENDING_ENTRY_CHASE_LOOKBACK_SAMPLES ?? 4);
 const WORKER_TRENDING_ENTRY_MAX_RECENT_SURGE_BPS = Number(process.env.WORKER_TRENDING_ENTRY_MAX_RECENT_SURGE_BPS ?? 80);
 const WORKER_TRENDING_ENTRY_MIN_PULLBACK_BPS = Number(process.env.WORKER_TRENDING_ENTRY_MIN_PULLBACK_BPS ?? 35);
@@ -5050,7 +5061,7 @@ const maybeTopUpTradingCapitalFromSol = async (
     return solBalanceLamports;
   }
 
-  const active = isCanaryShadowEnabled(session, WORKER_CAPITAL_TOPUP_ENABLED);
+  const active = isFeatureActiveForSession(session, WORKER_CAPITAL_TOPUP_ENABLED, 'capital_topup');
   const excessSol = (excessLamports / 1_000_000_000).toFixed(4);
   log(
     'info',
@@ -5736,6 +5747,14 @@ const isCanaryShadowEnabled = (session: RawSession, enabled: boolean): boolean =
   return WORKER_ADAPTIVE_EXIT_CANARY_SESSION_ID !== null && WORKER_ADAPTIVE_EXIT_CANARY_SESSION_ID === session.id;
 };
 
+// Promote-aware gate. Noah (canary) runs every enabled lever; normal fleet sessions only get
+// a lever once its feature key has been graduated via WORKER_GRADUATED_FEATURES.
+const isFeatureActiveForSession = (session: RawSession, enabled: boolean, featureKey: string): boolean => {
+  if (!enabled) return false;
+  if (isCanaryShadowEnabled(session, true)) return true;
+  return WORKER_GRADUATED_FEATURES.has(featureKey);
+};
+
 const computeDynamicExitThresholds = (
   session: RawSession,
   positionState: NonNullable<Session['serviceControl']['positionState']>,
@@ -5744,7 +5763,7 @@ const computeDynamicExitThresholds = (
   const costFloorBps = computeExitCostFloorBps(session);
   const atrBps = positionState.lastComputedAtrBps ?? null;
   // Token-class exit profile (flag-gated, Noah-scoped). OFF => exact global multipliers as before.
-  const exitProfilesActive = isCanaryShadowEnabled(session, WORKER_TOKEN_CLASS_EXIT_PROFILES_ENABLED);
+  const exitProfilesActive = isFeatureActiveForSession(session, WORKER_TOKEN_CLASS_EXIT_PROFILES_ENABLED, 'token_class_exit');
   const exitProfile: TokenClassExitProfile = exitProfilesActive
     ? getTokenClassExitProfile(getTokenTradeClass(positionState.positionMint ?? '', positionState.positionSymbol))
     : {
@@ -6802,7 +6821,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
     }> = [];
     // Step 4 partial-TP (Noah-only, flag-gated). Collected during the exit scan; only promoted
     // into an exit when NO hard exit competes this cycle (hard exits always win).
-    const partialTpActive = isCanaryShadowEnabled(session, WORKER_PARTIAL_TP_ENABLED);
+    const partialTpActive = isFeatureActiveForSession(session, WORKER_PARTIAL_TP_ENABLED, 'partial_tp');
     const partialCandidates: Array<{
       mint: string;
       position: SessionPositionState;
@@ -7675,7 +7694,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
       symbol: entryInventory.outputSymbol,
       inventory: entryInventory,
     });
-    const classSizingActive = isCanaryShadowEnabled(session, WORKER_CLASS_ENTRY_SIZING_ENABLED);
+    const classSizingActive = isFeatureActiveForSession(session, WORKER_CLASS_ENTRY_SIZING_ENABLED, 'class_entry_sizing');
     if (classSizing.multiplierBps !== 10_000) {
       log(
         'info',
