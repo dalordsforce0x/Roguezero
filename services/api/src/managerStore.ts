@@ -15,6 +15,7 @@ export type Manager = {
   duration: string | null;
   expiryDate: string | null;
   accessEnabled: boolean;
+  maskedKey: string | null;
 };
 
 export type ManagerScopedGroup = {
@@ -36,12 +37,22 @@ export type ManagerScopedUser = {
 
 let readyPromise: Promise<void> | null = null;
 
+const maskManagementKey = (key: string | null): string | null => {
+  if (!key) return null;
+  // The RZer0BotLord prefix is shared across all manager keys (not secret); the
+  // remainder is masked down to the last 4 chars so the header can identify the
+  // active license without ever exposing the full credential.
+  const tail = key.slice(-4);
+  return `RZer0BotLord…${tail}`;
+};
+
 const mapManager = (row: ManagerRow): Manager => ({
   id: row.id,
   name: row.name,
   duration: row.duration,
   expiryDate: row.expiry_date,
   accessEnabled: row.access_enabled,
+  maskedKey: maskManagementKey(row.management_key),
 });
 
 const isExpired = (expiryDate: string | null | undefined) => (
