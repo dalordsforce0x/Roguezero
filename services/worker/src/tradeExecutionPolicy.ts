@@ -166,6 +166,198 @@ export const computeTrendingEntryShapeGate = (params: {
   return { allowed: true, reason: 'trending_entry_pullback_reclaim', metrics };
 };
 
+export type EntryQualityBand = 'strong' | 'fair' | 'weak' | 'reject';
+
+export type EntryQualityComponents = {
+  // Each component is 0..1, higher = better entry. They are diagnostic so we can
+  // see WHICH factor drove a score when we correlate score vs realized MAE.
+  pullback: number;
+  reclaim: number;
+  rangePosition: number;
+  surgeRestraint: number;
+  regimeAlignment: number;
+  liquidity: number;
+};
+
+export type EntryQualityScoreResult = {
+  // 0..100 composite. Higher = a better-timed entry (buying a reclaimed pullback
+  // with room, deep liquidity, regime-aligned) instead of chasing a local top.
+  score: number;
+  band: EntryQualityBand;
+  wouldEnter: boolean;
+  components: EntryQualityComponents;
+  metrics: TrendingEntryShapeMetrics | null;
+  reason: string;
+};
+
+const clamp01 = (value: number): number => {
+  if (!Number.isFinite(value)) return 0;
+  if (value < 0) return 0;
+  if (value > 1) return 1;
+  return value;
+};
+
+/**
+ * Entry-quality score (shadow-first). The 24h MFE/MAE data showed every token
+ * class goes roughly -70 bps adverse right after entry, i.e. we systematically
+ * buy local tops / chase. This grades the SAME shape primitives the trending
+ * shape gate already computes, but (a) across every class (majors/SOL included,
+ * which currently bypass the hard shape gate yet still bleed), (b) as a graded
+ * 0..100 score instead of pass/fail, and (c) returning component breakdown so we
+ * can measure which factor predicts a lower adverse excursion before we ever let
+ * the score gate a live entry.
+ *
+ * Pure: no execution, no side effects. Caller decides whether to act on it.
+ */
+export const computeEntryQualityScore = (params: {
+  prices: readonly number[];
+  minSamples: number;
+  chaseLookbackSamples: number;
+  regime: 'chop' | 'trend' | 'unknown' | null;
+  priceImpactBps: number | null;
+  // Sweet-spot pullback depth from the local high (bps). Below idealPullbackBps
+  // we reward more pullback; far beyond it we treat it as a falling knife.
+  idealPullbackBps: number;
+  maxHealthyPullbackBps: number;
+  // Liquidity penalty scaling: priceImpactBps at/above this scores 0 liquidity.
+  maxHealthyPriceImpactBps: number;
+  // Score thresholds for banding.
+  strongScore: number;
+  fairScore: number;
+  // wouldEnter is true when score >= enterThreshold (shadow recommendation).
+  enterThreshold: number;
+  weights?: Partial<EntryQualityComponents>;
+}): EntryQualityScoreResult => {
+  const emptyComponents: EntryQualityComponents = {
+    pullback: 0,
+    reclaim: 0,
+    rangePosition: 0,
+    surgeRestraint: 0,
+    regimeAlignment: 0,
+    liquidity: 0,
+  };
+
+  const prices = params.prices.filter((price) => Number.isFinite(price) && price > 0);
+  const minSamples = Math.max(3, Math.floor(params.minSamples));
+  if (prices.length < minSamples) {
+    return {
+      score: 0,
+      band: 'reject',
+      wouldEnter: false,
+      components: emptyComponents,
+      metrics: null,
+      reason: 'entry_quality_warming_up',
+    };
+  }
+
+  const window = prices.slice(-minSamples);
+  const current = window[window.length - 1];
+  const previous = window[window.length - 2] ?? current;
+  const first = window[0];
+  const high = Math.max(...window);
+  const low = Math.min(...window);
+  const chaseLookbackSamples = Math.max(2, Math.min(window.length, Math.floor(params.chaseLookbackSamples)));
+  const chaseWindow = window.slice(-chaseLookbackSamples);
+  const chaseFirst = chaseWindow[0];
+  const range = Math.max(0, high - low);
+
+  const metrics: TrendingEntryShapeMetrics = {
+    sampleCount: window.length,
+    windowMomentumBps: computePriceMoveBps(first, current),
+    recentSurgeBps: computePriceMoveBps(chaseFirst, current),
+    pullbackFromHighBps: high > 0 ? Math.max(0, Math.round(((high - current) / high) * 10_000)) : 0,
+    reclaimFromLowBps: low > 0 ? Math.max(0, Math.round(((current - low) / low) * 10_000)) : 0,
+    lastStepMomentumBps: computePriceMoveBps(previous, current),
+    rangePositionBps: range > 0 ? Math.round(((current - low) / range) * 10_000) : 10_000,
+  };
+
+  const idealPullbackBps = Math.max(1, Math.round(params.idealPullbackBps));
+  const maxHealthyPullbackBps = Math.max(idealPullbackBps + 1, Math.round(params.maxHealthyPullbackBps));
+
+  // Pullback: 0 at the high, ramps to 1 at the ideal pullback depth, then decays
+  // back toward 0 as it becomes a falling knife beyond maxHealthyPullback.
+  const pullback = metrics.pullbackFromHighBps <= idealPullbackBps
+    ? clamp01(metrics.pullbackFromHighBps / idealPullbackBps)
+    : clamp01(1 - (metrics.pullbackFromHighBps - idealPullbackBps) / (maxHealthyPullbackBps - idealPullbackBps));
+
+  // Reclaim: needs to be off the low AND ticking up on the last step (confirmed).
+  const reclaimMagnitude = clamp01(metrics.reclaimFromLowBps / idealPullbackBps);
+  const reclaim = metrics.lastStepMomentumBps > 0 ? reclaimMagnitude : reclaimMagnitude * 0.25;
+
+  // Range position: best entries sit in the lower-middle of the range; buying the
+  // very top (10000) scores 0, the very bottom is fine but may be a knife so we
+  // peak around the lower third.
+  const rangePos01 = clamp01(metrics.rangePositionBps / 10_000);
+  const rangePosition = clamp01(1 - Math.abs(rangePos01 - 0.33) / 0.67);
+
+  // Surge restraint: penalize chasing a vertical recent surge with no pullback.
+  const surgeRestraint = clamp01(1 - Math.max(0, metrics.recentSurgeBps) / Math.max(1, idealPullbackBps * 4));
+
+  // Regime alignment: in a trend, a modest positive window momentum (buying a dip
+  // in an uptrend) is good; in chop, near-flat/slightly-negative window with a
+  // reclaim is good. Unknown regime gets a neutral 0.5.
+  let regimeAlignment = 0.5;
+  if (params.regime === 'trend') {
+    regimeAlignment = metrics.windowMomentumBps >= 0 ? 0.85 : 0.35;
+  } else if (params.regime === 'chop') {
+    regimeAlignment = Math.abs(metrics.windowMomentumBps) <= idealPullbackBps * 2 ? 0.8 : 0.4;
+  }
+
+  // Liquidity: deep liquidity (low price impact) scores 1; at/above the max
+  // healthy impact it scores 0. Null impact is treated as neutral 0.5 (unknown).
+  const maxHealthyPriceImpactBps = Math.max(1, Math.round(params.maxHealthyPriceImpactBps));
+  const liquidity = params.priceImpactBps === null
+    ? 0.5
+    : clamp01(1 - Math.max(0, params.priceImpactBps) / maxHealthyPriceImpactBps);
+
+  const components: EntryQualityComponents = {
+    pullback,
+    reclaim,
+    rangePosition,
+    surgeRestraint,
+    regimeAlignment,
+    liquidity,
+  };
+
+  const defaultWeights: EntryQualityComponents = {
+    pullback: 0.22,
+    reclaim: 0.22,
+    rangePosition: 0.18,
+    surgeRestraint: 0.16,
+    regimeAlignment: 0.12,
+    liquidity: 0.10,
+  };
+  const weights: EntryQualityComponents = { ...defaultWeights, ...(params.weights ?? {}) };
+  const weightTotal = Object.values(weights).reduce((sum, w) => sum + (Number.isFinite(w) ? w : 0), 0) || 1;
+
+  const weighted = (components.pullback * weights.pullback)
+    + (components.reclaim * weights.reclaim)
+    + (components.rangePosition * weights.rangePosition)
+    + (components.surgeRestraint * weights.surgeRestraint)
+    + (components.regimeAlignment * weights.regimeAlignment)
+    + (components.liquidity * weights.liquidity);
+
+  const score = Math.max(0, Math.min(100, Math.round((weighted / weightTotal) * 100)));
+
+  const strongScore = Math.max(0, Math.min(100, Math.round(params.strongScore)));
+  const fairScore = Math.max(0, Math.min(strongScore, Math.round(params.fairScore)));
+  const enterThreshold = Math.max(0, Math.min(100, Math.round(params.enterThreshold)));
+
+  let band: EntryQualityBand = 'reject';
+  if (score >= strongScore) band = 'strong';
+  else if (score >= fairScore) band = 'fair';
+  else if (score >= Math.round(fairScore / 2)) band = 'weak';
+
+  return {
+    score,
+    band,
+    wouldEnter: score >= enterThreshold,
+    components,
+    metrics,
+    reason: `entry_quality_${band}`,
+  };
+};
+
 export const computeFullExitAmountAtomic = (params: {
   walletBalanceAtomic: number;
   reserveAtomic: number;

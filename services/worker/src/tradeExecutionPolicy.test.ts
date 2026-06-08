@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   computeTrendingEntryShapeGate,
   computePrePrepareEntryGate,
+  computeEntryQualityScore,
   computeFullExitAmountAtomic,
   computeGasRefillPlan,
   computeRetryMinimumTradeAmountAtomic,
@@ -145,6 +146,70 @@ test('computeTrendingEntryShapeGate waits for enough live samples', () => {
 
   assert.equal(gate.allowed, false);
   assert.equal(gate.reason, 'trending_entry_shape_warming_up');
+});
+
+const baseEntryQualityInput = {
+  minSamples: 8,
+  chaseLookbackSamples: 3,
+  regime: 'trend' as const,
+  priceImpactBps: 20,
+  idealPullbackBps: 40,
+  maxHealthyPullbackBps: 150,
+  maxHealthyPriceImpactBps: 200,
+  strongScore: 70,
+  fairScore: 50,
+  enterThreshold: 55,
+};
+
+test('computeEntryQualityScore scores a reclaimed pullback higher than a chased top', () => {
+  // Reclaimed pullback: ran up, pulled back ~40bps, then ticked back up (confirmed).
+  const pullbackReclaim = computeEntryQualityScore({
+    ...baseEntryQualityInput,
+    prices: [1, 1.006, 1.014, 1.02, 1.015, 1.009, 1.011, 1.014],
+  });
+  // Chasing the top of a vertical candle: current sits at the local high.
+  const chasingTop = computeEntryQualityScore({
+    ...baseEntryQualityInput,
+    prices: [1, 1.002, 1.004, 1.007, 1.01, 1.016, 1.024, 1.035],
+  });
+
+  assert.ok(
+    pullbackReclaim.score > chasingTop.score,
+    `expected reclaimed pullback (${pullbackReclaim.score}) > chased top (${chasingTop.score})`,
+  );
+  assert.ok(chasingTop.score < 50, `chased top should be weak/reject, got ${chasingTop.score}`);
+});
+
+test('computeEntryQualityScore returns warming_up below min samples', () => {
+  const result = computeEntryQualityScore({
+    ...baseEntryQualityInput,
+    prices: [1, 1.01, 1.005],
+  });
+
+  assert.equal(result.score, 0);
+  assert.equal(result.band, 'reject');
+  assert.equal(result.wouldEnter, false);
+  assert.equal(result.reason, 'entry_quality_warming_up');
+  assert.equal(result.metrics, null);
+});
+
+test('computeEntryQualityScore penalizes thin liquidity', () => {
+  const prices = [1, 1.006, 1.014, 1.02, 1.015, 1.009, 1.011, 1.014];
+  const deep = computeEntryQualityScore({ ...baseEntryQualityInput, prices, priceImpactBps: 10 });
+  const thin = computeEntryQualityScore({ ...baseEntryQualityInput, prices, priceImpactBps: 190 });
+
+  assert.ok(deep.score > thin.score, `deep (${deep.score}) should beat thin (${thin.score})`);
+});
+
+test('computeEntryQualityScore band + wouldEnter track the thresholds', () => {
+  const result = computeEntryQualityScore({
+    ...baseEntryQualityInput,
+    prices: [1, 1.006, 1.014, 1.02, 1.015, 1.009, 1.011, 1.014],
+  });
+
+  assert.ok(['strong', 'fair', 'weak', 'reject'].includes(result.band));
+  assert.equal(result.wouldEnter, result.score >= baseEntryQualityInput.enterThreshold);
+  assert.ok(result.score >= 0 && result.score <= 100);
 });
 
 test('computeStopLossThresholdBps keeps stop-loss independent from cost floor', () => {
