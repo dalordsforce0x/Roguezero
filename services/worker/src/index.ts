@@ -6113,6 +6113,9 @@ const ensureExitShadowHistoryReady = async () => {
         partial_sell_bps INTEGER,
         partial_fired BOOLEAN,
         partial_net_bps INTEGER,
+        grid_range_width_bps INTEGER,
+        grid_price_position_pct INTEGER,
+        grid_recent_move_bps INTEGER,
         thresholds JSONB,
         evaluation JSONB,
         decided_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -6126,7 +6129,10 @@ const ensureExitShadowHistoryReady = async () => {
           ADD COLUMN IF NOT EXISTS partial_trigger_bps INTEGER,
           ADD COLUMN IF NOT EXISTS partial_sell_bps INTEGER,
           ADD COLUMN IF NOT EXISTS partial_fired BOOLEAN,
-          ADD COLUMN IF NOT EXISTS partial_net_bps INTEGER
+          ADD COLUMN IF NOT EXISTS partial_net_bps INTEGER,
+          ADD COLUMN IF NOT EXISTS grid_range_width_bps INTEGER,
+          ADD COLUMN IF NOT EXISTS grid_price_position_pct INTEGER,
+          ADD COLUMN IF NOT EXISTS grid_recent_move_bps INTEGER
       `))
       .then(() => dbPool.query(`
         CREATE INDEX IF NOT EXISTS exit_shadow_decisions_session_time_idx
@@ -6245,6 +6251,9 @@ const appendExitShadowHistory = async (
       partialShadow.sellBps,
       partialShadow.fired,
       partialShadow.netBps,
+      intOrNull(grid?.rangeWidthBps),
+      intOrNull(grid?.pricePositionPct),
+      intOrNull(grid?.recentMoveBps),
     ]);
   }
 
@@ -6253,7 +6262,7 @@ const appendExitShadowHistory = async (
   try {
     await ensureExitShadowHistoryReady();
     const dbPool = getPool();
-    const cols = 27;
+    const cols = 30;
     const columnCasts = [
       '::uuid', '::uuid', '::text', '::text', '::text', '::text',
       '::boolean', '::text',
@@ -6263,6 +6272,7 @@ const appendExitShadowHistory = async (
       '::jsonb', '::jsonb',
       '::int', '::int',
       '::int', '::int', '::boolean', '::int',
+      '::int', '::int', '::int',
     ];
     const valuesSql = rows
       .map((_, rowIndex) => {
@@ -6281,7 +6291,8 @@ const appendExitShadowHistory = async (
           pnl_bps, max_favorable_bps, max_adverse_bps, trailing_drawdown_bps,
           thresholds, evaluation,
           honest_floor_bps, net_after_partial_bps,
-          partial_trigger_bps, partial_sell_bps, partial_fired, partial_net_bps
+          partial_trigger_bps, partial_sell_bps, partial_fired, partial_net_bps,
+          grid_range_width_bps, grid_price_position_pct, grid_recent_move_bps
         ) VALUES ${valuesSql}
       `,
       rows.flat(),
