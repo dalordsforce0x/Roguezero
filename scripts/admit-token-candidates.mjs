@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import pg from 'pg';
+import { buildMintMarketDataMap, coingeckoMeta } from './coingeckoMarketData.mjs';
 
 const databaseUrl = process.env.DATABASE_PRIVATE_URL?.trim();
 
@@ -51,6 +52,15 @@ const TOKEN_SAFETY_REQUIRE_MINT_AUTH_DISABLED = parseBoolEnv(process.env.TOKEN_A
 const TOKEN_SAFETY_REQUIRE_FREEZE_AUTH_DISABLED = parseBoolEnv(process.env.TOKEN_ADMISSION_REQUIRE_FREEZE_AUTH_DISABLED, true);
 const TOKEN_SAFETY_REJECT_SUS = parseBoolEnv(process.env.TOKEN_ADMISSION_REJECT_SUS, true);
 const TOKEN_SAFETY_BLOCK_PUMP_MINTS = parseBoolEnv(process.env.TOKEN_ADMISSION_BLOCK_PUMP_MINTS, true);
+
+// CoinGecko market-cap admission gate (slow-moving context, NOT a trade-timing input).
+// Enrichment is best-effort and ON by default; the gate itself only rejects tokens when a
+// floor/rank ceiling is configured (>0). Tokens CoinGecko doesn't list are never rejected on
+// market-cap grounds unless TOKEN_ADMISSION_REQUIRE_COINGECKO_LISTING is explicitly set true.
+const COINGECKO_ENRICH_ENABLED = parseBoolEnv(process.env.TOKEN_ADMISSION_COINGECKO_ENABLED, true);
+const TOKEN_SAFETY_MIN_MARKET_CAP_USD = Number(process.env.TOKEN_ADMISSION_MIN_MARKET_CAP_USD ?? 0);
+const TOKEN_SAFETY_MAX_MARKET_CAP_RANK = Number(process.env.TOKEN_ADMISSION_MAX_MARKET_CAP_RANK ?? 0);
+const TOKEN_SAFETY_REQUIRE_COINGECKO_LISTING = parseBoolEnv(process.env.TOKEN_ADMISSION_REQUIRE_COINGECKO_LISTING, false);
 
 const collectJupiterApiKeys = () => {
   const keys = [
@@ -221,6 +231,30 @@ const evaluateTokenSafety = (token) => {
   }
 
   return { admitted: riskFlags.length === 0, riskFlags, safety };
+};
+
+// CoinGecko market-cap gate. Returns the risk flags this token earns from market-cap context.
+// `marketData` is { marketCapUsd, marketCapRank, ... } or null when CoinGecko has no listing.
+const evaluateMarketCapGate = (marketData) => {
+  const flags = [];
+  if (!marketData) {
+    if (TOKEN_SAFETY_REQUIRE_COINGECKO_LISTING) flags.push('not_listed_on_coingecko');
+    return flags;
+  }
+  if (TOKEN_SAFETY_MIN_MARKET_CAP_USD > 0) {
+    const cap = Number(marketData.marketCapUsd);
+    // Only reject on a real positive cap below the floor. A $0/null cap is a CoinGecko quirk
+    // for wrapped/bridged assets (e.g. WBTC, PBTC) and must NOT trip the floor; those tokens
+    // still have to clear every other safety gate (verified, liquidity, holders, routes).
+    if (Number.isFinite(cap) && cap > 0 && cap < TOKEN_SAFETY_MIN_MARKET_CAP_USD) flags.push('below_market_cap_floor');
+  }
+  if (TOKEN_SAFETY_MAX_MARKET_CAP_RANK > 0) {
+    const rank = Number(marketData.marketCapRank);
+    // Only reject on a real positive rank worse than the ceiling; no-rank tokens are judged
+    // by the USD floor instead so we never reject a legit token merely for lacking a rank.
+    if (Number.isFinite(rank) && rank > 0 && rank > TOKEN_SAFETY_MAX_MARKET_CAP_RANK) flags.push('market_cap_rank_too_low');
+  }
+  return flags;
 };
 
 const computeDiscoveryScore = (token, sourcePriority) => {
@@ -401,8 +435,13 @@ const evaluateCandidate = async (candidate) => {
   if (REQUIRE_EXIT_ROUTES && exitImpact5Usdc !== null && exitImpact5Usdc > MAX_5_USDC_IMPACT_BPS) riskFlags.push('high_exit_5usdc_impact');
   if (REQUIRE_EXIT_ROUTES && exitImpact10Usdc !== null && exitImpact10Usdc > MAX_10_USDC_IMPACT_BPS) riskFlags.push('high_exit_10usdc_impact');
 
+  // CoinGecko market-cap gate (always-admit/core seeds bypass via enabledByDefault below).
+  const marketCapFlags = candidate.enabledByDefault === true ? [] : evaluateMarketCapGate(candidate.marketData ?? null);
+  riskFlags.push(...marketCapFlags);
+
   const admitted = candidate.enabledByDefault === true
     || (!candidate.forceReject
+      && marketCapFlags.length === 0
       && successfulQuotes >= MIN_SUCCESSFUL_QUOTE_COUNT
       && (!REQUIRE_EXIT_ROUTES || successfulExitQuotes >= MIN_SUCCESSFUL_QUOTE_COUNT)
       && impact5Usdc !== null
@@ -416,6 +455,7 @@ const evaluateCandidate = async (candidate) => {
     ...candidate,
     status: admitted ? 'admitted' : 'rejected',
     riskFlags,
+    marketData: candidate.marketData ?? null,
     quotes,
     exitQuotes,
     successfulQuotes,
@@ -460,6 +500,21 @@ const ensureTables = async () => {
     ALTER TABLE public.rz_token_universe
       ADD COLUMN IF NOT EXISTS notes TEXT
   `);
+
+  // CoinGecko enrichment cache: slow-moving market context for the token universe.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS public.rz_token_marketdata (
+      mint TEXT PRIMARY KEY,
+      coingecko_id TEXT,
+      symbol TEXT,
+      name TEXT,
+      market_cap_usd DOUBLE PRECISION,
+      market_cap_rank INTEGER,
+      fdv_usd DOUBLE PRECISION,
+      volume_24h_usd DOUBLE PRECISION,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `);
 };
 
 const persistResult = async (result) => {
@@ -488,9 +543,37 @@ const persistResult = async (result) => {
       result.successfulQuotes,
       Number.isFinite(result.maxImpactBps) ? result.maxImpactBps : null,
       JSON.stringify(result.riskFlags),
-      JSON.stringify({ quotes: result.quotes, exitQuotes: result.exitQuotes ?? {}, tokenApi: result.tokenApi ?? null }),
+      JSON.stringify({ quotes: result.quotes, exitQuotes: result.exitQuotes ?? {}, tokenApi: result.tokenApi ?? null, marketData: result.marketData ?? null }),
     ],
   );
+
+  // Cache CoinGecko market context for visibility/reuse (admin + future gates).
+  if (result.marketData) {
+    await pool.query(
+      `INSERT INTO public.rz_token_marketdata (
+         mint, coingecko_id, symbol, name, market_cap_usd, market_cap_rank, fdv_usd, volume_24h_usd, updated_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
+       ON CONFLICT (mint)
+       DO UPDATE SET coingecko_id = EXCLUDED.coingecko_id,
+                     symbol = EXCLUDED.symbol,
+                     name = EXCLUDED.name,
+                     market_cap_usd = EXCLUDED.market_cap_usd,
+                     market_cap_rank = EXCLUDED.market_cap_rank,
+                     fdv_usd = EXCLUDED.fdv_usd,
+                     volume_24h_usd = EXCLUDED.volume_24h_usd,
+                     updated_at = now()`,
+      [
+        result.mint,
+        result.marketData.coingeckoId ?? null,
+        result.marketData.symbol ?? result.symbol ?? null,
+        result.marketData.name ?? null,
+        Number.isFinite(Number(result.marketData.marketCapUsd)) ? Number(result.marketData.marketCapUsd) : null,
+        Number.isFinite(Number(result.marketData.marketCapRank)) ? Number(result.marketData.marketCapRank) : null,
+        Number.isFinite(Number(result.marketData.fdvUsd)) ? Number(result.marketData.fdvUsd) : null,
+        Number.isFinite(Number(result.marketData.volume24hUsd)) ? Number(result.marketData.volume24hUsd) : null,
+      ],
+    );
+  }
 
   if (!APPLY_TO_UNIVERSE) return;
 
@@ -528,6 +611,24 @@ const main = async () => {
   console.error(`[admit] using ${jupiterApiKeys.length} Jupiter API key(s) via round-robin selector`);
   const candidates = await fetchCandidates();
   console.error(`[admit] testing ${candidates.length} candidates...`);
+
+  // Enrich candidates with CoinGecko market context (best-effort; never blocks admission).
+  if (COINGECKO_ENRICH_ENABLED) {
+    const meta = coingeckoMeta();
+    console.error(`[admit] coingecko enrichment: plan=${meta.plan} keyConfigured=${meta.keyConfigured} base=${meta.baseUrl}`);
+    console.error(`[admit] coingecko gate: minMarketCapUsd=${TOKEN_SAFETY_MIN_MARKET_CAP_USD} maxRank=${TOKEN_SAFETY_MAX_MARKET_CAP_RANK} requireListing=${TOKEN_SAFETY_REQUIRE_COINGECKO_LISTING}`);
+    const candidateMints = candidates.filter((c) => c.enabledByDefault !== true).map((c) => c.mint);
+    const marketDataMap = await buildMintMarketDataMap(candidateMints);
+    let enrichedCount = 0;
+    for (const candidate of candidates) {
+      const data = marketDataMap.get(candidate.mint);
+      if (data) {
+        candidate.marketData = data;
+        enrichedCount++;
+      }
+    }
+    console.error(`[admit] coingecko enrichment matched ${enrichedCount}/${candidateMints.length} candidates`);
+  }
 
   const results = [];
   let done = 0;
@@ -610,6 +711,10 @@ const main = async () => {
       requireMintAuthDisabled: TOKEN_SAFETY_REQUIRE_MINT_AUTH_DISABLED,
       requireFreezeAuthDisabled: TOKEN_SAFETY_REQUIRE_FREEZE_AUTH_DISABLED,
       rejectSus: TOKEN_SAFETY_REJECT_SUS,
+      coingeckoEnrichEnabled: COINGECKO_ENRICH_ENABLED,
+      minMarketCapUsd: TOKEN_SAFETY_MIN_MARKET_CAP_USD,
+      maxMarketCapRank: TOKEN_SAFETY_MAX_MARKET_CAP_RANK,
+      requireCoingeckoListing: TOKEN_SAFETY_REQUIRE_COINGECKO_LISTING,
     },
     admitted: admitted.map((result) => ({
       symbol: result.symbol,
