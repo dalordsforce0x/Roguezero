@@ -6062,10 +6062,18 @@ const appendExitShadowHistory = async (
     await ensureExitShadowHistoryReady();
     const dbPool = getPool();
     const cols = 21;
+    const columnCasts = [
+      '::uuid', '::uuid', '::text', '::text', '::text', '::text',
+      '::boolean', '::text',
+      '::text', '::text', '::int', '::int',
+      '::text', '::text', '::text',
+      '::int', '::int', '::int', '::int',
+      '::jsonb', '::jsonb',
+    ];
     const valuesSql = rows
       .map((_, rowIndex) => {
         const base = rowIndex * cols;
-        const placeholders = Array.from({ length: cols }, (_, c) => `${base + c + 1}`);
+        const placeholders = Array.from({ length: cols }, (_, c) => `$${base + c + 1}${columnCasts[c]}`);
         return `(${placeholders.join(', ')})`;
       })
       .join(', ');
