@@ -289,6 +289,7 @@ const WORKER_TRENDING_ENTRY_SHAPE_MIN_SAMPLES = Number(process.env.WORKER_TRENDI
 const WORKER_EXIT_TELEMETRY_ENABLED = process.env.WORKER_EXIT_TELEMETRY_ENABLED !== 'false';
 const WORKER_ADAPTIVE_EXIT_SHADOW_ENABLED = process.env.WORKER_ADAPTIVE_EXIT_SHADOW_ENABLED === 'true';
 const WORKER_GRID_CHOP_SHADOW_ENABLED = process.env.WORKER_GRID_CHOP_SHADOW_ENABLED === 'true';
+const WORKER_EXIT_SHADOW_HISTORY_ENABLED = process.env.WORKER_EXIT_SHADOW_HISTORY_ENABLED !== 'false';
 const WORKER_ADAPTIVE_EXIT_CANARY_SESSION_ID = process.env.WORKER_ADAPTIVE_EXIT_CANARY_SESSION_ID?.trim() || null;
 // Sessions are ephemeral (a fresh session_wallet + session id every funding cycle), so
 // pinning the canary to a single session id forces an env change + redeploy every time a
@@ -5942,6 +5943,150 @@ const buildGridChopShadow = (params: {
   };
 };
 
+let exitShadowHistoryReadyPromise: Promise<void> | null = null;
+
+const ensureExitShadowHistoryReady = async () => {
+  if (!exitShadowHistoryReadyPromise) {
+    const dbPool = getPool();
+    exitShadowHistoryReadyPromise = dbPool.query(`
+      CREATE TABLE IF NOT EXISTS exit_shadow_decisions (
+        id UUID PRIMARY KEY,
+        session_id UUID NOT NULL,
+        owner_wallet TEXT,
+        mint TEXT NOT NULL,
+        symbol TEXT,
+        token_class TEXT,
+        current_should_exit BOOLEAN,
+        current_reason TEXT,
+        adaptive_action TEXT,
+        adaptive_reason TEXT,
+        adaptive_suggested_sell_bps INTEGER,
+        adaptive_suggested_stop_bps INTEGER,
+        grid_regime TEXT,
+        grid_action TEXT,
+        grid_reason TEXT,
+        pnl_bps INTEGER,
+        max_favorable_bps INTEGER,
+        max_adverse_bps INTEGER,
+        trailing_drawdown_bps INTEGER,
+        thresholds JSONB,
+        evaluation JSONB,
+        decided_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `)
+      .then(() => dbPool.query(`
+        CREATE INDEX IF NOT EXISTS exit_shadow_decisions_session_time_idx
+        ON exit_shadow_decisions (session_id, decided_at DESC)
+      `))
+      .then(() => dbPool.query(`
+        CREATE INDEX IF NOT EXISTS exit_shadow_decisions_session_mint_time_idx
+        ON exit_shadow_decisions (session_id, mint, decided_at DESC)
+      `))
+      .then(() => undefined);
+  }
+  return exitShadowHistoryReadyPromise;
+};
+
+// Throttle: persist a fresh history row per (session, mint) only when the adaptive
+// action changes OR a heartbeat interval elapses, so the table samples the PnL path
+// without exploding to one row per position every cycle.
+const exitShadowHistoryLastWrite = new Map<string, { at: number; action: string }>();
+const EXIT_SHADOW_HISTORY_HEARTBEAT_MS = 30000;
+
+const appendExitShadowHistory = async (
+  session: RawSession,
+  evaluations: Array<Record<string, unknown>>,
+  adaptiveShadow: ReturnType<typeof buildAdaptiveExitShadow>,
+  gridShadow: ReturnType<typeof buildGridChopShadow>,
+): Promise<void> => {
+  if (!WORKER_EXIT_SHADOW_HISTORY_ENABLED) return;
+  // Canary-scoped: only accrue history where the shadow itself is active.
+  if (!adaptiveShadow.enabled) return;
+  if (evaluations.length === 0) return;
+
+  const adaptiveByMint = new Map<string, Record<string, unknown>>();
+  for (const decision of adaptiveShadow.decisions) {
+    adaptiveByMint.set(String(decision.mint), decision as Record<string, unknown>);
+  }
+  const gridByMint = new Map<string, Record<string, unknown>>();
+  for (const candidate of gridShadow.candidates) {
+    gridByMint.set(String(candidate.mint), candidate as Record<string, unknown>);
+  }
+
+  const intOrNull = (value: unknown): number | null =>
+    typeof value === 'number' && Number.isFinite(value) ? Math.round(value) : null;
+
+  const now = Date.now();
+  const rows: Array<unknown[]> = [];
+  for (const evaluation of evaluations) {
+    const mint = String(evaluation.mint);
+    const adaptive = adaptiveByMint.get(mint);
+    const grid = gridByMint.get(mint);
+    const adaptiveAction = adaptive ? String(adaptive.action ?? 'hold') : 'hold';
+    const key = `${session.id}:${mint}`;
+    const last = exitShadowHistoryLastWrite.get(key);
+    const actionChanged = !last || last.action !== adaptiveAction;
+    const heartbeatDue = !last || now - last.at >= EXIT_SHADOW_HISTORY_HEARTBEAT_MS;
+    if (!actionChanged && !heartbeatDue) continue;
+    exitShadowHistoryLastWrite.set(key, { at: now, action: adaptiveAction });
+
+    rows.push([
+      randomUUID(),
+      session.id,
+      session.owner_wallet ?? null,
+      mint,
+      evaluation.symbol ? String(evaluation.symbol) : null,
+      evaluation.tokenClass ? String(evaluation.tokenClass) : null,
+      typeof evaluation.shouldExit === 'boolean' ? evaluation.shouldExit : null,
+      evaluation.reason ? String(evaluation.reason) : null,
+      adaptiveAction,
+      adaptive?.reason ? String(adaptive.reason) : null,
+      intOrNull(adaptive?.suggestedSellBps),
+      intOrNull(adaptive?.suggestedStopBps),
+      gridShadow.marketRegime ?? null,
+      grid?.action ? String(grid.action) : null,
+      grid?.reason ? String(grid.reason) : null,
+      intOrNull(evaluation.pnlBps),
+      intOrNull(evaluation.maxFavorableBps),
+      intOrNull(evaluation.maxAdverseBps),
+      intOrNull(evaluation.trailingDrawdownBps),
+      JSON.stringify(evaluation.thresholds ?? null),
+      JSON.stringify(evaluation),
+    ]);
+  }
+
+  if (rows.length === 0) return;
+
+  try {
+    await ensureExitShadowHistoryReady();
+    const dbPool = getPool();
+    const cols = 21;
+    const valuesSql = rows
+      .map((_, rowIndex) => {
+        const base = rowIndex * cols;
+        const placeholders = Array.from({ length: cols }, (_, c) => `${base + c + 1}`);
+        return `(${placeholders.join(', ')})`;
+      })
+      .join(', ');
+    await dbPool.query(
+      `
+        INSERT INTO exit_shadow_decisions (
+          id, session_id, owner_wallet, mint, symbol, token_class,
+          current_should_exit, current_reason,
+          adaptive_action, adaptive_reason, adaptive_suggested_sell_bps, adaptive_suggested_stop_bps,
+          grid_regime, grid_action, grid_reason,
+          pnl_bps, max_favorable_bps, max_adverse_bps, trailing_drawdown_bps,
+          thresholds, evaluation
+        ) VALUES ${valuesSql}
+      `,
+      rows.flat(),
+    );
+  } catch (error) {
+    console.warn('[exit-shadow-history] append failed', error instanceof Error ? error.message : error);
+  }
+};
+
 const getSessionStrategyConfig = (session: RawSession) => {
   const configured = session.service_control.strategyConfig;
   const configuredMomentum = configured?.momentum;
@@ -6349,12 +6494,15 @@ const executeTrade = async (session: RawSession): Promise<void> => {
     }
 
     if (WORKER_EXIT_TELEMETRY_ENABLED && exitEvaluations.length > 0) {
+      const adaptiveExitShadow = buildAdaptiveExitShadow({ session, evaluations: exitEvaluations });
+      const gridChopShadow = buildGridChopShadow({ session, evaluations: exitEvaluations });
       await persistServiceControl(session, {
         lastExitEvaluations: exitEvaluations,
         lastExitEvaluation: exitEvaluations,
-        adaptiveExitShadow: buildAdaptiveExitShadow({ session, evaluations: exitEvaluations }),
-        gridChopShadow: buildGridChopShadow({ session, evaluations: exitEvaluations }),
+        adaptiveExitShadow,
+        gridChopShadow,
       } as any);
+      await appendExitShadowHistory(session, exitEvaluations, adaptiveExitShadow, gridChopShadow);
     }
 
     if (positionsChanged) {
