@@ -5608,7 +5608,7 @@ const getTokenClassExitProfile = (tokenClass: TokenTradeClass): TokenClassExitPr
     case 'sol_beta':
       return { takeProfitMult: 1.6, stopLossMult: 1.0, trailingStopMult: 0.8 };
     case 'trend_liquid':
-      return { takeProfitMult: 1.7, stopLossMult: 1.0, trailingStopMult: 0.8 };
+      return { takeProfitMult: 0.8, stopLossMult: 1.0, trailingStopMult: 0.8 };
     case 'long_tail':
     default:
       return { takeProfitMult: 2.6, stopLossMult: 1.2, trailingStopMult: 1.0 };
