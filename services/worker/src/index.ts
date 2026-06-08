@@ -289,6 +289,10 @@ const WORKER_TRENDING_ENTRY_SHAPE_MIN_SAMPLES = Number(process.env.WORKER_TRENDI
 const WORKER_EXIT_TELEMETRY_ENABLED = process.env.WORKER_EXIT_TELEMETRY_ENABLED !== 'false';
 const WORKER_ADAPTIVE_EXIT_SHADOW_ENABLED = process.env.WORKER_ADAPTIVE_EXIT_SHADOW_ENABLED === 'true';
 const WORKER_GRID_CHOP_SHADOW_ENABLED = process.env.WORKER_GRID_CHOP_SHADOW_ENABLED === 'true';
+// Expected REAL exit-leg slippage in bps (observed confirmed fills ran ~1-17 bps). Used only by the
+// honest break-even telemetry below, NOT by the live exit cost-floor. The live floor still uses the
+// conservative maxSlippage cap; this measures what a partial-TP would net against ACTUAL friction.
+const WORKER_EXIT_EXPECTED_SLIPPAGE_BPS = Number(process.env.WORKER_EXIT_EXPECTED_SLIPPAGE_BPS ?? 15);
 const WORKER_EXIT_SHADOW_HISTORY_ENABLED = process.env.WORKER_EXIT_SHADOW_HISTORY_ENABLED !== 'false';
 const WORKER_ADAPTIVE_EXIT_CANARY_SESSION_ID = process.env.WORKER_ADAPTIVE_EXIT_CANARY_SESSION_ID?.trim() || null;
 // Sessions are ephemeral (a fresh session_wallet + session id every funding cycle), so
@@ -5975,12 +5979,19 @@ const ensureExitShadowHistoryReady = async () => {
         max_favorable_bps INTEGER,
         max_adverse_bps INTEGER,
         trailing_drawdown_bps INTEGER,
+        honest_floor_bps INTEGER,
+        net_after_partial_bps INTEGER,
         thresholds JSONB,
         evaluation JSONB,
         decided_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
     `)
+      .then(() => dbPool.query(`
+        ALTER TABLE exit_shadow_decisions
+          ADD COLUMN IF NOT EXISTS honest_floor_bps INTEGER,
+          ADD COLUMN IF NOT EXISTS net_after_partial_bps INTEGER
+      `))
       .then(() => dbPool.query(`
         CREATE INDEX IF NOT EXISTS exit_shadow_decisions_session_time_idx
         ON exit_shadow_decisions (session_id, decided_at DESC)
@@ -6024,6 +6035,9 @@ const appendExitShadowHistory = async (
     typeof value === 'number' && Number.isFinite(value) ? Math.round(value) : null;
 
   const now = Date.now();
+  // Honest marginal sell-side cost a partial-TP must clear to net positive: REAL expected slippage
+  // plus the session's platform fee (taken on the sell output). This is the corrected break-even.
+  const honestFloorBps = WORKER_EXIT_EXPECTED_SLIPPAGE_BPS + Number(session.service_control.platformFeeBps ?? 0);
   const rows: Array<unknown[]> = [];
   for (const evaluation of evaluations) {
     const mint = String(evaluation.mint);
@@ -6059,6 +6073,8 @@ const appendExitShadowHistory = async (
       intOrNull(evaluation.trailingDrawdownBps),
       JSON.stringify(evaluation.thresholds ?? null),
       JSON.stringify(evaluation),
+      honestFloorBps,
+      (intOrNull(evaluation.pnlBps) === null ? null : (intOrNull(evaluation.pnlBps) as number) - honestFloorBps),
     ]);
   }
 
@@ -6067,7 +6083,7 @@ const appendExitShadowHistory = async (
   try {
     await ensureExitShadowHistoryReady();
     const dbPool = getPool();
-    const cols = 21;
+    const cols = 23;
     const columnCasts = [
       '::uuid', '::uuid', '::text', '::text', '::text', '::text',
       '::boolean', '::text',
@@ -6075,6 +6091,7 @@ const appendExitShadowHistory = async (
       '::text', '::text', '::text',
       '::int', '::int', '::int', '::int',
       '::jsonb', '::jsonb',
+      '::int', '::int',
     ];
     const valuesSql = rows
       .map((_, rowIndex) => {
@@ -6091,7 +6108,8 @@ const appendExitShadowHistory = async (
           adaptive_action, adaptive_reason, adaptive_suggested_sell_bps, adaptive_suggested_stop_bps,
           grid_regime, grid_action, grid_reason,
           pnl_bps, max_favorable_bps, max_adverse_bps, trailing_drawdown_bps,
-          thresholds, evaluation
+          thresholds, evaluation,
+          honest_floor_bps, net_after_partial_bps
         ) VALUES ${valuesSql}
       `,
       rows.flat(),
