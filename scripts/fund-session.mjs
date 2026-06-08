@@ -6,10 +6,15 @@
  *
  * Usage (PowerShell):
  *   $env:FUNDER_SECRET_KEY = "<bs58-secret-key>"
- *   node scripts/fund-session.mjs <recipient-session-wallet> <amount-sol>
+ *   node scripts/fund-session.mjs <recipient-session-wallet> <amount>
  *
- * Example:
+ * <amount> may be either an absolute SOL value (e.g. 0.02) or a percentage of
+ * the funder wallet's spendable balance (e.g. 95%). When a percentage is given,
+ * the script reserves the network fee so the transfer always lands.
+ *
+ * Examples:
  *   node scripts/fund-session.mjs 64zsneT71Rp9CchtvwBBz1p7k13KszSMuBqtkF3U76H2 0.02
+ *   node scripts/fund-session.mjs 64zsneT71Rp9CchtvwBBz1p7k13KszSMuBqtkF3U76H2 95%
  */
 import 'dotenv/config';
 import bs58 from 'bs58';
@@ -24,10 +29,22 @@ import {
 } from '@solana/web3.js';
 
 const RECIPIENT = process.argv[2];
-const AMOUNT_SOL = Number(process.argv[3]);
+const AMOUNT_ARG = (process.argv[3] ?? '').trim();
+const IS_PCT = AMOUNT_ARG.endsWith('%');
+const PCT = IS_PCT ? Number(AMOUNT_ARG.slice(0, -1)) : NaN;
+const AMOUNT_SOL = IS_PCT ? NaN : Number(AMOUNT_ARG);
 
-if (!RECIPIENT || !Number.isFinite(AMOUNT_SOL) || AMOUNT_SOL <= 0) {
-  console.error('Usage: node scripts/fund-session.mjs <recipient-session-wallet> <amount-sol>');
+if (!RECIPIENT) {
+  console.error('Usage: node scripts/fund-session.mjs <recipient-session-wallet> <amount|pct%>');
+  process.exit(1);
+}
+if (IS_PCT) {
+  if (!Number.isFinite(PCT) || PCT <= 0 || PCT > 100) {
+    console.error('Percentage must be a number in (0, 100], e.g. 95%');
+    process.exit(1);
+  }
+} else if (!Number.isFinite(AMOUNT_SOL) || AMOUNT_SOL <= 0) {
+  console.error('Amount must be a positive SOL value (e.g. 0.02) or a percentage (e.g. 95%)');
   process.exit(1);
 }
 
@@ -46,17 +63,33 @@ if (!rpcUrl) {
 const conn = new Connection(rpcUrl, 'confirmed');
 
 async function main() {
+  const FEE_RESERVE_LAMPORTS = 5000;
   const funder = Keypair.fromSecretKey(bs58.decode(secret));
   const recipient = new PublicKey(RECIPIENT);
-  const lamports = Math.round(AMOUNT_SOL * LAMPORTS_PER_SOL);
 
   console.log('Funder:   ', funder.publicKey.toBase58());
   console.log('Recipient:', recipient.toBase58());
-  console.log('Amount:   ', AMOUNT_SOL, 'SOL', `(${lamports} lamports)`);
 
   const funderBalance = await conn.getBalance(funder.publicKey, 'confirmed');
   console.log('Funder balance:', funderBalance / LAMPORTS_PER_SOL, 'SOL');
-  if (funderBalance < lamports + 5000) {
+
+  const lamports = IS_PCT
+    ? Math.floor((funderBalance - FEE_RESERVE_LAMPORTS) * (PCT / 100))
+    : Math.round(AMOUNT_SOL * LAMPORTS_PER_SOL);
+
+  if (lamports <= 0) {
+    console.error('Computed transfer amount is not positive (funder balance too low).');
+    process.exit(1);
+  }
+  console.log(
+    'Amount:   ',
+    lamports / LAMPORTS_PER_SOL,
+    'SOL',
+    `(${lamports} lamports)`,
+    IS_PCT ? `= ${PCT}% of spendable balance` : '',
+  );
+
+  if (funderBalance < lamports + FEE_RESERVE_LAMPORTS) {
     console.error('Funder has insufficient SOL for transfer + fee.');
     process.exit(1);
   }

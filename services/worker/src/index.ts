@@ -5981,6 +5981,10 @@ const ensureExitShadowHistoryReady = async () => {
         trailing_drawdown_bps INTEGER,
         honest_floor_bps INTEGER,
         net_after_partial_bps INTEGER,
+        partial_trigger_bps INTEGER,
+        partial_sell_bps INTEGER,
+        partial_fired BOOLEAN,
+        partial_net_bps INTEGER,
         thresholds JSONB,
         evaluation JSONB,
         decided_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -5990,7 +5994,11 @@ const ensureExitShadowHistoryReady = async () => {
       .then(() => dbPool.query(`
         ALTER TABLE exit_shadow_decisions
           ADD COLUMN IF NOT EXISTS honest_floor_bps INTEGER,
-          ADD COLUMN IF NOT EXISTS net_after_partial_bps INTEGER
+          ADD COLUMN IF NOT EXISTS net_after_partial_bps INTEGER,
+          ADD COLUMN IF NOT EXISTS partial_trigger_bps INTEGER,
+          ADD COLUMN IF NOT EXISTS partial_sell_bps INTEGER,
+          ADD COLUMN IF NOT EXISTS partial_fired BOOLEAN,
+          ADD COLUMN IF NOT EXISTS partial_net_bps INTEGER
       `))
       .then(() => dbPool.query(`
         CREATE INDEX IF NOT EXISTS exit_shadow_decisions_session_time_idx
@@ -6010,6 +6018,29 @@ const ensureExitShadowHistoryReady = async () => {
 // without exploding to one row per position every cycle.
 const exitShadowHistoryLastWrite = new Map<string, { at: number; action: string }>();
 const EXIT_SHADOW_HISTORY_HEARTBEAT_MS = 30000;
+
+// Phase 3 move 2 (shadow-only): token-class partial-TP that must CLEAR the honest break-even.
+// Faster/larger partials for runner-prone classes, slower/smaller for majors. The trigger is
+// honest break-even + a class margin so the sold fraction nets clearly positive. NO execution;
+// this records what a per-class partial WOULD bank so we can validate it before flipping exec.
+const computePartialTpShadow = (
+  tokenClass: TokenTradeClass,
+  pnlBps: number | null,
+  honestFloorBps: number,
+): { triggerBps: number; sellBps: number; fired: boolean; netBps: number | null } => {
+  const profile =
+    tokenClass === 'major'
+      ? { marginBps: 50, sellBps: 3000 }
+      : tokenClass === 'sol_beta'
+        ? { marginBps: 20, sellBps: 3500 }
+        : tokenClass === 'trend_liquid'
+          ? { marginBps: 15, sellBps: 4000 }
+          : { marginBps: 10, sellBps: 5000 };
+  const triggerBps = honestFloorBps + profile.marginBps;
+  const fired = pnlBps !== null && pnlBps >= triggerBps;
+  const netBps = fired ? (pnlBps as number) - honestFloorBps : null;
+  return { triggerBps, sellBps: profile.sellBps, fired, netBps };
+};
 
 const appendExitShadowHistory = async (
   session: RawSession,
@@ -6051,6 +6082,13 @@ const appendExitShadowHistory = async (
     if (!actionChanged && !heartbeatDue) continue;
     exitShadowHistoryLastWrite.set(key, { at: now, action: adaptiveAction });
 
+    const pnlForPartial = intOrNull(evaluation.pnlBps);
+    const partialShadow = computePartialTpShadow(
+      (evaluation.tokenClass as TokenTradeClass) ?? 'long_tail',
+      pnlForPartial,
+      honestFloorBps,
+    );
+
     rows.push([
       randomUUID(),
       session.id,
@@ -6074,7 +6112,11 @@ const appendExitShadowHistory = async (
       JSON.stringify(evaluation.thresholds ?? null),
       JSON.stringify(evaluation),
       honestFloorBps,
-      (intOrNull(evaluation.pnlBps) === null ? null : (intOrNull(evaluation.pnlBps) as number) - honestFloorBps),
+      pnlForPartial === null ? null : pnlForPartial - honestFloorBps,
+      partialShadow.triggerBps,
+      partialShadow.sellBps,
+      partialShadow.fired,
+      partialShadow.netBps,
     ]);
   }
 
@@ -6083,7 +6125,7 @@ const appendExitShadowHistory = async (
   try {
     await ensureExitShadowHistoryReady();
     const dbPool = getPool();
-    const cols = 23;
+    const cols = 27;
     const columnCasts = [
       '::uuid', '::uuid', '::text', '::text', '::text', '::text',
       '::boolean', '::text',
@@ -6092,6 +6134,7 @@ const appendExitShadowHistory = async (
       '::int', '::int', '::int', '::int',
       '::jsonb', '::jsonb',
       '::int', '::int',
+      '::int', '::int', '::boolean', '::int',
     ];
     const valuesSql = rows
       .map((_, rowIndex) => {
@@ -6109,7 +6152,8 @@ const appendExitShadowHistory = async (
           grid_regime, grid_action, grid_reason,
           pnl_bps, max_favorable_bps, max_adverse_bps, trailing_drawdown_bps,
           thresholds, evaluation,
-          honest_floor_bps, net_after_partial_bps
+          honest_floor_bps, net_after_partial_bps,
+          partial_trigger_bps, partial_sell_bps, partial_fired, partial_net_bps
         ) VALUES ${valuesSql}
       `,
       rows.flat(),

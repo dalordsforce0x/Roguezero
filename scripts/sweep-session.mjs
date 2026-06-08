@@ -7,6 +7,7 @@
 import 'dotenv/config';
 import pg from 'pg';
 import bs58 from 'bs58';
+import { createDecipheriv } from 'node:crypto';
 import {
   Connection,
   Keypair,
@@ -28,6 +29,25 @@ if (!SESSION_ID) { console.error('Usage: node scripts/sweep-session.mjs <session
 
 const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 const SOL_MINT  = 'So11111111111111111111111111111111111111112';
+
+// Mirror the worker's AES-256-GCM keypair encryption (enc:iv:tag:ciphertext).
+const decryptKeypair = (stored) => {
+  if (!stored.startsWith('enc:')) return stored;
+  const envKey = process.env.SESSION_KEY_ENCRYPTION_KEY ?? '';
+  if (!envKey || envKey.length < 32) throw new Error('SESSION_KEY_ENCRYPTION_KEY required to decrypt session keypairs');
+  const keyBytes = envKey.length === 64
+    ? Buffer.from(envKey, 'hex')
+    : Buffer.from(envKey.slice(0, 32), 'utf8');
+  const key = keyBytes.subarray(0, 32);
+  const parts = stored.split(':');
+  if (parts.length !== 4) throw new Error('Invalid encrypted keypair format');
+  const iv = Buffer.from(parts[1], 'hex');
+  const tag = Buffer.from(parts[2], 'hex');
+  const ciphertext = Buffer.from(parts[3], 'hex');
+  const decipher = createDecipheriv('aes-256-gcm', key, iv);
+  decipher.setAuthTag(tag);
+  return Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString('utf8');
+};
 
 // DB
 const databaseUrl = process.env.DATABASE_PRIVATE_URL?.trim();
@@ -59,7 +79,7 @@ async function main() {
   // Fetch keypair
   const keyRes = await pool.query('SELECT keypair_base58 FROM session_keys WHERE session_id = $1', [SESSION_ID]);
   if (!keyRes.rowCount) { console.error('No keypair found for session'); process.exit(1); }
-  const keypair = Keypair.fromSecretKey(bs58.decode(keyRes.rows[0].keypair_base58));
+  const keypair = Keypair.fromSecretKey(bs58.decode(decryptKeypair(keyRes.rows[0].keypair_base58)));
 
   if (keypair.publicKey.toBase58() !== session.session_wallet) {
     console.error('Keypair mismatch! Stored pubkey:', keypair.publicKey.toBase58());
