@@ -8001,6 +8001,12 @@ const executeTrade = async (session: RawSession): Promise<void> => {
       )
       : 0,
     safetyBufferBps: strategyConfig.momentum.edgeSafetyBufferBps,
+    // Honest round-trip cost (entry + exit legs): slippage + platform fee, both ways.
+    // Only binding for momentum, whose edge metric is comparable to cost; other
+    // strategies remain cost-protected by the downstream route/exit-liquidity gates.
+    estimatedCostBps: tradePlan.signalSnapshot.strategy === 'momentum'
+      ? (WORKER_EXIT_EXPECTED_SLIPPAGE_BPS + Number(session.service_control.platformFeeBps ?? 0)) * 2
+      : 0,
   });
 
   if (tradePlan.direction === 'enter_long') {

@@ -96,6 +96,36 @@ test('computePrePrepareEntryGate allows prepare when edge could clear costs', ()
   assert.equal(gate, null);
 });
 
+test('computePrePrepareEntryGate blocks when edge clears safety but not honest round-trip cost', () => {
+  const gate = computePrePrepareEntryGate({
+    direction: 'enter_long',
+    signalMomentumBps: 95,
+    signalThresholdBps: 45,
+    safetyBufferBps: 35,
+    estimatedCostBps: 100,
+  });
+
+  assert.deepEqual(gate, {
+    allowed: false,
+    reason: 'entry_edge_below_cost',
+    expectedEdgeBps: 50,
+    estimatedCostBps: 100,
+    safetyBufferBps: 35,
+  });
+});
+
+test('computePrePrepareEntryGate allows when edge clears honest cost plus safety', () => {
+  const gate = computePrePrepareEntryGate({
+    direction: 'enter_long',
+    signalMomentumBps: 200,
+    signalThresholdBps: 45,
+    safetyBufferBps: 35,
+    estimatedCostBps: 100,
+  });
+
+  assert.equal(gate, null);
+});
+
 test('computePrePrepareEntryGate never blocks exits', () => {
   const gate = computePrePrepareEntryGate({
     direction: 'exit_long',

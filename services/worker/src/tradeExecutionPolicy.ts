@@ -51,6 +51,7 @@ export const computePrePrepareEntryGate = (params: {
   signalMomentumBps: number | null | undefined;
   signalThresholdBps: number | null | undefined;
   safetyBufferBps: number;
+  estimatedCostBps?: number | null;
 }): TradeGateAssessment | null => {
   if (params.direction !== 'enter_long') {
     return null;
@@ -61,18 +62,23 @@ export const computePrePrepareEntryGate = (params: {
   const safetyBufferBps = Number.isFinite(params.safetyBufferBps)
     ? Math.max(0, Math.round(params.safetyBufferBps))
     : 0;
+  const estimatedCostBps = Number.isFinite(Number(params.estimatedCostBps))
+    ? Math.max(0, Math.round(Number(params.estimatedCostBps)))
+    : 0;
   const expectedEdgeBps = Math.max(0, Math.round(signalMagnitudeBps - thresholdBps));
 
-  // If raw edge cannot clear the safety buffer even before route impact,
-  // platform fees, slippage, and network cost are known, it is impossible for
-  // the full prepared-trade gate to pass. Skip before /prepare so routine
+  // Honest round-trip hurdle: the expected edge must clear the modeled cost of
+  // entering AND exiting (both legs' slippage + platform fee) plus a safety
+  // margin. When estimatedCostBps is omitted this falls back to the legacy
+  // safety-buffer-only behavior. Blocking here skips /prepare so routine
   // no-edge decisions do not create failed swap_executions rows.
-  if (expectedEdgeBps <= safetyBufferBps) {
+  const requiredEdgeBps = estimatedCostBps + safetyBufferBps;
+  if (expectedEdgeBps <= requiredEdgeBps) {
     return {
       allowed: false,
       reason: 'entry_edge_below_cost',
       expectedEdgeBps,
-      estimatedCostBps: 0,
+      estimatedCostBps,
       safetyBufferBps,
     };
   }
