@@ -1,0 +1,15 @@
+const WORKER_GRADUATED_FEATURES = new Set(
+  (process.env.WORKER_GRADUATED_FEATURES ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0),
+);
+// Session-end performance fee (user directive): no per-trade platform fee; instead
+// skim WORKER_PERFORMANCE_FEE_BPS of realized SOL profit when funds return to the
+// owner at settlement. Default 33 bps = 0.33%. Enabled by default but gated through
+// the standard graduation mechanism, so it runs Noah-only until 'performance_fee'
+// is added to WORKER_GRADUATED_FEATURES.
+const WORKER_PERFORMANCE_FEE_ENABLED = process.env.WORKER_PERFORMANCE_FEE_ENABLED !== 'false';
+const WORKER_PERFORMANCE_FEE_BPS = Number(process.env.WORKER_PERFORMANCE_FEE_BPS ?? 33);
+const PERFORMANCE_FEE_DESTINATION = getJupiterFeeAccounts(process.env).SOL;
+const PERFORMANCE_FEE_PUBKEY = new PublicKey(PERFORMANCE_FEE_DESTINATION);

@@ -1,0 +1,11 @@
+    confirmationSettled = confirmationSettled || settled;
+  }
+
+  if (solToSend > 0) {
+    log('info', session.id, `queuing SOL sweep: ${solToSend} lamports -> ${ownerWallet}`);
+    const settled = await sendSweepBatch(
+      [SystemProgram.transfer({ fromPubkey: sessionPubkey, toPubkey: ownerPubkey, lamports: solToSend })],
+      'SOL sweep',
+    );
+    confirmationSettled = confirmationSettled || settled;
+  }

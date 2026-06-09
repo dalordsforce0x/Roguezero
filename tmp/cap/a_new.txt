@@ -1,0 +1,10 @@
+const WORKER_EXIT_EXPECTED_SLIPPAGE_BPS = Number(process.env.WORKER_EXIT_EXPECTED_SLIPPAGE_BPS ?? 15);
+// Hard per-token sell-impact entry cap (verified 2026-06-09). SELL legs slip ~10x BUY
+// legs and the cost is a persistent property of each token's bid depth (flat across our
+// trade size). Tokens we cannot exit cheaply guarantee a net loss regardless of entry
+// signal, so we refuse to enter them. This is a loss-reducer, not an edge source. Default
+// cap 12bps keeps deep names (JUP/RAY/Bonk/KMNO/WBTC/mSOL) and blocks JTO/MEW/long-tail.
+// Noah-gated via feature key 'sell_impact_cap' until proven on a larger live sample.
+const WORKER_SELL_IMPACT_CAP_ENABLED = process.env.WORKER_SELL_IMPACT_CAP_ENABLED !== 'false';
+const WORKER_MAX_ENTRY_SELL_IMPACT_BPS = Number(process.env.WORKER_MAX_ENTRY_SELL_IMPACT_BPS ?? 12);
+const WORKER_SELL_IMPACT_CACHE_TTL_MS = Number(process.env.WORKER_SELL_IMPACT_CACHE_TTL_MS ?? 600000);

@@ -1,0 +1,10 @@
+const fs = require('fs');
+const Ln = fs.readFileSync('services/worker/src/index.ts', 'utf8').split('\n');
+const find = (s) => Ln.findIndex((l) => l.includes(s)) + 1;
+const a = find('const GECKO_CANDLES_ENABLED =');
+const b = find('const runGeckoCandleRefreshTick');
+const show = (x, y) => { for (let i = x; i <= y; i++) console.log(i + ': ' + Ln[i - 1]); };
+console.log('=== feed/config block ===');
+show(a, a + 38);
+console.log('=== refresh tick ===');
+show(b, b + 8);

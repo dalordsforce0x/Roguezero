@@ -10,3 +10,4 @@ build/
 .turbo/
 .DS_Store
 Thumbs.db
+tmp/dbclean/swap_executions_deleted_backup.json

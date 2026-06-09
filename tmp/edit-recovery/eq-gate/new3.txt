@@ -1,0 +1,21 @@
+const WORKER_ENTRY_QUALITY_TREND_EFFICIENCY_THRESHOLD = Number(process.env.WORKER_ENTRY_QUALITY_TREND_EFFICIENCY_THRESHOLD ?? 0.6);
+// Live entry-quality GATE (fleet-wide). Applied to trusted majors that currently
+// bypass the trending shape gate yet still bleed. Thresholds calibrated from the
+// 4-day round-trip backtest: buying the top of the range (rangePos>~9000: 21% win,
+// -222bps), chasing a vertical surge (recentSurge>~120: 33% win deteriorating to 0%
+// at >300), and buying the exact local high (pullback<~8: 25% win, -209bps) were
+// the loss tail. Fails open while the tape is warming up. Reversible via env.
+const WORKER_ENTRY_QUALITY_GATE_ENABLED = process.env.WORKER_ENTRY_QUALITY_GATE_ENABLED !== 'false';
+const WORKER_ENTRY_QUALITY_GATE_MAX_RANGE_BPS = Number(process.env.WORKER_ENTRY_QUALITY_GATE_MAX_RANGE_BPS ?? 9000);
+const WORKER_ENTRY_QUALITY_GATE_MAX_SURGE_BPS = Number(process.env.WORKER_ENTRY_QUALITY_GATE_MAX_SURGE_BPS ?? 120);
+const WORKER_ENTRY_QUALITY_GATE_MIN_PULLBACK_BPS = Number(process.env.WORKER_ENTRY_QUALITY_GATE_MIN_PULLBACK_BPS ?? 8);
+// Strategies disabled fleet-wide. The 4-day backtest showed momentum at 10% win /
+// -204bps (n=20) vs supertrend 51% win / -19bps -- momentum is an indefensible
+// bleeder, so it is removed from entry selection by default. Reversible via env
+// (set WORKER_DISABLED_STRATEGIES='' to re-enable everything).
+const WORKER_DISABLED_STRATEGIES = new Set(
+  (process.env.WORKER_DISABLED_STRATEGIES ?? 'momentum')
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0),
+);

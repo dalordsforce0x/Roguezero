@@ -1,0 +1,4 @@
+  computeEntryQualityScore,
+  classifyTapeRegime,
+  evaluateEntryQualityGate,
+  resolveTradeGateAssessment,

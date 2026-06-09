@@ -325,13 +325,29 @@ export default function ManagerPage() {
               const groupUsers = (overview?.users ?? []).filter((u) => u.groupId === group.id);
               return (
                 <div key={group.id}>
-                  <div className="mb-3 text-lg font-medium text-white underline underline-offset-4">
-                    {group.name}
+                  <div className="mb-3 flex items-center justify-between gap-3">
+                    <span className="text-lg font-medium text-white underline underline-offset-4">
+                      {group.name}
+                    </span>
+                    {groupUsers.length > 6 && (
+                      <select
+                        value={groupUsers.some((u) => u.id === selectedUserId) ? selectedUserId ?? '' : ''}
+                        onChange={(e) => e.target.value && setSelectedUserId(e.target.value)}
+                        className="max-w-56 shrink-0 rounded-md border border-white/15 bg-black/40 px-2 py-1 text-xs text-white/80 outline-none focus:border-lime-400/50"
+                      >
+                        <option value="">jump to bot… ({groupUsers.length})</option>
+                        {groupUsers.map((u) => (
+                          <option key={u.id} value={u.id}>
+                            {u.username} — {sessionByUser.get(u.id)?.status ?? 'idle'}
+                          </option>
+                        ))}
+                      </select>
+                    )}
                   </div>
                   {groupUsers.length === 0 ? (
                     <div className="text-sm text-white/35">no bots in this group</div>
                   ) : (
-                    <div className="flex flex-wrap gap-x-6 gap-y-5">
+                    <div className="flex flex-nowrap gap-4 overflow-x-auto pb-2">
                       {groupUsers.map((user) => {
                         const session = sessionByUser.get(user.id);
                         const live = LIVE_STATUSES.has(session?.status ?? '');
@@ -341,7 +357,7 @@ export default function ManagerPage() {
                             key={user.id}
                             type="button"
                             onClick={() => setSelectedUserId(user.id)}
-                            className="group flex w-44 flex-col items-center gap-2"
+                            className="group flex w-32 shrink-0 flex-col items-center gap-2"
                           >
                             {/* controller-screen tile = live mini render of the bot screen */}
                             <div
@@ -352,7 +368,7 @@ export default function ManagerPage() {
                               }`}
                             >
                               <div className="relative overflow-hidden rounded-xl">
-                                <ScaledScreen width={160}>
+                                <ScaledScreen width={116}>
                                   <BotScreen user={user} session={session} />
                                 </ScaledScreen>
                                 <span
@@ -363,7 +379,7 @@ export default function ManagerPage() {
                               </div>
                             </div>
                             {/* caption */}
-                            <span className="text-center text-sm text-lime-400 underline underline-offset-2">
+                            <span className="w-full truncate text-center text-xs text-lime-400 underline underline-offset-2">
                               {user.username}/ {session?.status ?? 'idle'}
                             </span>
                           </button>

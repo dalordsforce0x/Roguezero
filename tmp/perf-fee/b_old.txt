@@ -1,0 +1,6 @@
+const WORKER_GRADUATED_FEATURES = new Set(
+  (process.env.WORKER_GRADUATED_FEATURES ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0),
+);

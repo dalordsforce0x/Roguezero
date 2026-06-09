@@ -1,0 +1,55 @@
+const getTokenUniversePool = () => {
+  if (tokenUniversePool) return tokenUniversePool;
+  tokenUniversePool = getPool();
+  return tokenUniversePool;
+};
+
+// Rolling per-token SELL-side price impact (bps), measured from confirmed sells
+// (token -> USDC/SOL) over the trailing window. Refreshed on a TTL so the entry
+// cap reflects current bid-side liquidity without a hot-path quote. Tokens with no
+// recent sell history return null (unknown) and are NOT blocked, so the bot can
+// still take a first trade and learn the token's real exit cost.
+const sellImpactByMint = new Map<string, number>();
+let sellImpactLoadedAt = 0;
+let sellImpactRefreshPromise: Promise<void> | null = null;
+
+const refreshSellImpactCache = async (): Promise<void> => {
+  if (sellImpactRefreshPromise) return sellImpactRefreshPromise;
+  sellImpactRefreshPromise = (async () => {
+    try {
+      const result = await getPool().query<{ mint: string; imp: string }>(
+        `SELECT input_mint AS mint,
+                avg((build_response->>'priceImpactPct')::numeric * 10000) AS imp
+           FROM swap_executions
+          WHERE status = 'confirmed'
+            AND created_at > now() - interval '7 days'
+            AND build_response->>'priceImpactPct' IS NOT NULL
+            AND output_mint = ANY($1::text[])
+            AND NOT (input_mint = ANY($1::text[]))
+          GROUP BY input_mint`,
+        [[USDC_MINT, SOL_MINT]],
+      );
+      sellImpactByMint.clear();
+      for (const row of result.rows) {
+        const imp = Number(row.imp);
+        if (Number.isFinite(imp)) sellImpactByMint.set(row.mint, imp);
+      }
+      sellImpactLoadedAt = Date.now();
+    } finally {
+      sellImpactRefreshPromise = null;
+    }
+  })();
+  return sellImpactRefreshPromise;
+};
+
+const getRecentSellImpactBps = async (mint: string): Promise<number | null> => {
+  if (Date.now() - sellImpactLoadedAt > WORKER_SELL_IMPACT_CACHE_TTL_MS) {
+    try {
+      await refreshSellImpactCache();
+    } catch (err) {
+      log('warn', 'sell-impact', `failed to refresh sell-impact cache: ${String(err)}`);
+    }
+  }
+  const imp = sellImpactByMint.get(mint);
+  return imp === undefined ? null : imp;
+};

@@ -1,0 +1,66 @@
+    // Entry-quality score + LIVE GATE. The score is computed for every entry and
+    // stashed for the shadow score->MAE correlation log. The GATE then blocks
+    // entries on trusted majors that bypass the trending shape gate yet still
+    // bleed, using catastrophic-shape thresholds calibrated from real history.
+    if (WORKER_ENTRY_QUALITY_SHADOW_ENABLED || WORKER_ENTRY_QUALITY_GATE_ENABLED) {
+      const entryQualityPrices = getMomentumTapeForMint(selectedEntryMint).map((sample) => sample.usdPrice);
+      const entryQuality = computeEntryQualityScore({
+        prices: entryQualityPrices,
+        minSamples: WORKER_ENTRY_QUALITY_MIN_SAMPLES,
+        chaseLookbackSamples: WORKER_ENTRY_QUALITY_CHASE_LOOKBACK_SAMPLES,
+        regime: classifyTapeRegime({
+          prices: entryQualityPrices,
+          minSamples: WORKER_ENTRY_QUALITY_MIN_SAMPLES,
+          trendEfficiencyThreshold: WORKER_ENTRY_QUALITY_TREND_EFFICIENCY_THRESHOLD,
+        }),
+        priceImpactBps: latestPriceImpactBpsByMint.get(selectedEntryMint) ?? null,
+        idealPullbackBps: WORKER_ENTRY_QUALITY_IDEAL_PULLBACK_BPS,
+        maxHealthyPullbackBps: WORKER_ENTRY_QUALITY_MAX_HEALTHY_PULLBACK_BPS,
+        maxHealthyPriceImpactBps: WORKER_ENTRY_QUALITY_MAX_HEALTHY_IMPACT_BPS,
+        strongScore: WORKER_ENTRY_QUALITY_STRONG_SCORE,
+        fairScore: WORKER_ENTRY_QUALITY_FAIR_SCORE,
+        enterThreshold: WORKER_ENTRY_QUALITY_ENTER_THRESHOLD,
+      });
+      pendingEntryQualityByMint.set(`${session.id}:${selectedEntryMint}`, { score: entryQuality.score, band: entryQuality.band });
+      const eqSymbol = resolveTokenSymbol(selectedEntryMint);
+      const eqClass = getTokenTradeClass(selectedEntryMint, eqSymbol);
+      const eqC = entryQuality.components;
+      if (isCanaryShadowEnabled(session, true)) {
+        log(
+          'info',
+          session.id,
+          `entry-quality shadow: ${eqSymbol} (${selectedEntryMint}) class=${eqClass} score=${entryQuality.score} band=${entryQuality.band} wouldEnter=${entryQuality.wouldEnter} pull=${eqC.pullback.toFixed(2)} reclaim=${eqC.reclaim.toFixed(2)} rangePos=${eqC.rangePosition.toFixed(2)} surge=${eqC.surgeRestraint.toFixed(2)} liq=${eqC.liquidity.toFixed(2)} pbHighBps=${entryQuality.metrics?.pullbackFromHighBps ?? 'na'} reclaimLowBps=${entryQuality.metrics?.reclaimFromLowBps ?? 'na'} rangeBps=${entryQuality.metrics?.rangePositionBps ?? 'na'}`,
+        );
+      }
+
+      // LIVE GATE: trusted majors (non-SOL) only. SOL is base rotation; non-trusted
+      // tokens are handled by the trending shape gate below -> one gate per entry.
+      const appliesEntryQualityGate = WORKER_ENTRY_QUALITY_GATE_ENABLED
+        && selectedEntryMint !== SOL_MINT
+        && TRUSTED_ENTRY_UNIVERSE_MINT_SET.has(selectedEntryMint);
+      if (appliesEntryQualityGate) {
+        const eqGate = evaluateEntryQualityGate({
+          result: entryQuality,
+          maxRangePositionBps: WORKER_ENTRY_QUALITY_GATE_MAX_RANGE_BPS,
+          maxRecentSurgeBps: WORKER_ENTRY_QUALITY_GATE_MAX_SURGE_BPS,
+          minPullbackFromHighBps: WORKER_ENTRY_QUALITY_GATE_MIN_PULLBACK_BPS,
+        });
+        if (!eqGate.allowed) {
+          await persistTradeDecision(session, 'blocked', eqGate.reason);
+          await persistLastTradeGate(session, {
+            at: new Date().toISOString(),
+            decision: 'blocked',
+            reason: eqGate.reason,
+            expectedEdgeBps: tokenEntrySignal.momentumBps,
+            estimatedCostBps: entryQuality.metrics?.recentSurgeBps ?? null,
+            safetyBufferBps: strategyConfig.momentum.edgeSafetyBufferBps,
+          });
+          log(
+            'info',
+            session.id,
+            `entry blocked: entry-quality gate for ${eqSymbol} (${selectedEntryMint}) reason=${eqGate.reason} score=${entryQuality.score} pbHighBps=${entryQuality.metrics?.pullbackFromHighBps ?? 'na'} surgeBps=${entryQuality.metrics?.recentSurgeBps ?? 'na'} rangeBps=${entryQuality.metrics?.rangePositionBps ?? 'na'}`,
+          );
+          return;
+        }
+      }
+    }

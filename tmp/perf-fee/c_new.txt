@@ -1,0 +1,47 @@
+    confirmationSettled = confirmationSettled || settled;
+  }
+
+  // ── Session-end performance fee ─────────────────────────────────────────
+  // Per user directive: no per-trade platform fee; instead skim a small fee on
+  // realized session profit at settlement. Worker funding is SOL-only, so realized
+  // profit = SOL returning to the owner above the originally funded baseline. We
+  // only ever skim profit (principal is never touched; no profit => no fee), and the
+  // skim rides in the same SOL-sweep tx so it adds no extra tx-fee reserve. Rolled
+  // out Noah-first via the standard graduation gate ('performance_fee').
+  let performanceFeeLamports = 0;
+  if (
+    solToSend > 0
+    && WORKER_PERFORMANCE_FEE_BPS > 0
+    && isFeatureActiveForSession(session, WORKER_PERFORMANCE_FEE_ENABLED, 'performance_fee')
+  ) {
+    const fundedBaselineLamports = Number(session.funding?.startingBalanceAtomic ?? '0');
+    const realizedProfitLamports = solToSend - fundedBaselineLamports;
+    if (Number.isFinite(fundedBaselineLamports) && realizedProfitLamports > 0) {
+      const rawFee = Math.floor((realizedProfitLamports * WORKER_PERFORMANCE_FEE_BPS) / 10_000);
+      // Clamp so the fee can never exceed realized profit (owner always keeps principal).
+      performanceFeeLamports = Math.max(0, Math.min(rawFee, realizedProfitLamports));
+    }
+  }
+
+  const solToOwner = solToSend - performanceFeeLamports;
+
+  if (solToOwner > 0) {
+    const solSweepIxs: TransactionInstruction[] = [
+      SystemProgram.transfer({ fromPubkey: sessionPubkey, toPubkey: ownerPubkey, lamports: solToOwner }),
+    ];
+    if (performanceFeeLamports > 0) {
+      solSweepIxs.push(SystemProgram.transfer({
+        fromPubkey: sessionPubkey,
+        toPubkey: PERFORMANCE_FEE_PUBKEY,
+        lamports: performanceFeeLamports,
+      }));
+      log(
+        'info',
+        session.id,
+        `performance fee ${performanceFeeLamports} lamports (${WORKER_PERFORMANCE_FEE_BPS}bps of ${solToSend - Number(session.funding?.startingBalanceAtomic ?? '0')} realized SOL profit) -> ${PERFORMANCE_FEE_DESTINATION}`,
+      );
+    }
+    log('info', session.id, `queuing SOL sweep: ${solToOwner} lamports -> ${ownerWallet}`);
+    const settled = await sendSweepBatch(solSweepIxs, 'SOL sweep');
+    confirmationSettled = confirmationSettled || settled;
+  }

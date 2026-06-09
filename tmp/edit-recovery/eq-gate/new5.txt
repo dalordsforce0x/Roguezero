@@ -1,0 +1,7 @@
+  const enabledStrategies = strategyUniverse
+    .filter((strategy) => strategy.enabled && !WORKER_DISABLED_STRATEGIES.has(strategy.key))
+    .map((strategy) => strategy.key as StrategyKey);
+
+  const configuredActiveStrategy = (session.service_control.rotationState?.activeStrategy ?? 'momentum') as StrategyKey;
+  const fallbackStrategy = enabledStrategies[0]
+    ?? (WORKER_DISABLED_STRATEGIES.has('supertrend') ? 'momentum' : 'supertrend');

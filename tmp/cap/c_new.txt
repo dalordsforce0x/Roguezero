@@ -1,0 +1,47 @@
+  let prePrepareEntryGate = computePrePrepareEntryGate({
+    direction: tradePlan.direction,
+    signalMomentumBps: tradePlan.signalSnapshot.momentumBps,
+    signalThresholdBps: tradePlan.signalSnapshot.strategy === 'momentum'
+      ? Math.max(
+        Number(tradePlan.signalSnapshot.thresholdBps ?? 0),
+        strategyConfig.momentum.thresholdBps,
+      )
+      : 0,
+    safetyBufferBps: strategyConfig.momentum.edgeSafetyBufferBps,
+    // Honest round-trip cost (entry + exit legs): slippage + platform fee, both ways.
+    // Only binding for momentum, whose edge metric is comparable to cost; other
+    // strategies remain cost-protected by the downstream route/exit-liquidity gates.
+    estimatedCostBps: tradePlan.signalSnapshot.strategy === 'momentum'
+      ? (WORKER_EXIT_EXPECTED_SLIPPAGE_BPS + Number(session.service_control.platformFeeBps ?? 0)) * 2
+      : 0,
+  });
+
+  // Hard per-token sell-impact entry cap. Independent of momentum (momentum magnitude
+  // is not calibrated to forward bps, so it cannot gate cost). If a token's recent
+  // sell-side impact exceeds the cap we refuse to enter it, because the exit leg alone
+  // guarantees a net loss. Unknown tokens (no recent sell history) are allowed through
+  // so the bot can take a first trade and measure the real exit cost. Noah-gated.
+  if (
+    tradePlan.direction === 'enter_long'
+    && (!prePrepareEntryGate || prePrepareEntryGate.allowed)
+    && isFeatureActiveForSession(session, WORKER_SELL_IMPACT_CAP_ENABLED, 'sell_impact_cap')
+  ) {
+    const entryMint = tradePlan.inventory.outputMint;
+    const sellImpactBps = await getRecentSellImpactBps(entryMint);
+    if (sellImpactBps !== null && sellImpactBps > WORKER_MAX_ENTRY_SELL_IMPACT_BPS) {
+      prePrepareEntryGate = {
+        allowed: false,
+        reason: 'entry_sell_impact_too_high',
+        expectedEdgeBps: 0,
+        estimatedCostBps: Math.round(sellImpactBps),
+        safetyBufferBps: 0,
+      };
+      log(
+        'info',
+        session.id,
+        `sell-impact cap blocked entry: ${tradePlan.inventory.outputSymbol} (${entryMint}) sellImpact=${sellImpactBps.toFixed(1)}bps > cap ${WORKER_MAX_ENTRY_SELL_IMPACT_BPS}bps`,
+      );
+    }
+  }
+
+  if (tradePlan.direction === 'enter_long') {
