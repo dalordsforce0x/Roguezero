@@ -1072,6 +1072,14 @@ const GECKO_CANDLES_ENABLED = process.env.WORKER_GECKO_CANDLES_ENABLED !== 'fals
 const GECKO_CANDLE_REFRESH_MS = Math.max(60_000, Number(process.env.WORKER_GECKO_CANDLE_REFRESH_MS ?? 300_000));
 const GECKO_CANDLE_RPM = Math.max(1, Math.min(28, Number(process.env.WORKER_GECKO_CANDLE_RPM ?? 20)));
 const GECKO_CANDLE_MIN_SAMPLES = Math.max(5, Number(process.env.WORKER_GECKO_CANDLE_MIN_SAMPLES ?? 30));
+// Freshness gate: when a non-SOL token has NO fresh GeckoTerminal candles, the
+// shape/ATR scorers fall back to the thin ~60s Jupiter drift tape -- which the
+// code itself labels "blind, failed open". Entering blind is how the most-traded
+// majors (JTO/BONK) bled. Block the entry instead of trading on the blind tape.
+// SOL is exempt (Pyth tape is always fresh). Only ever blocks -> no new loss path.
+// Default ON; set WORKER_GECKO_CANDLES_REQUIRED_FOR_ENTRY=false to disable.
+const GECKO_CANDLES_REQUIRED_FOR_ENTRY = GECKO_CANDLES_ENABLED
+  && process.env.WORKER_GECKO_CANDLES_REQUIRED_FOR_ENTRY !== 'false';
 // Anti-churn: backtest showed sub-2-min stop_loss exits are ~all losers (-146bps,
 // 3.4% win) -- we stop out inside entry-slippage noise. Hold past the window unless
 // the loss is a genuine blowout past the hard floor.
@@ -7736,6 +7744,33 @@ const executeTrade = async (session: RawSession): Promise<void> => {
         'info',
         session.id,
         `entry blocked: ${resolveTokenSymbol(selectedEntryMint)} momentum not persistent (${MIN_ENTRY_SIGNAL_PERSISTENCE_SAMPLES} samples required)`,
+      );
+      return;
+    }
+
+    // FRESHNESS GATE: non-SOL entries require fresh GeckoTerminal candles. Without
+    // them the shape/ATR scorers fall back to the blind ~60s drift tape and the bot
+    // enters on no real signal -- the proven loss path on JTO/BONK. Block instead.
+    // SOL is exempt (Pyth tape is always fresh). Only blocks -> no new loss path.
+    if (
+      GECKO_CANDLES_REQUIRED_FOR_ENTRY
+      && selectedEntryMint !== SOL_MINT
+      && !geckoCandleFeed.hasFreshCandles(selectedEntryMint)
+    ) {
+      const reason = 'stale_candles_no_fresh_signal';
+      await persistTradeDecision(session, 'blocked', reason);
+      await persistLastTradeGate(session, {
+        at: new Date().toISOString(),
+        decision: 'blocked',
+        reason,
+        expectedEdgeBps: tokenEntrySignal.momentumBps,
+        estimatedCostBps: null,
+        safetyBufferBps: strategyConfig.momentum.edgeSafetyBufferBps,
+      });
+      log(
+        'info',
+        session.id,
+        `entry blocked: stale candles for ${resolveTokenSymbol(selectedEntryMint)} (${selectedEntryMint}) -- no fresh GeckoTerminal signal, refusing blind-tape entry candleDepth=${geckoCandleFeed.getTape(selectedEntryMint).length}`,
       );
       return;
     }
