@@ -171,7 +171,15 @@ const TX_FEE_LAMPORTS = fundingThresholds.txFeeLamports;
 const MIN_TRADEABLE_LAMPORTS = fundingThresholds.minimumTradeableLamports;
 const FUNDING_READY_SLOP_LAMPORTS = Number(process.env.WORKER_FUNDING_READY_SLOP_LAMPORTS ?? 5_000);
 const MIN_SOL_OPERATING_RESERVE_LAMPORTS = TX_FEE_LAMPORTS + OPERATING_BUFFER_LAMPORTS;
-const MIN_USDC_ENTRY_ATOMIC = Number(process.env.WORKER_MIN_USDC_ENTRY_ATOMIC ?? 1_000_000);
+// Economic entry floor: a trade must be large enough that the fixed per-swap cost
+// (base fee + Sender tip ~200k lamports + priority fee, together ~$0.03) amortizes
+// under the entry cost cap (WORKER_MAX_QUOTE_PRICE_IMPACT_BPS, default 120 bps).
+// At $1.00 the fixed cost alone is ~178 bps so every entry was prepared, rejected by
+// the cost gate ('entry_leg_cost_too_high'), then cancelled. That prepare->cancel churn
+// left a prepared/submitted row that tripped the in-flight guard and starved the whole
+// trade loop (including exits). At $5.00 the fixed cost is ~64 bps with headroom for
+// route price impact; sub-floor sizes are blocked before prepare instead of churning.
+const MIN_USDC_ENTRY_ATOMIC = Number(process.env.WORKER_MIN_USDC_ENTRY_ATOMIC ?? 5_000_000);
 const MIN_USDC_POSITION_NOTIONAL_ATOMIC = Number(
   process.env.WORKER_MIN_USDC_POSITION_NOTIONAL_ATOMIC ?? MIN_USDC_ENTRY_ATOMIC,
 );
