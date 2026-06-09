@@ -5854,6 +5854,7 @@ const ENTRY_REJECT_COOLDOWN_REASONS = new Set([
   'route_stability_impact_too_high',
   'route_stability_impact_unstable',
   'route_stability_output_unstable',
+  'entry_token_unpriced',
 ]);
 
 const getEntryRejectCooldownKey = (sessionId: string, mint: string) => sessionId + ':' + mint;
@@ -7960,6 +7961,28 @@ const executeTrade = async (session: RawSession): Promise<void> => {
       });
       log('info', session.id, `entry blocked: ${resolveTokenSymbol(selectedEntryMint)} already open in portfolio`);
       return;
+    }
+
+    // Price-availability gate. Never enter a token we cannot price: without a
+    // live USD mark we cannot mark the position, evaluate stop/take-profit, or
+    // report honest PnL. SOL is priced via the Pyth feed; every other entry mint
+    // must have a live Jupiter USD price before we commit capital to it.
+    if (selectedEntryMint !== SOL_MINT) {
+      const entryMintUsdPrice = latestJupiterUsdByMint.get(selectedEntryMint) ?? null;
+      if (entryMintUsdPrice === null || !Number.isFinite(entryMintUsdPrice) || entryMintUsdPrice <= 0) {
+        recordEntryRejectCooldown(session, selectedEntryMint, 'entry_token_unpriced');
+        await persistTradeDecision(session, 'blocked', 'entry_token_unpriced');
+        await persistLastTradeGate(session, {
+          at: new Date().toISOString(),
+          decision: 'blocked',
+          reason: 'entry_token_unpriced',
+          expectedEdgeBps: tokenEntrySignal.momentumBps,
+          estimatedCostBps: null,
+          safetyBufferBps: strategyConfig.momentum.edgeSafetyBufferBps,
+        });
+        log('info', session.id, `entry blocked: no live USD price for ${resolveTokenSymbol(selectedEntryMint)} (${selectedEntryMint}) -- refusing to trade an unpriceable token`);
+        return;
+      }
     }
 
     if (tokenEntrySignal.status !== 'ready' || tokenEntrySignal.regime !== 'bullish') {
