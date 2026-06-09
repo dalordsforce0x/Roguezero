@@ -1735,6 +1735,7 @@ export default function Home() {
   const [form, setForm]           = useState({ username: '', walletAddress: '', duration: '1month', maxWalletUsd: '10000', groupId: '' });
   const [groupForm, setGroupForm] = useState({ name: '', botLimit: '1', addUserIds: [] as string[], removeUserIds: [] as string[], newUsername: '', newWalletAddress: '', newDuration: '1month', newMaxWalletUsd: '10000' });
   const [groupUserSearch, setGroupUserSearch] = useState('');
+  const [groupCardSearch, setGroupCardSearch] = useState<Record<string, string>>({});
   const [formBusy, setFormBusy]   = useState(false);
   const [assigning, setAssigning] = useState<string | null>(null);
   const [toggling, setToggling]   = useState<string | null>(null);
@@ -2412,10 +2413,16 @@ export default function Home() {
             ) : (
               <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4">
                 {groups.map(group => {
-                  const members = users.filter(u => u.group_id === group.id);
+                  const allMembers = users.filter(u => u.group_id === group.id);
+                  const cardQuery = (groupCardSearch[group.id] ?? '').trim().toLowerCase();
+                  const members = cardQuery
+                    ? allMembers.filter(u =>
+                        u.username.toLowerCase().includes(cardQuery)
+                        || (u.wallet_address ?? '').toLowerCase().includes(cardQuery))
+                    : allMembers;
                   return (
-                    <div key={group.id} className="bg-gray-900/80 border border-gray-800 rounded-xl p-4">
-                      <div className="flex items-start justify-between gap-3">
+                    <div key={group.id} className="flex h-96 flex-col bg-gray-900/80 border border-gray-800 rounded-xl p-4">
+                      <div className="flex items-start justify-between gap-3 shrink-0">
                         <div>
                           <h3 className="text-white font-semibold">{group.name}</h3>
                           <p className="text-xs text-gray-600 mt-1">{group.member_count} users · {group.bot_limit} bots allocated</p>
@@ -2435,7 +2442,7 @@ export default function Home() {
                         </button>
                         </div>
                       </div>
-                      <div className="mt-3 flex items-center gap-2">
+                      <div className="mt-3 flex items-center gap-2 shrink-0">
                         <span className="text-[10px] uppercase tracking-wider text-gray-600">Manager</span>
                         <select
                           value={group.manager_id ?? ''}
@@ -2448,9 +2455,20 @@ export default function Home() {
                           ))}
                         </select>
                       </div>
-                      <div className="mt-4 space-y-2">
-                        {members.length === 0 ? (
+                      <div className="mt-3 shrink-0">
+                        <input
+                          type="text"
+                          value={groupCardSearch[group.id] ?? ''}
+                          onChange={(e) => setGroupCardSearch(prev => ({ ...prev, [group.id]: e.target.value }))}
+                          placeholder={`Search ${allMembers.length} user${allMembers.length === 1 ? '' : 's'} by name or wallet…`}
+                          className="w-full bg-gray-950 border border-gray-800 text-xs text-white rounded-md px-2 py-1.5 outline-none focus:border-cyan-400/40 placeholder:text-gray-700"
+                        />
+                      </div>
+                      <div className="mt-4 flex-1 space-y-2 overflow-y-auto pr-1">
+                        {allMembers.length === 0 ? (
                           <p className="text-xs text-gray-700 italic">No users assigned yet.</p>
+                        ) : members.length === 0 ? (
+                          <p className="text-xs text-gray-700 italic">No users match “{groupCardSearch[group.id]}”.</p>
                         ) : members.map(member => (
                           <div key={member.id} className="flex items-center justify-between rounded-lg bg-gray-950/60 border border-gray-800/70 px-3 py-2">
                             <div>
