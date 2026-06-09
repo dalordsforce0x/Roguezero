@@ -6029,7 +6029,7 @@ const computeDynamicExitThresholds = (
     return {
       takeProfitBps: applyTakeProfitTimeDecay(Math.max(positionExitPolicy.takeProfitBps, costFloorBps)),
       stopLossBps: Math.max(positionExitPolicy.stopLossBps, costFloorBps),
-      trailingStopBps: Math.max(positionExitPolicy.trailingStopBps, costFloorBps),
+      trailingStopBps: Math.max(positionExitPolicy.trailingStopBps, positionExitPolicy.trailingStopFloorBps),
       atrBps: null,
       costFloorBps,
       mode: 'fallback',
@@ -6048,7 +6048,7 @@ const computeDynamicExitThresholds = (
       Math.round(atrBps * exitProfile.stopLossMult),
     ),
     trailingStopBps: Math.max(
-      costFloorBps,
+      positionExitPolicy.trailingStopFloorBps,
       Math.round(atrBps * exitProfile.trailingStopMult),
     ),
     atrBps,

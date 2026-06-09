@@ -1189,14 +1189,48 @@ function RecentTradesTable({ trades }: { trades: SessionHealthData['recentTrades
                       ? 'text-cyan-300'
                       : 'text-yellow-300';
 
+                // Row-level color coding so the receipt tape reads at a glance:
+                //   profit exit (take_profit)        -> green
+                //   loss exit (stop_loss)            -> red
+                //   profit-protect exit (trailing /  -> amber
+                //     signal_reversal)
+                //   entry / buy                      -> blue
+                //   reconcile / wallet / unconfirmed -> neutral
+                const isConfirmed = trade.status === 'confirmed';
+                const exitReason = trade.exitReason;
+                const isEntry = !exitReason && !!trade.entryStrategy;
+                let rowTone = 'border-b border-gray-800/50';
+                let kindLabel: string | null = null;
+                if (isConfirmed && exitReason === 'take_profit') {
+                  rowTone = 'border-b border-gray-800/50 bg-emerald-950/30 border-l-2 border-l-emerald-400';
+                  kindLabel = 'PROFIT';
+                } else if (isConfirmed && exitReason === 'stop_loss') {
+                  rowTone = 'border-b border-gray-800/50 bg-rose-950/30 border-l-2 border-l-rose-400';
+                  kindLabel = 'LOSS';
+                } else if (isConfirmed && (exitReason === 'trailing_stop' || exitReason === 'signal_reversal')) {
+                  rowTone = 'border-b border-gray-800/50 bg-amber-950/25 border-l-2 border-l-amber-400';
+                  kindLabel = 'LOCK';
+                } else if (isConfirmed && isEntry) {
+                  rowTone = 'border-b border-gray-800/50 bg-sky-950/25 border-l-2 border-l-sky-400';
+                  kindLabel = 'BOUGHT';
+                }
+
                 return (
-                  <tr key={trade.executionId} className="border-b border-gray-800/50 align-top">
+                  <tr key={trade.executionId} className={`${rowTone} align-top`}>
                     <td className="py-2 pr-3">
                       <p className="font-medium text-white">{trade.username}</p>
                       <p className="font-mono text-[10px] text-gray-600">{trade.sessionId.slice(0, 8)} · {trade.sessionStatus.replace(/_/g, ' ')}</p>
                     </td>
                     <td className={`py-2 pr-3 font-semibold ${statusTone}`}>
                       {trade.status}
+                      {kindLabel && (
+                        <span className={`ml-1.5 rounded px-1 py-0.5 text-[9px] font-bold uppercase tracking-wider ${
+                          kindLabel === 'PROFIT' ? 'bg-emerald-500/20 text-emerald-300'
+                            : kindLabel === 'LOSS' ? 'bg-rose-500/20 text-rose-300'
+                              : kindLabel === 'LOCK' ? 'bg-amber-500/20 text-amber-300'
+                                : 'bg-sky-500/20 text-sky-300'
+                        }`}>{kindLabel}</span>
+                      )}
                       {trade.confirmationStatus && <p className="font-normal text-[10px] text-gray-600">{trade.confirmationStatus}</p>}
                     </td>
                     <td className="py-2 pr-3 text-gray-300">

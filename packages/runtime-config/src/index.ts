@@ -555,6 +555,7 @@ export type WorkerPositionExitPolicy = {
   atrStopLossMultiplier: number;
   atrTrailingStopMultiplier: number;
   exitCostFloorBps: number;
+  trailingStopFloorBps: number;
   takeProfitTimeDecayStartMs: number;
   takeProfitTimeDecayFullMs: number;
 };
@@ -582,6 +583,12 @@ export const getWorkerPositionExitPolicy = (env: NodeJS.ProcessEnv): WorkerPosit
   const atrStopLossMultiplier = Number(env.WORKER_ATR_SL_MULT ?? 1.0);
   const atrTrailingStopMultiplier = Number(env.WORKER_ATR_TRAIL_MULT ?? 0.8);
   const exitCostFloorBps = Number(env.WORKER_EXIT_COST_FLOOR_BPS ?? 60);
+  // Trailing-stop floor is DECOUPLED from the take-profit cost floor. The cost
+  // floor was lowered so take-profits become reachable; if the trailing stop
+  // shared that floor it would hair-trigger on low-volatility assets (SOL) and
+  // churn buy->trail->rebuy every few seconds. The trailing band must stay wide
+  // enough to ignore normal noise so winners can actually run.
+  const trailingStopFloorBps = Number(env.WORKER_TRAILING_STOP_FLOOR_BPS ?? 120);
   // Time-decay take-profit ladder: a young position requires its full ATR/static
   // take-profit target; once it ages past the start window the required target
   // decays linearly toward the cost floor (breakeven + fees) by the full window,
@@ -597,6 +604,7 @@ export const getWorkerPositionExitPolicy = (env: NodeJS.ProcessEnv): WorkerPosit
     atrStopLossMultiplier,
     atrTrailingStopMultiplier,
     exitCostFloorBps,
+    trailingStopFloorBps,
     takeProfitTimeDecayStartMs,
     takeProfitTimeDecayFullMs,
   };
