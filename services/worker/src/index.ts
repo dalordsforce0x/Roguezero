@@ -1316,6 +1316,11 @@ const universeSortProbeTaker = process.env.WORKER_UNIVERSE_PROBE_TAKER?.trim()
   || '11111111111111111111111111111111';
 const tokenUniverseSymbolByMint = new Map<string, string>();
 const latestJupiterUsdByMint = new Map<string, number>();
+// Mints currently held as positions across active sessions. The price poll
+// adds these to its fetch list so EVERY held token (including re-tracked
+// orphans outside the trade universe) gets a live USD price, keeping PnL
+// valuation honest. Populated by the wallet-truth reconcile each cycle.
+const heldPositionMints = new Set<string>();
 const previousJupiterUsdByMint = new Map<string, number>();
 const latestJupiterDecimalsByMint = new Map<string, number>();
 const latestPriceImpactBpsByMint = new Map<string, number>();
@@ -3596,6 +3601,7 @@ const runJupiterPricePollTick = async (): Promise<void> => {
     const mints = dedupeMints([
       ...jupiterPriceConfig.defaultMints,
       ...tokenUniverseMints,
+      ...heldPositionMints,
     ]);
     const samples = await fetchJupiterPricesUsd(mints);
     for (const mint of Object.keys(samples)) {
@@ -6100,6 +6106,13 @@ const refreshPositionsMarks = async (
       ? clonePositionState(positionState)
       : {
           ...positionState,
+          // Backfill cost basis for a re-tracked orphan the first time we have
+          // a price. True entry is unknown, so basis = current mark (unrealized
+          // starts at 0 from discovery)  this lets the position contribute to PnL.
+          entryPriceUsd: isLongPositionStatus(positionState.status) && positionState.entryPriceUsd === null
+            ? markedPriceUsd
+            : positionState.entryPriceUsd,
+          entryAt: positionState.entryAt ?? markedAt,
           highWaterPriceUsd: isLongPositionStatus(positionState.status)
             ? (positionState.highWaterPriceUsd === null
               ? markedPriceUsd
@@ -7139,6 +7152,15 @@ const executeTrade = async (session: RawSession): Promise<void> => {
   }
 
   const openPositionMints = new Set(openPositions.map(({ mint }) => mint));
+
+  // Register every held, non-currency mint so the global price poll keeps a
+  // live USD price for it. Without this, re-tracked orphans outside the trade
+  // universe would never be priced and their position PnL would read as zero.
+  for (const mint of openPositionMints) {
+    if (mint !== SOL_MINT && mint !== USDC_MINT && mint !== session.funding.fundingMint) {
+      heldPositionMints.add(mint);
+    }
+  }
 
   // Gas keep-alive: if SOL has drained toward the fee floor while the session
   // still holds USDC working capital, top the tank back up from a small USDC
