@@ -1443,18 +1443,21 @@ const getBuildBlockhash = (build: JupiterBuildResponse) => {
   throw new Error('Jupiter build response returned an invalid blockhash format');
 };
 
-// Platform fee is charged ONLY on profit-taking exits (take_profit / trailing_stop),
-// which by design fire above the cost floor. Entries, stop-losses, and signal
-// reversals are fee-free so users never pay the platform fee on an entry or a loss.
-const PROFIT_EXIT_FEE_REASONS = new Set(['take_profit', 'trailing_stop']);
-
+// Fee model: NO per-trade platform fee. Real-data backtests proved the per-trade
+// fee was larger than the strategy's net per-trade edge, so charging it on every
+// profit-exit turned a marginally-positive strategy negative. The platform now
+// collects a single performance fee (PERFORMANCE_FEE_BPS, default 33 bps = 0.33%)
+// on NET SESSION PROFIT at session settlement instead of per trade. This keeps the
+// per-trade economics clean so the bot can actually clear slippage and make money,
+// while the platform still earns on realized session profit.
+//
+// The prepare path still accepts exitReason for telemetry, but this resolver returns
+// 0 for every trade: no per-trade fee account is ever attached.
 const resolveEffectivePlatformFeeBps = (
-  request: ValidatedJupiterBuildRequest,
-  basePlatformFeeBps: number,
+  _request: ValidatedJupiterBuildRequest,
+  _basePlatformFeeBps: number,
 ): number => {
-  if (request.exitReason && PROFIT_EXIT_FEE_REASONS.has(request.exitReason)) {
-    return basePlatformFeeBps;
-  }
+  // Per-trade platform fee removed. Performance fee is taken at session end.
   return 0;
 };
 
