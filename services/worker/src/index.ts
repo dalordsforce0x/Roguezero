@@ -1298,11 +1298,21 @@ const STABLE_ENTRY_TARGET_MINTS = new Set<string>([
 ]);
 const TOKEN_UNIVERSE_HARD_BLOCKED_MINTS = new Set<string>([
   '4SZjjNABoqhbd4hnapbvoEPEqT8mnNkfbEoAwALf1V8t', // CAVE
+  // Net money-losers over trailing 30d (exit_shadow_decisions). Removed from
+  // the live entry universe because they bleed the SOL/JTO/JUP edge:
+  'MEW1gQWJ3nEXg2qgERiKu7FAFj79PHvQVREQUzScPP5', // MEW  -153 bps
+  'mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So', // MSOL -115 bps
+  '85VBFQZC9TZkfaptBWjvUw7YbZjy52A6mjtPGjstQAmQ', // W    -94 bps
+  'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263', // BONK -30 bps
 ]);
 const TOKEN_UNIVERSE_HARD_BLOCKED_SYMBOLS = new Set<string>([
   'CAVE',
   'APPLE',
   'USELESS',
+  'MEW',
+  'MSOL',
+  'W',
+  'BONK',
 ]);
 
 // Correlation clusters for diversification. Tokens in the same cluster move
