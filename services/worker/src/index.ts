@@ -322,13 +322,24 @@ const WORKER_SELL_IMPACT_CACHE_TTL_MS = Number(process.env.WORKER_SELL_IMPACT_CA
 const WORKER_DEMOTE_AND_SIZE_ENABLED = process.env.WORKER_DEMOTE_AND_SIZE_ENABLED !== 'false';
 const WORKER_DEMOTE_MAX_EXIT_BPS = Number(process.env.WORKER_DEMOTE_MAX_EXIT_BPS ?? 45);
 const WORKER_DEMOTE_SIZE_FLOOR_BPS = Number(process.env.WORKER_DEMOTE_SIZE_FLOOR_BPS ?? 3000);
-// Per-trade economic floor: the smallest entry notional that can clear the fixed-cost gate.
-// A trade below this size amortizes the fixed network cost over too little notional and always
-// fails entry_leg_cost_too_high. USDC entries already enforce a $5 floor; SOL entries had none,
-// so SOL-funded sessions churned sub-economic trades forever. When enabled (canary-scoped until
-// graduated) the final entry size is clamped UP to this floor if affordable, else the trade skips.
+// Per-trade economic floor: the smallest entry notional that can clear the cost gate. A trade below
+// this size amortizes the per-swap network cost over too little notional and always fails
+// entry_leg_cost_too_high. The floor is NOT a hardcoded dollar amount (both the SOL price and the
+// priority-fee-driven network cost move constantly); it is derived live every trade from the most
+// recent measured network cost and the live cost cap. When enabled (canary-scoped until graduated)
+// the entry is clamped UP to this floor if affordable, else the trade skips (fees too high to trade).
 const WORKER_ENTRY_ECONOMIC_FLOOR_ENABLED = process.env.WORKER_ENTRY_ECONOMIC_FLOOR_ENABLED !== 'false';
-const WORKER_MIN_ENTRY_NOTIONAL_USD = Number(process.env.WORKER_MIN_ENTRY_NOTIONAL_USD ?? 5);
+// Headroom over the bare break-even size so normal priority-fee variance does not immediately push a
+// just-economic trade back over the cost cap. 15000 bps = 1.5x. This is a safety margin, not a
+// price/cost guess  the floor itself is derived from the measured network cost below.
+const WORKER_ENTRY_COST_HEADROOM_BPS = Number(process.env.WORKER_ENTRY_COST_HEADROOM_BPS ?? 15000);
+// Startup seed for the fleet-wide measured network cost, in lamports. Immediately overwritten by the
+// first real prepare response, so it only governs the first few seconds after a worker restart.
+const WORKER_NETWORK_COST_SEED_LAMPORTS = Number(process.env.WORKER_NETWORK_COST_SEED_LAMPORTS ?? 250_000);
+// Most recent network cost (base fee + priority fee + tip, plus ATA rent when a new token account is
+// genuinely needed) measured from a live prepare response. Shared fleet-wide in this single worker
+// process; busy sessions keep it fresh. Drives the live economic entry floor.
+let recentNetworkCostLamports = WORKER_NETWORK_COST_SEED_LAMPORTS;
 // Step 4 (real exec, Noah-only, default OFF): when enabled + canary-scoped, the worker may sell a
 // token-class fraction of a position that has cleared its honest-break-even partial-TP trigger,
 // but only when no hard exit (stop/TP/reversal) is competing that cycle. One partial per position.
@@ -4874,19 +4885,24 @@ const getUsdValueFromAtomicAmount = (mint: string, amountAtomic: number): number
 // the fixed per-swap cost cannot be amortized under the entry cost cap, so the trade is guaranteed
 // to fail the cost gate. Returns 0 when the SOL price is unknown (caller then leaves size untouched).
 const entryEconomicFloorAtomic = (inputMint: string): number => {
-  const usd = WORKER_MIN_ENTRY_NOTIONAL_USD;
-  if (usd <= 0) {
+  const capBps = MAX_QUOTE_PRICE_IMPACT_BPS;
+  if (capBps <= 0 || recentNetworkCostLamports <= 0) {
     return 0;
   }
-  if (inputMint === USDC_MINT) {
-    return Math.floor(usd * USDC_ATOMIC_PER_USD);
-  }
+  // Smallest trade whose measured network cost amortizes under the cost cap, with headroom for fee
+  // variance. For a SOL-funded entry the SOL price cancels (cost and notional are both in SOL), so
+  // this self-adjusts to priority-fee spikes with no price input: minLamports = cost * headroom / cap.
+  const minSolLamports = (recentNetworkCostLamports * WORKER_ENTRY_COST_HEADROOM_BPS) / capBps;
   if (inputMint === SOL_MINT) {
+    return Math.ceil(minSolLamports);
+  }
+  if (inputMint === USDC_MINT) {
     const solUsd = lastPythSolSample?.usdPrice ?? lastJupiterSolSample?.usdPrice ?? 0;
     if (solUsd <= 0) {
       return 0;
     }
-    return Math.floor((usd / solUsd) * 1_000_000_000);
+    const minNotionalUsd = (minSolLamports / 1_000_000_000) * solUsd;
+    return Math.ceil(minNotionalUsd * USDC_ATOMIC_PER_USD);
   }
   return 0;
 };
@@ -8425,23 +8441,27 @@ const executeTrade = async (session: RawSession): Promise<void> => {
     const economicFloorAtomic = entryEconomicFloorAtomic(entryInventory.inputMint);
     if (economicFloorAtomic > 0) {
       const preFloorAmount = entryInventory.amountAtomic ?? 0;
-      const affordableFloor = Math.min(economicFloorAtomic, entryInventory.maxTradeAtomic);
-      if (preFloorAmount > 0 && preFloorAmount < affordableFloor) {
-        if (affordableFloor <= entryInventory.tradableAtomic) {
+      // Only act when the entry is sub-economic. Require reaching the FULL headroom floor: if it does
+      // not fit under both the max-trade cap (fee spike) and tradable balance, skip rather than clamp
+      // to a marginal size that sits at the cost cap and churns the edge gate.
+      const floorFits = economicFloorAtomic <= entryInventory.maxTradeAtomic
+        && economicFloorAtomic <= entryInventory.tradableAtomic;
+      if (preFloorAmount > 0 && preFloorAmount < economicFloorAtomic) {
+        if (floorFits) {
           log(
             'info',
             session.id,
-            `entry economic floor ${economicFloorActive ? 'apply' : 'shadow'}: ${entryInventory.inputSymbol}->${entryInventory.outputSymbol} amount ${preFloorAmount} -> ${affordableFloor} floor=${economicFloorAtomic} (${WORKER_MIN_ENTRY_NOTIONAL_USD}) sub-economic clamp`,
+            `entry economic floor ${economicFloorActive ? 'apply' : 'shadow'}: ${entryInventory.inputSymbol}->${entryInventory.outputSymbol} amount ${preFloorAmount} -> ${economicFloorAtomic} floor=${economicFloorAtomic} (cost=${recentNetworkCostLamports}lamports cap=${MAX_QUOTE_PRICE_IMPACT_BPS}bps) sub-economic clamp`,
           );
           if (economicFloorActive) {
-            entryInventory.amountAtomic = affordableFloor;
-            entryInventory.riskAdjustedAmountAtomic = affordableFloor;
+            entryInventory.amountAtomic = economicFloorAtomic;
+            entryInventory.riskAdjustedAmountAtomic = economicFloorAtomic;
           }
         } else if (economicFloorActive) {
           log(
             'info',
             session.id,
-            `entry blocked: economic floor ${economicFloorAtomic} (${WORKER_MIN_ENTRY_NOTIONAL_USD}) exceeds tradable ${entryInventory.tradableAtomic} for ${entryInventory.inputSymbol}; cannot place an economic trade`,
+            `entry blocked: economic floor ${economicFloorAtomic} (cost=${recentNetworkCostLamports}lamports, fees too high to trade economically) exceeds tradable ${entryInventory.tradableAtomic} for ${entryInventory.inputSymbol}`,
           );
           await persistTradeDecision(session, 'blocked', 'entry_below_economic_floor');
           await persistLastTradeGate(session, {
@@ -8719,6 +8739,10 @@ const executeTrade = async (session: RawSession): Promise<void> => {
       }
     }
 
+    const observedNetworkCostLamports = Number(prepare.data.costs?.estimatedNetworkCostLamports ?? 0);
+    if (Number.isFinite(observedNetworkCostLamports) && observedNetworkCostLamports > 0) {
+      recentNetworkCostLamports = observedNetworkCostLamports;
+    }
     economics = buildTradeEconomics({
       tradeAmountAtomic: tradeAmount,
       inputMint: tradePlan.inventory.inputMint,
