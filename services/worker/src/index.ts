@@ -315,6 +315,13 @@ const WORKER_EXIT_EXPECTED_SLIPPAGE_BPS = Number(process.env.WORKER_EXIT_EXPECTE
 const WORKER_SELL_IMPACT_CAP_ENABLED = process.env.WORKER_SELL_IMPACT_CAP_ENABLED !== 'false';
 const WORKER_MAX_ENTRY_SELL_IMPACT_BPS = Number(process.env.WORKER_MAX_ENTRY_SELL_IMPACT_BPS ?? 12);
 const WORKER_SELL_IMPACT_CACHE_TTL_MS = Number(process.env.WORKER_SELL_IMPACT_CACHE_TTL_MS ?? 600000);
+// Demote-and-size (AlphaPy pattern, Noah-gated via feature key 'demote_and_size'). Replaces the
+// hard sell-impact block with size-down: a token whose measured exit cost sits between the
+// full-size cap and the hard ceiling is entered at a reduced size (cap / exitCost, floored)
+// instead of being rejected. Tokens above the hard ceiling are still blocked (real exit walls).
+const WORKER_DEMOTE_AND_SIZE_ENABLED = process.env.WORKER_DEMOTE_AND_SIZE_ENABLED !== 'false';
+const WORKER_DEMOTE_MAX_EXIT_BPS = Number(process.env.WORKER_DEMOTE_MAX_EXIT_BPS ?? 45);
+const WORKER_DEMOTE_SIZE_FLOOR_BPS = Number(process.env.WORKER_DEMOTE_SIZE_FLOOR_BPS ?? 3000);
 // Step 4 (real exec, Noah-only, default OFF): when enabled + canary-scoped, the worker may sell a
 // token-class fraction of a position that has cleared its honest-break-even partial-TP trigger,
 // but only when no hard exit (stop/TP/reversal) is competing that cycle. One partial per position.
@@ -1315,6 +1322,18 @@ let lastTokenUniverseMetadataSignature: string | null = null;
 const universeSortProbeTaker = process.env.WORKER_UNIVERSE_PROBE_TAKER?.trim()
   || '11111111111111111111111111111111';
 const tokenUniverseSymbolByMint = new Map<string, string>();
+type TokenUniverseMeta = {
+  isVerified: boolean | null;
+  organicScore: number | null;
+  liquidityUsd: number | null;
+  volume24hUsd: number | null;
+  mcapUsd: number | null;
+  holderCount: number | null;
+  topHoldersPct: number | null;
+  priceChange1hPct: number | null;
+  priceChange24hPct: number | null;
+};
+const tokenUniverseMetaByMint = new Map<string, TokenUniverseMeta>();
 const latestJupiterUsdByMint = new Map<string, number>();
 // Mints currently held as positions across active sessions. The price poll
 // adds these to its fetch list so EVERY held token (including re-tracked
@@ -1468,6 +1487,15 @@ type TokenUniverseRow = {
   symbol: string | null;
   enabled: boolean;
   notes: string | null;
+  is_verified: boolean | null;
+  organic_score: number | string | null;
+  liquidity_usd: number | string | null;
+  volume_24h_usd: number | string | null;
+  mcap_usd: number | string | null;
+  holder_count: number | string | null;
+  top_holders_pct: number | string | null;
+  price_change_1h_pct: number | string | null;
+  price_change_24h_pct: number | string | null;
 };
 
 const isApprovedUniverseRow = (row: TokenUniverseRow) => {
@@ -3322,7 +3350,21 @@ const refreshTokenUniverseMints = async (force = false) => {
     const notesSelect = notesColumn && isSafeSqlIdentifier(notesColumn)
       ? `, ${notesColumn}::text AS notes`
       : `, NULL::text AS notes`;
-    const query = `SELECT ${mintColumn}::text AS mint${symbolSelect}${enabledSelect}${notesSelect}
+    const metaSelect = (col: string, cast: string) =>
+      columns.has(col) && isSafeSqlIdentifier(col)
+        ? `, ${col}::${cast} AS ${col}`
+        : `, NULL::${cast} AS ${col}`;
+    const metadataSelect =
+      metaSelect('is_verified', 'boolean')
+      + metaSelect('organic_score', 'numeric')
+      + metaSelect('liquidity_usd', 'numeric')
+      + metaSelect('volume_24h_usd', 'numeric')
+      + metaSelect('mcap_usd', 'numeric')
+      + metaSelect('holder_count', 'numeric')
+      + metaSelect('top_holders_pct', 'numeric')
+      + metaSelect('price_change_1h_pct', 'numeric')
+      + metaSelect('price_change_24h_pct', 'numeric');
+    const query = `SELECT ${mintColumn}::text AS mint${symbolSelect}${enabledSelect}${notesSelect}${metadataSelect}
                      FROM public.${selectedTable}
                      ${whereClause}
                      ${orderClause}
@@ -3340,6 +3382,12 @@ const refreshTokenUniverseMints = async (force = false) => {
       ),
     ]);
     tokenUniverseSymbolByMint.clear();
+    tokenUniverseMetaByMint.clear();
+    const parseUniverseNum = (v: unknown): number | null => {
+      if (v === null || v === undefined) return null;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    };
     for (const row of approvedRows) {
       const mint = row.mint ?? '';
       if (!solanaPublicKeyPattern.test(mint)) continue;
@@ -3348,6 +3396,17 @@ const refreshTokenUniverseMints = async (force = false) => {
       if (symbol && symbol.length > 0) {
         tokenUniverseSymbolByMint.set(mint, symbol.toUpperCase());
       }
+      tokenUniverseMetaByMint.set(mint, {
+        isVerified: typeof row.is_verified === 'boolean' ? row.is_verified : null,
+        organicScore: parseUniverseNum(row.organic_score),
+        liquidityUsd: parseUniverseNum(row.liquidity_usd),
+        volume24hUsd: parseUniverseNum(row.volume_24h_usd),
+        mcapUsd: parseUniverseNum(row.mcap_usd),
+        holderCount: parseUniverseNum(row.holder_count),
+        topHoldersPct: parseUniverseNum(row.top_holders_pct),
+        priceChange1hPct: parseUniverseNum(row.price_change_1h_pct),
+        priceChange24hPct: parseUniverseNum(row.price_change_24h_pct),
+      });
     }
     tokenUniverseSourceTable = selectedTable;
     tokenUniverseTableMeta = {
@@ -8303,6 +8362,33 @@ const executeTrade = async (session: RawSession): Promise<void> => {
       );
     }
 
+    // Demote-and-size: shrink the entry by measured exit cost instead of hard-blocking it.
+    // Tokens whose recent sell-side impact sits between the full-size cap and the hard ceiling
+    // enter at a reduced size of (cap / exitCost), floored. Canary-scoped (Noah) until graduated;
+    // always computed for shadow telemetry so the fleet line shows what it WOULD do.
+    const demoteSizingActive = isFeatureActiveForSession(session, WORKER_DEMOTE_AND_SIZE_ENABLED, 'demote_and_size');
+    const exitCostBpsForSizing = await getRecentSellImpactBps(entryInventory.outputMint);
+    if (
+      exitCostBpsForSizing !== null
+      && exitCostBpsForSizing > WORKER_MAX_ENTRY_SELL_IMPACT_BPS
+      && exitCostBpsForSizing < WORKER_DEMOTE_MAX_EXIT_BPS
+    ) {
+      const rawDemoteMultBps = Math.round((WORKER_MAX_ENTRY_SELL_IMPACT_BPS / exitCostBpsForSizing) * 10_000);
+      const demoteMultBps = Math.min(10_000, Math.max(WORKER_DEMOTE_SIZE_FLOOR_BPS, rawDemoteMultBps));
+      const preDemoteAmount = entryInventory.amountAtomic ?? 0;
+      const demotedAmount = Math.floor((preDemoteAmount * demoteMultBps) / 10_000);
+      const demoteBelowMin = demotedAmount < entryInventory.minTradeAtomic;
+      log(
+        'info',
+        session.id,
+        `demote-and-size ${demoteSizingActive ? 'apply' : 'shadow'}: ${entryInventory.outputSymbol} exitCost=${exitCostBpsForSizing.toFixed(1)}bps mult=${(demoteMultBps / 10_000).toFixed(2)}x base=${preDemoteAmount} would=${demotedAmount}${demoteBelowMin ? ' (below_min_trade=kept_base)' : ''}`,
+      );
+      if (demoteSizingActive && !demoteBelowMin && demotedAmount > 0 && demotedAmount < preDemoteAmount) {
+        entryInventory.amountAtomic = demotedAmount;
+        entryInventory.riskAdjustedAmountAtomic = demotedAmount;
+      }
+    }
+
     const routeStability = await assessEntryRouteStability({
       inputMint: entryInventory.inputMint,
       outputMint: entryInventory.outputMint,
@@ -8395,7 +8481,12 @@ const executeTrade = async (session: RawSession): Promise<void> => {
   ) {
     const entryMint = tradePlan.inventory.outputMint;
     const sellImpactBps = await getRecentSellImpactBps(entryMint);
-    if (sellImpactBps !== null && sellImpactBps > WORKER_MAX_ENTRY_SELL_IMPACT_BPS) {
+    // When demote-and-size is active for this session the exit-cost band is handled by size-down
+    // (above), so the hard block only fires at the higher demote ceiling (the real exit wall).
+    // Normal fleet sessions keep the original full-size cap as the block threshold.
+    const demoteActiveForGate = isFeatureActiveForSession(session, WORKER_DEMOTE_AND_SIZE_ENABLED, 'demote_and_size');
+    const sellImpactBlockBps = demoteActiveForGate ? WORKER_DEMOTE_MAX_EXIT_BPS : WORKER_MAX_ENTRY_SELL_IMPACT_BPS;
+    if (sellImpactBps !== null && sellImpactBps > sellImpactBlockBps) {
       prePrepareEntryGate = {
         allowed: false,
         reason: 'entry_sell_impact_too_high',
@@ -8406,7 +8497,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
       log(
         'info',
         session.id,
-        `sell-impact cap blocked entry: ${tradePlan.inventory.outputSymbol} (${entryMint}) sellImpact=${sellImpactBps.toFixed(1)}bps > cap ${WORKER_MAX_ENTRY_SELL_IMPACT_BPS}bps`,
+        `sell-impact cap blocked entry: ${tradePlan.inventory.outputSymbol} (${entryMint}) sellImpact=${sellImpactBps.toFixed(1)}bps > cap ${sellImpactBlockBps}bps`,
       );
     }
   }
