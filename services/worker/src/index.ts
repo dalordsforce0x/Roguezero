@@ -37,6 +37,7 @@ import {
   getDatabaseConnectionUrl,
   getHeliusRpcUrls,
   getJupiterPriceConfig,
+  getJupiterFeeAccounts,
   getPythPriceConfig,
   getRuntimeSpeedProfile,
   getRuntimeConfigReport,
@@ -297,6 +298,15 @@ const WORKER_GRID_CHOP_SHADOW_ENABLED = process.env.WORKER_GRID_CHOP_SHADOW_ENAB
 // honest break-even telemetry below, NOT by the live exit cost-floor. The live floor still uses the
 // conservative maxSlippage cap; this measures what a partial-TP would net against ACTUAL friction.
 const WORKER_EXIT_EXPECTED_SLIPPAGE_BPS = Number(process.env.WORKER_EXIT_EXPECTED_SLIPPAGE_BPS ?? 15);
+// Hard per-token sell-impact entry cap (verified 2026-06-09). SELL legs slip ~10x BUY
+// legs and the cost is a persistent property of each token's bid depth (flat across our
+// trade size). Tokens we cannot exit cheaply guarantee a net loss regardless of entry
+// signal, so we refuse to enter them. This is a loss-reducer, not an edge source. Default
+// cap 12bps keeps deep names (JUP/RAY/Bonk/KMNO/WBTC/mSOL) and blocks JTO/MEW/long-tail.
+// Noah-gated via feature key 'sell_impact_cap' until proven on a larger live sample.
+const WORKER_SELL_IMPACT_CAP_ENABLED = process.env.WORKER_SELL_IMPACT_CAP_ENABLED !== 'false';
+const WORKER_MAX_ENTRY_SELL_IMPACT_BPS = Number(process.env.WORKER_MAX_ENTRY_SELL_IMPACT_BPS ?? 12);
+const WORKER_SELL_IMPACT_CACHE_TTL_MS = Number(process.env.WORKER_SELL_IMPACT_CACHE_TTL_MS ?? 600000);
 // Step 4 (real exec, Noah-only, default OFF): when enabled + canary-scoped, the worker may sell a
 // token-class fraction of a position that has cleared its honest-break-even partial-TP trigger,
 // but only when no hard exit (stop/TP/reversal) is competing that cycle. One partial per position.
@@ -336,6 +346,15 @@ const WORKER_GRADUATED_FEATURES = new Set(
     .map((s) => s.trim())
     .filter((s) => s.length > 0),
 );
+// Session-end performance fee (user directive): no per-trade platform fee; instead
+// skim WORKER_PERFORMANCE_FEE_BPS of realized SOL profit when funds return to the
+// owner at settlement. Default 33 bps = 0.33%. Enabled by default but gated through
+// the standard graduation mechanism, so it runs Noah-only until 'performance_fee'
+// is added to WORKER_GRADUATED_FEATURES.
+const WORKER_PERFORMANCE_FEE_ENABLED = process.env.WORKER_PERFORMANCE_FEE_ENABLED !== 'false';
+const WORKER_PERFORMANCE_FEE_BPS = Number(process.env.WORKER_PERFORMANCE_FEE_BPS ?? 33);
+const PERFORMANCE_FEE_DESTINATION = getJupiterFeeAccounts(process.env).SOL;
+const PERFORMANCE_FEE_PUBKEY = new PublicKey(PERFORMANCE_FEE_DESTINATION);
 const WORKER_TRENDING_ENTRY_CHASE_LOOKBACK_SAMPLES = Number(process.env.WORKER_TRENDING_ENTRY_CHASE_LOOKBACK_SAMPLES ?? 4);
 const WORKER_TRENDING_ENTRY_MAX_RECENT_SURGE_BPS = Number(process.env.WORKER_TRENDING_ENTRY_MAX_RECENT_SURGE_BPS ?? 80);
 const WORKER_TRENDING_ENTRY_MIN_PULLBACK_BPS = Number(process.env.WORKER_TRENDING_ENTRY_MIN_PULLBACK_BPS ?? 35);
@@ -451,6 +470,56 @@ const getTokenUniversePool = () => {
   if (tokenUniversePool) return tokenUniversePool;
   tokenUniversePool = getPool();
   return tokenUniversePool;
+};
+
+// Rolling per-token SELL-side price impact (bps), measured from confirmed sells
+// (token -> USDC/SOL) over the trailing window. Refreshed on a TTL so the entry
+// cap reflects current bid-side liquidity without a hot-path quote. Tokens with no
+// recent sell history return null (unknown) and are NOT blocked, so the bot can
+// still take a first trade and learn the token's real exit cost.
+const sellImpactByMint = new Map<string, number>();
+let sellImpactLoadedAt = 0;
+let sellImpactRefreshPromise: Promise<void> | null = null;
+
+const refreshSellImpactCache = async (): Promise<void> => {
+  if (sellImpactRefreshPromise) return sellImpactRefreshPromise;
+  sellImpactRefreshPromise = (async () => {
+    try {
+      const result = await getPool().query<{ mint: string; imp: string }>(
+        `SELECT input_mint AS mint,
+                avg((build_response->>'priceImpactPct')::numeric * 10000) AS imp
+           FROM swap_executions
+          WHERE status = 'confirmed'
+            AND created_at > now() - interval '7 days'
+            AND build_response->>'priceImpactPct' IS NOT NULL
+            AND output_mint = ANY($1::text[])
+            AND NOT (input_mint = ANY($1::text[]))
+          GROUP BY input_mint`,
+        [[USDC_MINT, SOL_MINT]],
+      );
+      sellImpactByMint.clear();
+      for (const row of result.rows) {
+        const imp = Number(row.imp);
+        if (Number.isFinite(imp)) sellImpactByMint.set(row.mint, imp);
+      }
+      sellImpactLoadedAt = Date.now();
+    } finally {
+      sellImpactRefreshPromise = null;
+    }
+  })();
+  return sellImpactRefreshPromise;
+};
+
+const getRecentSellImpactBps = async (mint: string): Promise<number | null> => {
+  if (Date.now() - sellImpactLoadedAt > WORKER_SELL_IMPACT_CACHE_TTL_MS) {
+    try {
+      await refreshSellImpactCache();
+    } catch (err) {
+      log('warn', 'sell-impact', `failed to refresh sell-impact cache: ${String(err)}`);
+    }
+  }
+  const imp = sellImpactByMint.get(mint);
+  return imp === undefined ? null : imp;
 };
 
 // â”€â”€ Solana connection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -8047,7 +8116,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
   let observedPriceImpactBps: number | null = null;
   const forceExitExecution = shouldForceExitExecution(tradePlan.direction, tradePlan.exitReason);
 
-  const prePrepareEntryGate = computePrePrepareEntryGate({
+  let prePrepareEntryGate = computePrePrepareEntryGate({
     direction: tradePlan.direction,
     signalMomentumBps: tradePlan.signalSnapshot.momentumBps,
     signalThresholdBps: tradePlan.signalSnapshot.strategy === 'momentum'
@@ -8064,6 +8133,34 @@ const executeTrade = async (session: RawSession): Promise<void> => {
       ? (WORKER_EXIT_EXPECTED_SLIPPAGE_BPS + Number(session.service_control.platformFeeBps ?? 0)) * 2
       : 0,
   });
+
+  // Hard per-token sell-impact entry cap. Independent of momentum (momentum magnitude
+  // is not calibrated to forward bps, so it cannot gate cost). If a token's recent
+  // sell-side impact exceeds the cap we refuse to enter it, because the exit leg alone
+  // guarantees a net loss. Unknown tokens (no recent sell history) are allowed through
+  // so the bot can take a first trade and measure the real exit cost. Noah-gated.
+  if (
+    tradePlan.direction === 'enter_long'
+    && (!prePrepareEntryGate || prePrepareEntryGate.allowed)
+    && isFeatureActiveForSession(session, WORKER_SELL_IMPACT_CAP_ENABLED, 'sell_impact_cap')
+  ) {
+    const entryMint = tradePlan.inventory.outputMint;
+    const sellImpactBps = await getRecentSellImpactBps(entryMint);
+    if (sellImpactBps !== null && sellImpactBps > WORKER_MAX_ENTRY_SELL_IMPACT_BPS) {
+      prePrepareEntryGate = {
+        allowed: false,
+        reason: 'entry_sell_impact_too_high',
+        expectedEdgeBps: 0,
+        estimatedCostBps: Math.round(sellImpactBps),
+        safetyBufferBps: 0,
+      };
+      log(
+        'info',
+        session.id,
+        `sell-impact cap blocked entry: ${tradePlan.inventory.outputSymbol} (${entryMint}) sellImpact=${sellImpactBps.toFixed(1)}bps > cap ${WORKER_MAX_ENTRY_SELL_IMPACT_BPS}bps`,
+      );
+    }
+  }
 
   if (tradePlan.direction === 'enter_long') {
     log(
@@ -9458,12 +9555,50 @@ const sweepFunds = async (session: RawSession): Promise<SweepResult> => {
     confirmationSettled = confirmationSettled || settled;
   }
 
-  if (solToSend > 0) {
-    log('info', session.id, `queuing SOL sweep: ${solToSend} lamports -> ${ownerWallet}`);
-    const settled = await sendSweepBatch(
-      [SystemProgram.transfer({ fromPubkey: sessionPubkey, toPubkey: ownerPubkey, lamports: solToSend })],
-      'SOL sweep',
-    );
+  // ── Session-end performance fee ─────────────────────────────────────────
+  // Per user directive: no per-trade platform fee; instead skim a small fee on
+  // realized session profit at settlement. Worker funding is SOL-only, so realized
+  // profit = SOL returning to the owner above the originally funded baseline. We
+  // only ever skim profit (principal is never touched; no profit => no fee), and the
+  // skim rides in the same SOL-sweep tx so it adds no extra tx-fee reserve. Rolled
+  // out Noah-first via the standard graduation gate ('performance_fee').
+  let performanceFeeLamports = 0;
+  if (
+    solToSend > 0
+    && WORKER_PERFORMANCE_FEE_BPS > 0
+    && isFeatureActiveForSession(session, WORKER_PERFORMANCE_FEE_ENABLED, 'performance_fee')
+  ) {
+    const fundedBaselineLamports = Number(session.funding?.startingBalanceAtomic ?? '0');
+    const realizedProfitLamports = solToSend - fundedBaselineLamports;
+    // Require a known positive funded baseline: if it is 0/unknown we cannot tell
+    // principal from profit, so we skip the fee rather than risk skimming principal.
+    if (Number.isFinite(fundedBaselineLamports) && fundedBaselineLamports > 0 && realizedProfitLamports > 0) {
+      const rawFee = Math.floor((realizedProfitLamports * WORKER_PERFORMANCE_FEE_BPS) / 10_000);
+      // Clamp so the fee can never exceed realized profit (owner always keeps principal).
+      performanceFeeLamports = Math.max(0, Math.min(rawFee, realizedProfitLamports));
+    }
+  }
+
+  const solToOwner = solToSend - performanceFeeLamports;
+
+  if (solToOwner > 0) {
+    const solSweepIxs: TransactionInstruction[] = [
+      SystemProgram.transfer({ fromPubkey: sessionPubkey, toPubkey: ownerPubkey, lamports: solToOwner }),
+    ];
+    if (performanceFeeLamports > 0) {
+      solSweepIxs.push(SystemProgram.transfer({
+        fromPubkey: sessionPubkey,
+        toPubkey: PERFORMANCE_FEE_PUBKEY,
+        lamports: performanceFeeLamports,
+      }));
+      log(
+        'info',
+        session.id,
+        `performance fee ${performanceFeeLamports} lamports (${WORKER_PERFORMANCE_FEE_BPS}bps of ${solToSend - Number(session.funding?.startingBalanceAtomic ?? '0')} realized SOL profit) -> ${PERFORMANCE_FEE_DESTINATION}`,
+      );
+    }
+    log('info', session.id, `queuing SOL sweep: ${solToOwner} lamports -> ${ownerWallet}`);
+    const settled = await sendSweepBatch(solSweepIxs, 'SOL sweep');
     confirmationSettled = confirmationSettled || settled;
   }
 
