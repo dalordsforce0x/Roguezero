@@ -4077,7 +4077,9 @@ const activateSession = async (session: RawSession): Promise<void> => {
   let solBalance = await rlGetBalance(keypair.publicKey).catch(() => 0);
   let usdcBalance = await getTokenBalanceAtomic(keypair.publicKey, USDC_MINT, TOKEN_PROGRAM_ID).catch(() => 0);
 
-  if (usdcBalance < MIN_USDC_ENTRY_ATOMIC) {
+  const useUsdcBase = sessionUsesUsdcBase(session);
+
+  if (useUsdcBase && usdcBalance < MIN_USDC_ENTRY_ATOMIC) {
     const lamportsToConvert = computeSolToUsdcConversionLamports(solBalance);
     if (lamportsToConvert < MIN_TRADEABLE_LAMPORTS) {
       log(
@@ -4107,14 +4109,23 @@ const activateSession = async (session: RawSession): Promise<void> => {
   }
 
   const now = new Date().toISOString();
-  await mergeFundingPatch(session, {
-    fundingMint: USDC_MINT,
-    fundingTokenSymbol: 'USDC',
-    startingBalanceAtomic: String(usdcBalance),
-    currentBalanceAtomic: String(usdcBalance),
-  });
+  if (useUsdcBase) {
+    await mergeFundingPatch(session, {
+      fundingMint: USDC_MINT,
+      fundingTokenSymbol: 'USDC',
+      startingBalanceAtomic: String(usdcBalance),
+      currentBalanceAtomic: String(usdcBalance),
+    });
+  } else {
+    await mergeFundingPatch(session, {
+      fundingMint: SOL_MINT,
+      fundingTokenSymbol: 'SOL',
+      startingBalanceAtomic: String(solBalance),
+      currentBalanceAtomic: String(solBalance),
+    });
+  }
   await setSessionStatus(session.id, 'active', { started_at: now }, { expectedStatuses: ['starting'] });
-  log('info', session.id, `starting → active, USDC base trading begins (usdc=${usdcBalance}, solReserve=${solBalance})`);
+  log('info', session.id, `starting → active, ${useUsdcBase ? 'USDC' : 'SOL'} base trading begins (usdc=${usdcBalance}, sol=${solBalance})`);
 };
 
 // â”€â”€ Trade execution â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -5003,6 +5014,17 @@ const getSessionProfitHandling = (session: RawSession) => (
   }
 );
 
+// The session's trading base currency is driven by the user's profit setting:
+//   - take profits in USDC (send_to_owner + USDC) -> USDC base (idle capital parks
+//     in USDC; the "usdc swap protection"). Exits settle to USDC, payouts send USDC.
+//   - compound OR take profits in SOL -> SOL base. Capital stays native SOL, exits
+//     settle back to SOL, and the session returns SOL with no USDC round-trip.
+// Compound implies a SOL return by default, so payoutToken is ignored when compounding.
+const sessionUsesUsdcBase = (session: RawSession): boolean => {
+  const handling = getSessionProfitHandling(session);
+  return handling.mode === 'send_to_owner' && handling.payoutToken === 'USDC';
+};
+
 // Swap a fixed amount of the session wallet's SOL into USDC via the Jupiter prepare/sign/submit
 // flow. Used for USDC-base activation and for USDC profit payouts. Returns true once the swap
 // confirms and the USDC balance is available.
@@ -5253,6 +5275,12 @@ const maybeTopUpTradingCapitalFromSol = async (
   keypair: Keypair,
   solBalanceLamports: number,
 ): Promise<number> => {
+  // SOL-base sessions (compound / take-profits-in-SOL) keep native SOL as their
+  // trading capital, so it must never be swept into USDC. Only USDC-base sessions
+  // treat idle SOL above the gas reserve as deployable trading capital.
+  if (session.funding.fundingMint !== USDC_MINT) {
+    return solBalanceLamports;
+  }
   const excessLamports = solBalanceLamports - CAPITAL_TOPUP_KEEP_LAMPORTS;
   if (excessLamports < CAPITAL_TOPUP_MIN_EXCESS_LAMPORTS) {
     // Common "no idle SOL" case stays quiet to avoid per-loop log spam.
@@ -7229,11 +7257,13 @@ const executeTrade = async (session: RawSession): Promise<void> => {
         ? Math.max(0, Math.floor((fullExitAmountLamports * Math.min(selectedExit.partialFractionBps, WORKER_PARTIAL_TP_MAX_FRACTION_BPS)) / 10000))
         : fullExitAmountLamports;
 
+      const exitBaseMint = session.funding.fundingMint === USDC_MINT ? USDC_MINT : SOL_MINT;
+      const exitBaseSymbol = exitBaseMint === USDC_MINT ? 'USDC' : 'SOL';
       const sellInventory: TradeInventoryContext = {
         inputMint: positionMint,
         inputSymbol: positionSymbol,
-        outputMint: USDC_MINT,
-        outputSymbol: 'USDC',
+        outputMint: exitBaseMint,
+        outputSymbol: exitBaseSymbol,
         balanceAtomic: exitWalletBalanceAtomic,
         reserveAtomic: exitReserveAtomic,
         tradableAtomic: exitTradableAtomic,
