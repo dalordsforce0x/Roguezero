@@ -3800,9 +3800,10 @@ app.post('/sessions', { config: { rateLimit: { max: 5, timeWindow: '1 minute' } 
   const sessionWallet = sessionKeypair.publicKey.toBase58();
   const now = new Date().toISOString();
   const id = randomUUID();
-  const platformFeeBps = configReport.schemaValid
-    ? (process.env.JUPITER_PLATFORM_FEE_BPS ? Number(process.env.JUPITER_PLATFORM_FEE_BPS) : 30)
-    : 30;
+  // Per-trade platform fee is disabled (resolveEffectivePlatformFeeBps returns 0 for every trade).
+  // The worker uses this stored value in exit-cost-floor math, so a stale non-zero value here
+  // inflates the cost floor and makes take-profits unreachable. Keep it 0 to match real cost.
+  const platformFeeBps = 0;
   const normalizedTargetDurationMinutes = Number.isFinite(req.targetDurationMinutes) && req.targetDurationMinutes >= 1
     ? req.targetDurationMinutes
     : 0;
