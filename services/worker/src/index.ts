@@ -6098,11 +6098,13 @@ const evaluateExitTrigger = (
   }
 
   // Signal-reversal exits LOCK IN profit when the trend flips against an open
-  // position. They must never dump an underwater bag at a fee loss -- that path
-  // booked a small realized loss on every reversal. When the position is not yet
-  // profitable we hold and let stop_loss own the downside (it only fires past the
-  // full round-trip cost floor) and take_profit own the upside.
-  if (signalSnapshot.regime === 'bearish' && pnlBps !== null && pnlBps > 0) {
+  // position. The old `pnlBps > 0` gate fired on ANY positive gross mark, so every
+  // reversal that closed between +1bps and the exit cost floor realized a NET loss
+  // (exit fee + slippage exceeded the tiny gross gain). This was the most frequent
+  // exit in production and the dominant bleed. Require the gross gain to clear the
+  // exit cost floor so a reversal only fires when it locks in genuine NET profit;
+  // otherwise hold and let stop_loss own the downside and take_profit own the upside.
+  if (signalSnapshot.regime === 'bearish' && pnlBps !== null && pnlBps > thresholds.costFloorBps) {
     return {
       shouldExit: true,
       reason: 'signal_reversal',
