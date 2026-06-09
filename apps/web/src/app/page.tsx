@@ -2464,33 +2464,38 @@ export default function Home() {
 
               <button
                 type="button"
-                onClick={() => setProfitModeChoice('compound')}
+                onClick={() => {
+                  setProfitModeChoice('compound');
+                  setProfitPayoutTokenChoice('SOL');
+                }}
                 className={`rounded border px-3 py-2 text-left transition ${profitModeChoice === 'compound'
                   ? 'border-cyan-300/35 bg-cyan-500/12 text-cyan-100'
                   : 'border-white/10 bg-white/3 text-gray-300 hover:border-cyan-300/20 hover:text-cyan-100'}`}
               >
                 <div className="text-xs uppercase tracking-[0.16em]">Compound</div>
-                <div className="mt-1 text-xs text-gray-300">Leaves realized profits in the bot wallet so the strategy can continue trading with a larger balance.</div>
+                <div className="mt-1 text-xs text-gray-300">Leaves realized profits in the bot wallet so the strategy can continue trading with a larger balance. Profits return as SOL.</div>
               </button>
             </div>
 
-            <div className="mt-4">
-              <div className="text-[10px] uppercase tracking-[0.2em] text-gray-400">profit payout token</div>
-              <div className="mt-2 flex gap-2">
-                {(['USDC', 'SOL'] as const).map((token) => (
-                  <button
-                    key={token}
-                    type="button"
-                    onClick={() => setProfitPayoutTokenChoice(token)}
-                    className={`rounded border px-3 py-1.5 text-xs transition ${profitPayoutTokenChoice === token
-                      ? 'border-cyan-300/35 bg-cyan-500/12 text-cyan-100'
-                      : 'border-white/10 bg-white/3 text-gray-300 hover:border-cyan-300/20 hover:text-cyan-100'}`}
-                  >
-                    {token}
-                  </button>
-                ))}
+            {profitModeChoice !== 'compound' && (
+              <div className="mt-4">
+                <div className="text-[10px] uppercase tracking-[0.2em] text-gray-400">profit payout token</div>
+                <div className="mt-2 flex gap-2">
+                  {(['USDC', 'SOL'] as const).map((token) => (
+                    <button
+                      key={token}
+                      type="button"
+                      onClick={() => setProfitPayoutTokenChoice(token)}
+                      className={`rounded border px-3 py-1.5 text-xs transition ${profitPayoutTokenChoice === token
+                        ? 'border-cyan-300/35 bg-cyan-500/12 text-cyan-100'
+                        : 'border-white/10 bg-white/3 text-gray-300 hover:border-cyan-300/20 hover:text-cyan-100'}`}
+                    >
+                      {token}
+                    </button>
+                  ))}
+                </div>
               </div>
-            </div>
+            )}
 
             <div className="mt-5 flex justify-end gap-2">
               <button
