@@ -6872,29 +6872,44 @@ const executeTrade = async (session: RawSession): Promise<void> => {
   let positionsState = await refreshPositionsMarks(session, getPositionsState(session));
   let positionState = summarizePositionsState(positionsState, session.service_control.positionState ?? undefined);
 
-  // Recovery guard: older funding flow could incorrectly mark a session as
-  // long position before any submitted trade exists. Reset to flat so entry logic
-  // can run normally.
+  // Recovery guard: an older funding flow could mark a session 'long' before any
+  // real buy executed. Such bootstrap phantoms carry NO tracked quantity. Clear
+  // ONLY those zero-quantity phantoms here — never positions that hold a real
+  // tracked balance. Wiping real positions to {} (the old behavior) orphaned the
+  // on-chain tokens out of tracking: they became invisible to PnL and were never
+  // sold. Positions whose tokens are genuinely gone on-chain are dropped by the
+  // wallet-truth reconcile below, which checks the chain instead of guessing.
   if (
     countOpenPositions(positionsState) > 0
     && !session.service_control.schedulingState?.lastTradeSubmittedAt
   ) {
-    const markedAt = new Date().toISOString();
-    const markedPriceUsd = positionState.lastMarkedPriceUsd ?? lastPythSolSample?.usdPrice ?? null;
+    const realPositions = Object.fromEntries(
+      Object.entries(positionsState.positions).filter(([, position]) => {
+        const qty = Number(position.quantityAtomic ?? 0);
+        return Number.isFinite(qty) && qty > 0;
+      }),
+    );
 
-    positionsState = await persistPositionsState(session, {
-      activePositionMint: null,
-      positions: {},
-    }, {
-      lastMarkedPriceUsd: markedPriceUsd,
-      lastMarkedAt: markedAt,
-    });
+    if (Object.keys(realPositions).length !== Object.keys(positionsState.positions).length) {
+      const markedAt = new Date().toISOString();
+      const markedPriceUsd = positionState.lastMarkedPriceUsd ?? lastPythSolSample?.usdPrice ?? null;
 
-    positionState = summarizePositionsState(positionsState, {
-      lastMarkedPriceUsd: markedPriceUsd,
-      lastMarkedAt: markedAt,
-    });
-    log('warn', session.id, 'recovered inconsistent bootstrap position state (long without submitted trade)');
+      positionsState = await persistPositionsState(session, {
+        activePositionMint: positionsState.activePositionMint && realPositions[positionsState.activePositionMint]
+          ? positionsState.activePositionMint
+          : null,
+        positions: realPositions,
+      }, {
+        lastMarkedPriceUsd: markedPriceUsd,
+        lastMarkedAt: markedAt,
+      });
+
+      positionState = summarizePositionsState(positionsState, {
+        lastMarkedPriceUsd: markedPriceUsd,
+        lastMarkedAt: markedAt,
+      });
+      log('warn', session.id, 'cleared zero-quantity bootstrap position phantom (kept real on-chain holdings)');
+    }
   }
 
   const strategyConfig = getSessionStrategyConfig(session);
@@ -6999,10 +7014,48 @@ const executeTrade = async (session: RawSession): Promise<void> => {
 
   let openPositions = listOpenPositions(positionsState);
 
-  if (openPositions.length > 0) {
+  // ---------------------------------------------------------------------------
+  // Wallet-truth reconcile. positionsState MUST mirror what the session wallet
+  // actually holds on-chain so the database, admin views, and the user UI never
+  // diverge from reality. This runs every cycle and is bidirectional:
+  //   * DROP tracked positions whose tokens are gone on-chain (sold/dust) so we
+  //     stop reporting phantom holdings.
+  //   * RE-TRACK on-chain tokens that are NOT tracked (orphans) so they become
+  //     visible, get valued, and the exit path can manage them. Without this a
+  //     token that ever left tracking while a real balance remained was lost
+  //     forever (invisible to PnL, never sold).
+  // Base/gas currencies (the funding mint, SOL, USDC) are managed by the capital
+  // and gas keep-alive logic, not as tradeable positions, so they are excluded.
+  {
+    const fundingMint = session.funding.fundingMint;
+    const currencyMints = new Set<string>([fundingMint, SOL_MINT, USDC_MINT]);
+    const ORPHAN_RECOVERY_MIN_USD = Number(process.env.WORKER_ORPHAN_RECOVERY_MIN_USD ?? 0.5);
+
+    let onChainAccounts: SessionTokenAccount[] = [];
+    try {
+      onChainAccounts = await getSessionTokenAccounts(keypair.publicKey);
+    } catch (error) {
+      log('warn', session.id, `wallet-truth reconcile skipped (enumeration failed): ${(error as Error).message}`);
+    }
+
+    const onChainByMint = new Map<string, { atomic: number; decimals: number }>();
+    for (const tokenAccount of onChainAccounts) {
+      const mint = tokenAccount.account.mint.toBase58();
+      const atomic = Number(tokenAccount.account.amount);
+      if (!Number.isFinite(atomic) || atomic <= 0) continue;
+      const prior = onChainByMint.get(mint);
+      onChainByMint.set(mint, {
+        atomic: (prior?.atomic ?? 0) + atomic,
+        decimals: tokenAccount.mint.decimals,
+      });
+    }
+
     const reconciledPositions = { ...positionsState.positions };
     const droppedMints: string[] = [];
+    const recoveredMints: string[] = [];
+    let reconcileChanged = false;
 
+    // DROP positions whose on-chain balance is gone (sold or reduced to dust).
     for (const { mint, position } of openPositions) {
       const trackedQuantityAtomic = Number(position.quantityAtomic ?? 0);
       if (!Number.isFinite(trackedQuantityAtomic) || trackedQuantityAtomic <= 0) {
@@ -7011,16 +7064,63 @@ const executeTrade = async (session: RawSession): Promise<void> => {
 
       const walletInventoryAtomic = mint === SOL_MINT
         ? Math.max(0, balance - MIN_SOL_OPERATING_RESERVE_LAMPORTS)
-        : await getTokenBalanceAtomic(keypair.publicKey, mint, TOKEN_PROGRAM_ID).catch(() => 0);
+        : (onChainByMint.get(mint)?.atomic ?? 0);
       const minimumExpectedInventoryAtomic = Math.max(1, Math.floor(trackedQuantityAtomic * 0.1));
 
       if (walletInventoryAtomic < minimumExpectedInventoryAtomic) {
         delete reconciledPositions[mint];
         droppedMints.push(`${getPositionSymbol(position)}:${walletInventoryAtomic}/${trackedQuantityAtomic}`);
+        reconcileChanged = true;
       }
     }
 
-    if (droppedMints.length > 0) {
+    // RE-TRACK orphaned on-chain tokens that are not currently tracked, so the
+    // database/admin/UI reflect every real holding and the exit path can manage
+    // them. True cost basis is unknown for an orphan, so we mark it at the current
+    // price (unrealized starts at 0 from the moment we re-discover it).
+    for (const [mint, holding] of onChainByMint) {
+      if (currencyMints.has(mint)) continue;
+      if (reconciledPositions[mint]) continue;
+
+      const rawMarkUsd = latestJupiterUsdByMint.get(mint) ?? null;
+      const markPriceUsd = rawMarkUsd !== null && rawMarkUsd > 0 ? rawMarkUsd : null;
+      const uiAmount = holding.atomic / (10 ** holding.decimals);
+      const approxUsd = markPriceUsd !== null ? markPriceUsd * uiAmount : null;
+      // Only skip tokens we can price AND that are below the dust floor. Unpriced
+      // tokens are always re-tracked so they remain visible rather than hidden.
+      if (approxUsd !== null && approxUsd < ORPHAN_RECOVERY_MIN_USD) continue;
+
+      const nowIso = new Date().toISOString();
+      reconciledPositions[mint] = {
+        status: 'long',
+        positionMint: mint,
+        positionSymbol: resolveTokenSymbol(mint),
+        entryStrategy: null,
+        entryPriceUsd: markPriceUsd,
+        entryAt: nowIso,
+        quantityAtomic: String(holding.atomic),
+        tokenDecimals: holding.decimals,
+        highWaterPriceUsd: markPriceUsd,
+        lastMarkedPriceUsd: markPriceUsd,
+        lastMarkedAt: markPriceUsd !== null ? nowIso : null,
+        lastComputedAtrUsd: null,
+        lastComputedAtrBps: null,
+        atrComputedAt: null,
+        maxFavorableBps: null,
+        maxFavorableAt: null,
+        maxAdverseBps: null,
+        maxAdverseAt: null,
+        entryQualityScore: null,
+        entryQualityBand: null,
+        pendingExitReason: null,
+        exitReason: null,
+        partialExitDone: false,
+      };
+      recoveredMints.push(`${resolveTokenSymbol(mint)}:${holding.atomic}`);
+      reconcileChanged = true;
+    }
+
+    if (reconcileChanged) {
       positionsState = await persistPositionsState(session, {
         activePositionMint: positionsState.activePositionMint && reconciledPositions[positionsState.activePositionMint]
           ? positionsState.activePositionMint
@@ -7029,7 +7129,12 @@ const executeTrade = async (session: RawSession): Promise<void> => {
       });
       positionState = summarizePositionsState(positionsState, session.service_control.positionState ?? undefined);
       openPositions = listOpenPositions(positionsState);
-      log('warn', session.id, `reconciled stale position inventory; dropped ${droppedMints.join(', ')}`);
+      if (droppedMints.length > 0) {
+        log('warn', session.id, `wallet-truth reconcile dropped vanished positions: ${droppedMints.join(', ')}`);
+      }
+      if (recoveredMints.length > 0) {
+        log('warn', session.id, `wallet-truth reconcile re-tracked orphaned on-chain tokens: ${recoveredMints.join(', ')}`);
+      }
     }
   }
 
