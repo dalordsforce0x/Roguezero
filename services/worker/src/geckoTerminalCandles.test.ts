@@ -178,6 +178,45 @@ test('pool address is cached within TTL across refreshes', async () => {
   assert.equal(poolCalls, 2);
 });
 
+test('null pool result is retried after the short null TTL, not held for the full pool TTL', async () => {
+  let poolCalls = 0;
+  let clock = 1_000;
+  let poolExists = false;
+  const feed = createGeckoTerminalCandleFeed({
+    acquire: async () => undefined,
+    sleep: async () => undefined,
+    callSpacingMs: 0,
+    poolTtlMs: 24 * 60 * 60 * 1000,
+    nullPoolTtlMs: 5_000,
+    now: () => clock,
+    fetchJson: async (url) => {
+      if (url.includes('/pools?page=1')) {
+        poolCalls += 1;
+        // Simulate a transient failure (e.g. 429 -> null) on the first lookup,
+        // then a real pool once the token recovers.
+        return poolExists ? { data: [{ attributes: { address: 'P' } }] } : null;
+      }
+      return makeOhlcv(130);
+    },
+  });
+  await feed.refreshMints(['M']);
+  assert.equal(poolCalls, 1);
+  assert.equal(feed.hasFreshCandles('M'), false);
+
+  // Within the short null TTL: do NOT re-hit the API yet.
+  clock += 2_000;
+  await feed.refreshMints(['M']);
+  assert.equal(poolCalls, 1);
+
+  // Past the short null TTL (but far within the 24h pool TTL): retry. The token
+  // now has a pool, so candles populate instead of being stuck for 24h.
+  poolExists = true;
+  clock += 5_000;
+  await feed.refreshMints(['M']);
+  assert.equal(poolCalls, 2);
+  assert.equal(feed.hasFreshCandles('M'), true);
+});
+
 test('hasFreshCandles respects freshness TTL', async () => {
   let clock = 1_000;
   const feed = createGeckoTerminalCandleFeed({

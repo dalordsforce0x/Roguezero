@@ -44,6 +44,7 @@ export type GeckoCandleFeedDeps = {
   baseUrl?: string;
   /** Pool-address cache TTL in ms (default 24h). */
   poolTtlMs?: number;
+  nullPoolTtlMs?: number;
   /** Max candle points retained per mint (default 240 = 4h of 1-min candles). */
   maxCandlesPerMint?: number;
   /** Inter-call spacing in ms applied in addition to the governor (default 1200). */
@@ -64,6 +65,11 @@ export type GeckoCandleRefreshResult = {
 
 const GT_DEFAULT_BASE = 'https://api.geckoterminal.com/api/v2/networks/solana';
 const DEFAULT_POOL_TTL_MS = 24 * 60 * 60 * 1000;
+// A NULL pool result (lookup failed, usually a 429 on the cloud egress IP) must
+// NOT be cached for the full 24h pool TTL -- that poisons a token's candles for a
+// whole day after one transient failure, forcing it onto the blind 60s fallback
+// tape. Retry null lookups soon so a token recovers on the next refresh tick.
+const DEFAULT_NULL_POOL_TTL_MS = 5 * 60 * 1000;
 const DEFAULT_MAX_CANDLES = 240;
 const DEFAULT_CALL_SPACING_MS = 1200;
 const DEFAULT_FRESH_TTL_MS = 15 * 60 * 1000;
@@ -133,6 +139,7 @@ export const createGeckoTerminalCandleFeed = (
   const now = deps.now ?? Date.now;
   const log = deps.log ?? (() => undefined);
   const poolTtlMs = deps.poolTtlMs ?? DEFAULT_POOL_TTL_MS;
+  const nullPoolTtlMs = deps.nullPoolTtlMs ?? DEFAULT_NULL_POOL_TTL_MS;
   const maxCandles = Math.max(1, deps.maxCandlesPerMint ?? DEFAULT_MAX_CANDLES);
   const callSpacingMs = Math.max(0, deps.callSpacingMs ?? DEFAULT_CALL_SPACING_MS);
 
@@ -141,15 +148,18 @@ export const createGeckoTerminalCandleFeed = (
 
   const resolvePoolAddress = async (mint: string): Promise<string | null> => {
     const cached = poolCache.get(mint);
-    if (cached && now() - cached.fetchedAtMs < poolTtlMs) {
-      return cached.poolAddress;
+    if (cached) {
+      const effectiveTtlMs = cached.poolAddress === null ? nullPoolTtlMs : poolTtlMs;
+      if (now() - cached.fetchedAtMs < effectiveTtlMs) {
+        return cached.poolAddress;
+      }
     }
     await deps.acquire();
     if (callSpacingMs > 0) await sleep(callSpacingMs);
     const json = await deps.fetchJson(`${baseUrl}/tokens/${mint}/pools?page=1`);
     const poolAddress = selectTopPoolAddress(json);
-    // Cache even a null result to avoid hammering a token with no pool, but with a
-    // shorter implicit TTL by not extending fetchedAt on success-only paths.
+    // Cache the result. A null (failed/no-pool) result uses nullPoolTtlMs so a
+    // transient 429 recovers within minutes instead of being stuck for 24h.
     poolCache.set(mint, { poolAddress, fetchedAtMs: now() });
     return poolAddress;
   };
