@@ -9209,11 +9209,52 @@ const executeTrade = async (session: RawSession): Promise<void> => {
       const entryOutUi = entryOutAtomic > 0 ? toUiAmount(entryOutputMint, entryOutAtomic) : 0;
       log('info', session.id, `entry-fill DIAG basis out=${entryOutputMint} inMint=${entryInputMint} inAtomic=${entryInAtomic} inputUsd=${entryInputUsd} outUi=${entryOutUi} solUsd=${solUsdForBasis}`);
       if (entryInputUsd !== null && entryInputUsd > 0 && entryOutUi > 0) {
+        const entryPriceUsdReal = entryInputUsd / entryOutUi;
         pendingEntryFillPriceByMint.set(`${session.id}:${entryOutputMint}`, {
-          priceUsd: entryInputUsd / entryOutUi,
+          priceUsd: entryPriceUsdReal,
           strategy: tradePlan.entryStrategy ?? null,
           at: Date.now(),
         });
+        // Record the position NOW with the real fill price. Previously the worker
+        // never created a position at buy time and relied on the orphan-recovery
+        // loop to reconstruct it from a Jupiter USD mark decoupled from the
+        // executable price, birthing positions instantly underwater -> fake
+        // stop_loss churn. Creating it here means recovery's
+        // `if (reconciledPositions[mint]) continue;` skips it and the true cost
+        // basis is never overwritten by a mark.
+        const entryNowIso = new Date().toISOString();
+        positionsState = await persistPositionsState(session, {
+          activePositionMint: entryOutputMint,
+          positions: {
+            ...positionsState.positions,
+            [entryOutputMint]: {
+              status: 'long',
+              positionMint: entryOutputMint,
+              positionSymbol: resolveTokenSymbol(entryOutputMint),
+              entryStrategy: tradePlan.entryStrategy ?? null,
+              entryPriceUsd: entryPriceUsdReal,
+              entryAt: entryNowIso,
+              quantityAtomic: String(entryOutAtomic),
+              tokenDecimals: getMintDecimals(entryOutputMint),
+              highWaterPriceUsd: entryPriceUsdReal,
+              lastMarkedPriceUsd: entryPriceUsdReal,
+              lastMarkedAt: entryNowIso,
+              lastComputedAtrUsd: null,
+              lastComputedAtrBps: null,
+              atrComputedAt: null,
+              maxFavorableBps: null,
+              maxFavorableAt: null,
+              maxAdverseBps: null,
+              maxAdverseAt: null,
+              entryQualityScore: null,
+              entryQualityBand: null,
+              pendingExitReason: null,
+              exitReason: null,
+              partialExitDone: false,
+            },
+          },
+        });
+        log('info', session.id, `entry recorded at buy: ${resolveTokenSymbol(entryOutputMint)} entryPriceUsd=${entryPriceUsdReal} qtyAtomic=${entryOutAtomic}`);
       }
     }
     const nextScannerStrategy = getNextStrategyInSequence(
