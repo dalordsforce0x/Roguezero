@@ -1,4 +1,4 @@
-import { Pool } from 'pg';
+import { Pool, type QueryResult, type QueryResultRow } from 'pg';
 import { getRuntimeSpeedProfile, normalizeRuntimeSpeedProfileName } from '@/lib/runtimeControl';
 
 const DEFAULT_ROTATION_INTERVAL_MINUTES = 15;
@@ -23,20 +23,74 @@ const getDatabaseConnectionUrl = () => {
   throw new Error('DATABASE_PRIVATE_URL or DATABASE_URL is not set');
 };
 
+// ── API DB proxy (used when admin can't reach TigerData directly) ──
+const DB_PROXY_URL = process.env.DB_PROXY_URL?.trim(); // e.g. http://roguezeroapi.railway.internal:8080
+const DB_PROXY_SECRET = process.env.RZ_INTERNAL_SECRET?.trim();
+
+async function proxyQuery<T extends QueryResultRow = QueryResultRow>(
+  text: string,
+  values: unknown[] = [],
+): Promise<QueryResult<T>> {
+  const res = await fetch(`${DB_PROXY_URL}/internal/db-query`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-rz-internal-secret': DB_PROXY_SECRET!,
+    },
+    body: JSON.stringify({ text, values }),
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`DB proxy error ${res.status}: ${body}`);
+  }
+  const json = await res.json() as { rows: T[]; rowCount: number };
+  return { rows: json.rows, rowCount: json.rowCount } as QueryResult<T>;
+}
+
+/** Pool-compatible wrapper that routes queries through the API service */
+function createProxyPool(): Pool {
+  const handler: ProxyHandler<Pool> = {
+    get(_target, prop) {
+      if (prop === 'query') {
+        return (text: string, values?: unknown[]) => proxyQuery(text, values);
+      }
+      if (prop === 'connect') {
+        // Return a mock client for transaction support (no real isolation—admin-only)
+        return async () => ({
+          query: (text: string, values?: unknown[]) => proxyQuery(text, values),
+          release: () => {},
+        });
+      }
+      if (prop === 'end') {
+        return async () => {};
+      }
+      return undefined;
+    },
+  };
+  return new Proxy({} as Pool, handler);
+}
+
 export function getPool(): Pool {
   if (!pool) {
-    const databaseUrl = getDatabaseConnectionUrl();
+    if (DB_PROXY_URL && DB_PROXY_SECRET) {
+      console.log('[db] Using API DB proxy:', DB_PROXY_URL);
+      pool = createProxyPool();
+    } else {
+      const databaseUrl = getDatabaseConnectionUrl();
 
-    // Strip sslmode from the URL — pg-connection-string now treats sslmode=require
-    // as verify-full (breaks TigerData). We manage SSL explicitly instead.
-    const parsed = new URL(databaseUrl);
-    parsed.searchParams.delete('sslmode');
+      // Strip sslmode from the URL — pg-connection-string now treats sslmode=require
+      // as verify-full (breaks TigerData). We manage SSL explicitly instead.
+      const parsed = new URL(databaseUrl);
+      parsed.searchParams.delete('sslmode');
 
-    pool = new Pool({
-      connectionString: parsed.toString(),
-      ...(databaseUrl.includes('sslmode=require') ? { ssl: { rejectUnauthorized: false } } : {}),
-      max: 5,
-    });
+      pool = new Pool({
+        connectionString: parsed.toString(),
+        ...(databaseUrl.includes('sslmode=require') ? { ssl: { rejectUnauthorized: false } } : {}),
+        max: 5,
+        connectionTimeoutMillis: 10_000,
+        idleTimeoutMillis: 30_000,
+      });
+    }
   }
   return pool;
 }
@@ -627,6 +681,7 @@ type RuntimeControlRow = {
     lastTransitionAt?: unknown;
     pressure?: unknown;
     entriesEnabled?: unknown;
+    performanceFeeEnabled?: unknown;
     maintenanceReason?: unknown;
   } | null;
   updated_at: string;
@@ -859,6 +914,7 @@ const hydrateRuntimeControl = (row: RuntimeControlRow | null) => {
       ? (row.state.pressure as Record<string, unknown>)
       : null;
   const entriesEnabled = row?.state?.entriesEnabled === false ? false : true;
+  const performanceFeeEnabled = row?.state?.performanceFeeEnabled === false ? false : true;
   const maintenanceReason =
     typeof row?.state?.maintenanceReason === 'string' && row.state.maintenanceReason.trim().length > 0
       ? row.state.maintenanceReason.trim().slice(0, 160)
@@ -873,6 +929,7 @@ const hydrateRuntimeControl = (row: RuntimeControlRow | null) => {
     lastTransitionAt,
     pressure,
     entriesEnabled,
+    performanceFeeEnabled,
     maintenanceReason,
     updatedAt: row?.updated_at ?? new Date().toISOString(),
   };
@@ -931,6 +988,7 @@ export async function getLiveRuntimeControlSnapshot() {
     lastTransitionAt: control.lastTransitionAt,
     pressure: control.pressure,
     entriesEnabled: control.entriesEnabled,
+    performanceFeeEnabled: control.performanceFeeEnabled,
     maintenanceReason: control.maintenanceReason,
     cadenceMs: control.profile.cadenceMs,
     liveSessions: Number(liveResult.rows[0]?.count ?? '0'),
@@ -989,6 +1047,21 @@ export async function setLiveRuntimeEntriesEnabled(entriesEnabledInput: unknown,
      DO UPDATE SET state = runtime_control_settings.state || EXCLUDED.state,
                    updated_at = NOW()`,
     [RUNTIME_CONTROL_KEY, JSON.stringify({ entriesEnabled, maintenanceReason })],
+  );
+
+  return getLiveRuntimeControlSnapshot();
+}
+
+export async function setLiveRuntimePerformanceFee(enabled: boolean) {
+  await runtimeControlReady();
+
+  await getPool().query(
+    `INSERT INTO runtime_control_settings (control_key, state, updated_at)
+     VALUES ($1, $2::jsonb, NOW())
+     ON CONFLICT (control_key)
+     DO UPDATE SET state = runtime_control_settings.state || EXCLUDED.state,
+                   updated_at = NOW()`,
+    [RUNTIME_CONTROL_KEY, JSON.stringify({ performanceFeeEnabled: enabled })],
   );
 
   return getLiveRuntimeControlSnapshot();

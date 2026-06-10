@@ -27,6 +27,14 @@ export type GeckoCandlePoint = {
   sampledAt: string;
   /** Unix seconds of the candle open, as returned by GeckoTerminal. */
   ts: number;
+  /** Candle open price in USD. */
+  open: number;
+  /** Candle high price in USD. */
+  high: number;
+  /** Candle low price in USD. */
+  low: number;
+  /** Candle volume in USD. */
+  volume: number;
 };
 
 export type GeckoCandleFeedDeps = {
@@ -105,11 +113,23 @@ export const parseOhlcvList = (json: unknown): GeckoCandlePoint[] => {
   if (!Array.isArray(list)) return [];
   const points: GeckoCandlePoint[] = [];
   for (const row of list) {
-    if (!Array.isArray(row) || row.length < 5) continue;
+    if (!Array.isArray(row) || row.length < 6) continue;
     const ts = Number(row[0]);
+    const open = Number(row[1]);
+    const high = Number(row[2]);
+    const low = Number(row[3]);
     const close = Number(row[4]);
+    const volume = Number(row[5]);
     if (!Number.isFinite(ts) || !Number.isFinite(close) || close <= 0) continue;
-    points.push({ ts, usdPrice: close, sampledAt: new Date(ts * 1000).toISOString() });
+    points.push({
+      ts,
+      usdPrice: close,
+      sampledAt: new Date(ts * 1000).toISOString(),
+      open: Number.isFinite(open) ? open : close,
+      high: Number.isFinite(high) ? high : close,
+      low: Number.isFinite(low) ? low : close,
+      volume: Number.isFinite(volume) && volume >= 0 ? volume : 0,
+    });
   }
   points.sort((a, b) => a.ts - b.ts);
   return points;
@@ -122,6 +142,7 @@ export type GeckoTerminalCandleFeed = {
   refreshMints: (mints: readonly string[]) => Promise<GeckoCandleRefreshResult>;
   getTape: (mint: string) => readonly GeckoCandlePoint[];
   getCloses: (mint: string) => number[];
+  getVolumes: (mint: string) => number[];
   hasFreshCandles: (mint: string, freshTtlMs?: number) => boolean;
   getCoverage: (freshTtlMs?: number) => GeckoCandleCoverage;
 };
@@ -219,6 +240,9 @@ export const createGeckoTerminalCandleFeed = (
   const getCloses = (mint: string): number[] =>
     (candleCache.get(mint)?.points ?? []).map((p) => p.usdPrice);
 
+  const getVolumes = (mint: string): number[] =>
+    (candleCache.get(mint)?.points ?? []).map((p) => p.volume);
+
   const hasFreshCandles = (mint: string, freshTtlMs = DEFAULT_FRESH_TTL_MS): boolean => {
     const entry = candleCache.get(mint);
     if (!entry || entry.points.length === 0) return false;
@@ -241,5 +265,5 @@ export const createGeckoTerminalCandleFeed = (
     return { mints: candleCache.size, freshMints, oldestFreshAgeMs };
   };
 
-  return { refreshMints, getTape, getCloses, hasFreshCandles, getCoverage };
+  return { refreshMints, getTape, getCloses, getVolumes, hasFreshCandles, getCoverage };
 };

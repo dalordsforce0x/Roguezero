@@ -325,6 +325,7 @@ interface RuntimeControlData {
   transitionReason: string | null;
   lastTransitionAt: string | null;
   entriesEnabled: boolean;
+  performanceFeeEnabled: boolean;
   maintenanceReason: string | null;
   pressure: {
     heliusBudget?: string;
@@ -346,6 +347,21 @@ interface RuntimeControlData {
   liveSessions: number;
   reservedSessions: number;
   updatedAt: string;
+}
+
+interface TokenPerformanceEntry {
+  mint: string;
+  symbol: string;
+  token_class: string;
+  total_exits: number;
+  wins: number;
+  losses: number;
+  avg_pnl_bps: number;
+  total_pnl_bps: number;
+  max_favorable_bps_avg: number;
+  max_adverse_bps_avg: number;
+  avg_hold_minutes: number;
+  last_exit_at: string;
 }
 
 const DURATIONS = [
@@ -809,12 +825,14 @@ function RuntimeControlPanel({
   onSelect,
   onAuto,
   onToggleEntries,
+  onToggleFee,
 }: {
   control: RuntimeControlData | null;
   updating: boolean;
   onSelect: (profile: 'glide' | 'pulse' | 'surge') => void;
   onAuto: () => void;
   onToggleEntries: (enabled: boolean) => void;
+  onToggleFee: (enabled: boolean) => void;
 }) {
   const profiles = [
     { id: 'glide', label: 'Glide', detail: 'most conservative cadence · full fleet capacity preserved' },
@@ -909,6 +927,41 @@ function RuntimeControlPanel({
               ].join(' ')}
             >
               {control.entriesEnabled ? 'Block New Entries' : 'Allow New Entries'}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* F1: Performance Fee Toggle */}
+      {control && (
+        <div className="bg-gray-900 border border-gray-800 rounded-xl p-5">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-sm font-semibold text-white">
+                Performance Fee
+                <span className={`ml-2 text-xs font-normal ${control.performanceFeeEnabled ? 'text-emerald-400' : 'text-gray-500'}`}>
+                  {control.performanceFeeEnabled ? 'ACTIVE' : 'DISABLED'}
+                </span>
+              </p>
+              <p className="text-xs text-gray-500 mt-1">
+                {control.performanceFeeEnabled
+                  ? '0.33% of net session profit is collected at settlement.'
+                  : 'Performance fee is disabled. No revenue is being collected.'}
+              </p>
+            </div>
+            <button
+              type="button"
+              disabled={updating}
+              onClick={() => onToggleFee(!control.performanceFeeEnabled)}
+              className={[
+                'rounded-lg border px-3 py-2 text-xs font-semibold transition-colors',
+                control.performanceFeeEnabled
+                  ? 'border-amber-400/30 bg-amber-500/10 text-amber-200 hover:bg-amber-500/20'
+                  : 'border-emerald-400/30 bg-emerald-500/10 text-emerald-200 hover:bg-emerald-500/20',
+                updating ? 'opacity-60 cursor-not-allowed' : '',
+              ].join(' ')}
+            >
+              {control.performanceFeeEnabled ? 'Disable Fee' : 'Enable Fee'}
             </button>
           </div>
         </div>
@@ -1790,6 +1843,8 @@ export default function Home() {
   const [sessionHealthLoading, setSessionHealthLoading] = useState(false);
   const [tokenUniverse, setTokenUniverse] = useState<TokenUniverseOverview | null>(null);
   const [tokenUniverseLoading, setTokenUniverseLoading] = useState(false);
+  const [tokenPerformance, setTokenPerformance] = useState<TokenPerformanceEntry[]>([]);
+  const [tokenPerfLoading, setTokenPerfLoading] = useState(false);
   const [runtimeControl, setRuntimeControl] = useState<RuntimeControlData | null>(null);
   const [runtimeControlLoading, setRuntimeControlLoading] = useState(false);
   const [runtimeControlUpdating, setRuntimeControlUpdating] = useState(false);
@@ -1888,6 +1943,22 @@ export default function Home() {
     }
   }, []);
 
+  const togglePerformanceFee = useCallback(async (enabled: boolean) => {
+    setRuntimeControlUpdating(true);
+    try {
+      const res = await fetch('/api/runtime-control', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ performanceFeeEnabled: enabled }),
+      });
+      if (!res.ok) return;
+      const data = await res.json() as RuntimeControlData;
+      setRuntimeControl(data);
+    } finally {
+      setRuntimeControlUpdating(false);
+    }
+  }, []);
+
   const toggleRuntimeEntries = useCallback(async (entriesEnabled: boolean) => {
     setRuntimeControlUpdating(true);
     try {
@@ -1943,6 +2014,18 @@ export default function Home() {
       setTokenUniverse(data);
     } finally {
       setTokenUniverseLoading(false);
+    }
+  }, []);
+
+  const fetchTokenPerformance = useCallback(async () => {
+    setTokenPerfLoading(true);
+    try {
+      const res = await fetch('/api/token-performance');
+      if (!res.ok) return;
+      const data = await res.json() as { tokens: TokenPerformanceEntry[] };
+      setTokenPerformance(data.tokens ?? []);
+    } finally {
+      setTokenPerfLoading(false);
     }
   }, []);
 
@@ -2359,6 +2442,7 @@ export default function Home() {
               onSelect={updateRuntimeControl}
               onAuto={resumeRuntimeAuto}
               onToggleEntries={toggleRuntimeEntries}
+              onToggleFee={togglePerformanceFee}
             />
 
             <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
@@ -2375,6 +2459,56 @@ export default function Home() {
               reserved={runtimeControl?.reservedSessions ?? activeSessions.size}
               traders={users.filter(u => activeSessions.has(u.id))}
             />
+
+            {/* E3: Per-Token Performance (30d) */}
+            <div className="bg-gray-900/70 border border-gray-800 rounded-xl p-5">
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="text-sm font-medium text-white">Token Performance (30d)</h3>
+                <button
+                  onClick={() => void fetchTokenPerformance()}
+                  disabled={tokenPerfLoading}
+                  className="text-xs border border-gray-700 hover:border-gray-500 text-gray-400 hover:text-white px-3 py-1.5 rounded-md transition-colors disabled:opacity-40"
+                >
+                  {tokenPerfLoading ? 'Loading…' : '↻ Load'}
+                </button>
+              </div>
+              {tokenPerformance.length > 0 && (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-xs">
+                    <thead>
+                      <tr className="border-b border-gray-800 text-gray-500">
+                        <th className="text-left py-2 px-2">Token</th>
+                        <th className="text-left py-2 px-2">Class</th>
+                        <th className="text-right py-2 px-2">Exits</th>
+                        <th className="text-right py-2 px-2">Win%</th>
+                        <th className="text-right py-2 px-2">Avg PnL</th>
+                        <th className="text-right py-2 px-2">Total PnL</th>
+                        <th className="text-right py-2 px-2">Avg Hold</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {tokenPerformance.map((t) => (
+                        <tr key={t.mint} className="border-b border-gray-800/50 hover:bg-gray-800/30">
+                          <td className="py-1.5 px-2 text-white font-mono">{t.symbol}</td>
+                          <td className="py-1.5 px-2 text-gray-400">{t.token_class}</td>
+                          <td className="py-1.5 px-2 text-right text-gray-300">{t.total_exits}</td>
+                          <td className="py-1.5 px-2 text-right text-gray-300">
+                            {t.total_exits > 0 ? Math.round(t.wins / t.total_exits * 100) : 0}%
+                          </td>
+                          <td className={`py-1.5 px-2 text-right ${t.avg_pnl_bps >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                            {t.avg_pnl_bps >= 0 ? '+' : ''}{t.avg_pnl_bps}bps
+                          </td>
+                          <td className={`py-1.5 px-2 text-right font-semibold ${t.total_pnl_bps >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                            {t.total_pnl_bps >= 0 ? '+' : ''}{t.total_pnl_bps}bps
+                          </td>
+                          <td className="py-1.5 px-2 text-right text-gray-400">{t.avg_hold_minutes}m</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
 
             {/* Expiring soon list */}
             {expiringSoonUsers.length > 0 && (

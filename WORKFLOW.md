@@ -60,8 +60,16 @@ User: approve before implementation, confirm after
 - Reason: fee capture works, no referral setup needed, routing quality equivalent when using referral (referralAccount disables JupiterZ on Meta-Aggregator anyway)
 - `/build` endpoint verified working as of 2026-05-28
 
-### Fee Accounts (in .env)
-- Platform fee: **35 BPS**
+### Fee Model
+- **Per-trade platformFeeBps: 0** (disabled — per-trade fees eat into bot profitability)
+- **Revenue model: 0.33% performance fee on NET SESSION PROFIT at session end**
+  - OR 0.33% at take-profit payout if user chose profit-taking mode
+  - Fee deducted before funds sent to owner wallet
+  - **BUILT** — worker `sweepFunds` computes 33bps of net SOL profit, deducts before return transfer
+  - Feature-gated: requires `performanceFeeEnabled = true` in `runtime_control_settings` (admin toggle)
+  - Env config: `WORKER_PERFORMANCE_FEE_BPS` (default 33), `WORKER_PERFORMANCE_FEE_ENABLED` (default true)
+
+### Fee Token Accounts (in .env) — for future per-trade fees if re-enabled
 - SOL: `8B3zcBMcjpAJeR7ksEeJMiiNrW6dEf1oL3YK2GnQwGGK`
 - USDC: `AYE7gjGL2GrPHmQXieipTfT66CPvzWYu2onkGPWByJmo`
 - USDT: `zo5WxSQEj2feo5JTSoeEbmFdzD5QNdyKZRABpjabeW7`

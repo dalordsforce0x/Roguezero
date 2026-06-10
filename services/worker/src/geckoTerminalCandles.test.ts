@@ -36,8 +36,13 @@ test('parseOhlcvList sorts ascending and maps close price', () => {
   assert.equal(points.length, 2);
   assert.equal(points[0].ts, 100);
   assert.equal(points[0].usdPrice, 1.5);
+  assert.equal(points[0].open, 1);
+  assert.equal(points[0].high, 2);
+  assert.equal(points[0].low, 0.5);
+  assert.equal(points[0].volume, 90);
   assert.equal(points[1].ts, 200);
   assert.equal(points[1].usdPrice, 2.5);
+  assert.equal(points[1].volume, 100);
   assert.equal(points[0].sampledAt, new Date(100 * 1000).toISOString());
 });
 

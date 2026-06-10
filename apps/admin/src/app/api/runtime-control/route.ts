@@ -4,6 +4,7 @@ import {
   setLiveRuntimeEntriesEnabled,
   setLiveRuntimeMode,
   setLiveRuntimeSpeedProfile,
+  setLiveRuntimePerformanceFee,
 } from '@/lib/db';
 
 export async function GET() {
@@ -23,10 +24,16 @@ export async function PATCH(req: NextRequest) {
       modeSource?: unknown;
       entriesEnabled?: unknown;
       maintenanceReason?: unknown;
+      performanceFeeEnabled?: unknown;
     };
 
     if (typeof body.entriesEnabled === 'boolean') {
       const snapshot = await setLiveRuntimeEntriesEnabled(body.entriesEnabled, body.maintenanceReason);
+      return NextResponse.json(snapshot);
+    }
+
+    if (typeof body.performanceFeeEnabled === 'boolean') {
+      const snapshot = await setLiveRuntimePerformanceFee(body.performanceFeeEnabled);
       return NextResponse.json(snapshot);
     }
 

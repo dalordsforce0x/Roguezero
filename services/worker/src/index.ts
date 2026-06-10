@@ -30,7 +30,7 @@ import {
   type Mint as SplTokenMint,
 } from '@solana/spl-token';
 import { createMonthlyBudgetGovernor, createSharedTokenBucket, getExponentialBackoffDelayMs } from '@roguezero/provider-governor';
-import { createGeckoTerminalCandleFeed } from './geckoTerminalCandles.js';
+import { createGeckoTerminalCandleFeed, type GeckoTerminalCandleFeed } from './geckoTerminalCandles.js';
 import {
   createRoundRobinKeySelector,
   computeTradeAmountLamports,
@@ -93,6 +93,7 @@ import {
   computeSupertrendSignal,
   getNextStrategyInSequence,
   getStrategyScanOrder,
+  recommendStrategy,
   type BollingerConfig,
   type PriceSample,
   type StrategyKey,
@@ -112,12 +113,12 @@ const WORKER_INTERNAL_SECRET = process.env.RZ_INTERNAL_SECRET?.trim() ?? '';
 const POLL_MS  = Number(process.env.WORKER_POLL_INTERVAL_MS ?? 5000);
 const MIN_LOOP_MS = Number(process.env.WORKER_MIN_LOOP_INTERVAL_MS ?? 250);
 const LOOP_JITTER_RATIO = Number(process.env.WORKER_LOOP_JITTER_RATIO ?? 0.1);
-const FUNDING_POLL_FALLBACK_MS = Number(process.env.WORKER_FUNDING_POLL_FALLBACK_MS ?? 60000);
+const FUNDING_POLL_FALLBACK_MS = Number(process.env.WORKER_FUNDING_POLL_FALLBACK_MS ?? 15000);
 // Active session-wallet balance is served from a subscription-backed cache, revalidated by
 // RPC at most this often. onAccountChange keeps it fresh between revalidations; the TTL is a
 // safety net against websocket gaps. Cuts the per-cycle pre-trade balance RPC for 350 bots.
 const BALANCE_CACHE_TTL_MS = Number(process.env.WORKER_BALANCE_CACHE_TTL_MS ?? 60000);
-const AWAITING_FUNDING_TIMEOUT_MINUTES = Number(process.env.WORKER_AWAITING_FUNDING_TIMEOUT_MINUTES ?? 3);
+const AWAITING_FUNDING_TIMEOUT_MINUTES = Number(process.env.WORKER_AWAITING_FUNDING_TIMEOUT_MINUTES ?? 10);
 const POST_SUBMIT_RECONCILE_GRACE_MS = Number(process.env.WORKER_POST_SUBMIT_RECONCILE_GRACE_MS ?? 10000);
 const STALE_SESSION_MINUTES = Number(process.env.WORKER_STALE_SESSION_MINUTES ?? 0);
 const EXECUTION_QUEUE_CLAIMS_PER_TICK = Number(process.env.WORKER_EXECUTION_QUEUE_CLAIMS_PER_TICK ?? 5);
@@ -457,6 +458,7 @@ let latestJupiterBudgetPressure: LaneBudgetPressure = { pressure: 'normal', usag
 let liveModeSource: 'auto' | 'manual' = 'auto';
 let liveEntriesEnabled: boolean = true;
 let liveMaintenanceReason: string | null = null;
+let livePerformanceFeeEnabled = true;
 
 const AUTO_SHIFT_ENABLED = process.env.WORKER_AUTO_SHIFT_ENABLED !== 'false';
 const AUTO_SHIFT_EVAL_MS = Number(process.env.WORKER_AUTO_SHIFT_EVAL_MS ?? 15_000);
@@ -629,6 +631,7 @@ type RuntimeControlRow = {
     lastTransitionAt?: unknown;
     pressure?: unknown;
     entriesEnabled?: boolean;
+    performanceFeeEnabled?: boolean;
     maintenanceReason?: string | null;
   } | null;
 };
@@ -884,6 +887,7 @@ const refreshLiveRuntimeControl = async (force = false) => {
   liveMaintenanceReason = typeof result.rows[0]?.state?.maintenanceReason === 'string'
     ? result.rows[0].state.maintenanceReason.slice(0, 160)
     : null;
+  livePerformanceFeeEnabled = result.rows[0]?.state?.performanceFeeEnabled !== false;
 
   if (result.rowCount === 0) {
     await getPool().query(
@@ -1304,6 +1308,10 @@ const reserveHeliusRpc = async () => {
   await reserveProviderBudget({ provider: 'helius', governor: heliusMonthlyBudget, units: 1 });
   await heliusLimiter.acquire();
 };
+// D5: Sender costs 0 Helius monthly credits — only TPS-limit, no budget burn.
+const reserveHeliusSender = async () => {
+  await heliusLimiter.acquire();
+};
 
 const reserveJupiterRequest = async () => {
   await reserveProviderBudget({ provider: 'jupiter', governor: jupiterMonthlyBudget, units: 1 });
@@ -1581,6 +1589,34 @@ const sharedMarketTape = {
 
 const jupiterMomentumTapeByMint = new Map<string, MarketTapePoint[]>();
 
+// B2: GeckoTerminal shared 1-min OHLCV candle feed for volume confirmation.
+const geckoFeed: GeckoTerminalCandleFeed = createGeckoTerminalCandleFeed({
+  fetchJson: async (url: string) => {
+    try {
+      const res = await fetch(url);
+      if (!res.ok) return null;
+      return await res.json();
+    } catch {
+      return null;
+    }
+  },
+  acquire: async () => {},
+  log: (entry) => {
+    if (entry.event === 'error' || entry.event === 'warn') {
+      console.log(JSON.stringify({ source: 'geckoFeed', ...entry }));
+    }
+  },
+});
+
+// RVOL: current candle volume / avg(last N). > 1.0 = above-average volume.
+const computeRelativeVolume = (mint: string, lookback = 20): number | null => {
+  const volumes = geckoFeed.getVolumes(mint);
+  if (volumes.length < lookback + 1) return null;
+  const currentVolume = volumes[volumes.length - 1];
+  const avgVolume = volumes.slice(-lookback - 1, -1).reduce((s, v) => s + v, 0) / lookback;
+  if (avgVolume <= 0) return null;
+  return currentVolume / avgVolume;
+};
 type PersistedMarketTapeRow = {
   state: {
     solUsdPyth?: unknown;
@@ -3769,6 +3805,11 @@ const runJupiterPricePollTick = async (): Promise<void> => {
 
     await applyTokenUniverseAutoSort();
 
+    // B2: Refresh GeckoTerminal candles for active mints.
+    if (tokenUniverseActiveMints.length > 0) {
+      void geckoFeed.refreshMints(tokenUniverseActiveMints).catch(() => {});
+    }
+
     await persistMarketTapeState();
   } catch (err) {
     jupiterPriceConsecutiveFailures += 1;
@@ -3863,7 +3904,7 @@ const rlConfirmTransaction = async (args: { signature: string; blockhash: string
 };
 
 const rlSendRawTransaction = async (serializedTransaction: Buffer | Uint8Array) => {
-  await reserveHeliusRpc();
+  await reserveHeliusSender();
   return getConnection().sendRawTransaction(serializedTransaction, {
     skipPreflight: true,
     maxRetries: 0,
@@ -3955,7 +3996,7 @@ const checkFunding = async (session: RawSession, observedBalance?: number): Prom
   let balance = observedBalance;
   if (balance === undefined) {
     try {
-      balance = await rlGetBalance(new PublicKey(session.session_wallet));
+      balance = await getCachedSessionWalletBalance(new PublicKey(session.session_wallet));
     } catch (err) {
       log('warn', session.id, `balance check failed: ${String(err)}`);
       return;
@@ -4146,7 +4187,7 @@ const unsubscribeActiveSessionBalance = (sessionId: string, walletBase58?: strin
   }
 };
 
-const ACTIVE_BALANCE_SUB_STATUSES = new Set(['ready', 'starting', 'active', 'stopping']);
+const ACTIVE_BALANCE_SUB_STATUSES = new Set(['awaiting_funding', 'ready', 'starting', 'active', 'stopping']);
 
 const syncActiveBalanceSubscriptions = (sessions: RawSession[]) => {
   const subscribableSessions = new Map<string, string>();
@@ -6199,6 +6240,20 @@ const computeDynamicExitThresholds = (
 ): DynamicExitThresholds => {
   const costFloorBps = computeExitCostFloorBps(session);
   const atrBps = positionState.lastComputedAtrBps ?? null;
+
+  // ── B4: Regime-based exit scaling ─────────────────────────────────────────
+  // Trending: widen TP (+30%) and trailing (+20%) — let winners ride.
+  // Ranging: tighten TP (-20%) and trailing (-20%) — take quick profits.
+  const regime = recommendStrategy(sharedMarketTape.solUsdPyth);
+  let regimeTpScale = 1.0;
+  let regimeTrailingScale = 1.0;
+  if (regime.reason === 'expanding_bands_steep_slope') {
+    regimeTpScale = 1.3;
+    regimeTrailingScale = 1.2;
+  } else if (regime.reason === 'narrow_bands_flat_slope') {
+    regimeTpScale = 0.8;
+    regimeTrailingScale = 0.8;
+  }
   // Token-class exit profile (flag-gated, Noah-scoped). OFF => exact global multipliers as before.
   const exitProfilesActive = isFeatureActiveForSession(session, WORKER_TOKEN_CLASS_EXIT_PROFILES_ENABLED, 'token_class_exit');
   const exitProfile: TokenClassExitProfile = exitProfilesActive
@@ -6229,9 +6284,9 @@ const computeDynamicExitThresholds = (
 
   if (!atrBps || atrBps <= 0) {
     return {
-      takeProfitBps: applyTakeProfitTimeDecay(Math.max(positionExitPolicy.takeProfitBps, costFloorBps)),
+      takeProfitBps: applyTakeProfitTimeDecay(Math.max(Math.round(positionExitPolicy.takeProfitBps * regimeTpScale), costFloorBps)),
       stopLossBps: Math.max(positionExitPolicy.stopLossBps, costFloorBps),
-      trailingStopBps: Math.max(positionExitPolicy.trailingStopBps, positionExitPolicy.trailingStopFloorBps),
+      trailingStopBps: Math.max(Math.round(positionExitPolicy.trailingStopBps * regimeTrailingScale), positionExitPolicy.trailingStopFloorBps),
       atrBps: null,
       costFloorBps,
       mode: 'fallback',
@@ -6243,7 +6298,7 @@ const computeDynamicExitThresholds = (
   return {
     takeProfitBps: applyTakeProfitTimeDecay(Math.max(
       costFloorBps,
-      Math.round(atrBps * exitProfile.takeProfitMult * (1 + signalStrengthBoost)),
+      Math.round(atrBps * exitProfile.takeProfitMult * (1 + signalStrengthBoost) * regimeTpScale),
     )),
     stopLossBps: Math.max(
       costFloorBps,
@@ -6251,7 +6306,7 @@ const computeDynamicExitThresholds = (
     ),
     trailingStopBps: Math.max(
       positionExitPolicy.trailingStopFloorBps,
-      Math.round(atrBps * exitProfile.trailingStopMult),
+      Math.round(atrBps * exitProfile.trailingStopMult * regimeTrailingScale),
     ),
     atrBps,
     costFloorBps,
@@ -7377,6 +7432,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
         maxAdverseAt: null,
         entryQualityScore: null,
         entryQualityBand: null,
+        entryCostBps: null,
         pendingExitReason: null,
         exitReason: null,
         partialExitDone: false,
@@ -8807,6 +8863,28 @@ const executeTrade = async (session: RawSession): Promise<void> => {
     return;
   }
 
+
+  // ── B2: RVOL entry gate ───────────────────────────────────────────────────
+  // Block entries when current candle volume is below average (RVOL < 1.0).
+  if (tradePlan.direction === 'enter_long') {
+    const entryMint = tradePlan.inventory.outputMint;
+    const rvol = computeRelativeVolume(entryMint);
+    const rvolThreshold = 1.0;
+    if (rvol !== null && rvol < rvolThreshold) {
+      const rvolReason = 'rvol_below_threshold';
+      recordTradePlanEntryRejectCooldown(session, tradePlan, rvolReason);
+      await persistTradeDecision(session, 'blocked', rvolReason);
+      log(
+        'info',
+        session.id,
+        `RVOL gate blocked entry: mint=${entryMint} rvol=${rvol.toFixed(2)} threshold=${rvolThreshold}`,
+      );
+      return;
+    }
+    if (rvol !== null) {
+      log('info', session.id, `RVOL gate passed: mint=${entryMint} rvol=${rvol.toFixed(2)}`);
+    }
+  }
   for (let attempt = 1; attempt <= 2; attempt++) {
     log(
       'info',
@@ -9389,6 +9467,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
               maxAdverseAt: null,
               entryQualityScore: null,
               entryQualityBand: null,
+              entryCostBps: null,
               pendingExitReason: null,
               exitReason: null,
               partialExitDone: false,
@@ -9398,10 +9477,18 @@ const executeTrade = async (session: RawSession): Promise<void> => {
         log('info', session.id, `entry recorded at buy: ${resolveTokenSymbol(entryOutputMint)} entryPriceUsd=${entryPriceUsdReal} qtyAtomic=${entryOutAtomic}`);
       }
     }
-    const nextScannerStrategy = getNextStrategyInSequence(
-      tradePlan.entryStrategy ?? tradePlan.scannerStrategy,
-      enabledStrategies,
-    );
+    // B3: Regime-based strategy selection instead of blind round-robin.
+    // recommendStrategy picks based on Bollinger bandwidth + price slope.
+    // Falls back to round-robin if recommended strategy not in enabled set.
+    const regime = recommendStrategy(sharedMarketTape.solUsdPyth);
+    const recommendedKey = regime.recommended;
+    const enabledSet = new Set(enabledStrategies);
+    const nextScannerStrategy = enabledSet.has(recommendedKey)
+      ? recommendedKey
+      : getNextStrategyInSequence(
+        tradePlan.entryStrategy ?? tradePlan.scannerStrategy,
+        enabledStrategies,
+      );
     await persistServiceControl(session, {
       rotationState: {
         activeStrategy: nextScannerStrategy,
@@ -10010,6 +10097,8 @@ const waitForPostSweepSnapshot = async (
   return latestSnapshot;
 };
 
+
+
 const sweepFunds = async (session: RawSession): Promise<SweepResult> => {
   const ownerWallet = session.owner_wallet;
 
@@ -10263,6 +10352,7 @@ const sweepFunds = async (session: RawSession): Promise<SweepResult> => {
   if (
     solToSend > 0
     && WORKER_PERFORMANCE_FEE_BPS > 0
+    && livePerformanceFeeEnabled
     && isFeatureActiveForSession(session, WORKER_PERFORMANCE_FEE_ENABLED, 'performance_fee')
   ) {
     const fundedBaselineLamports = Number(session.funding?.startingBalanceAtomic ?? '0');
@@ -10627,6 +10717,14 @@ const tick = async (): Promise<number> => {
             const waitingMs = Date.now() - session.requested_at.getTime();
             const waitingLimitMs = Math.max(1, AWAITING_FUNDING_TIMEOUT_MINUTES) * 60_000;
             if (waitingMs > waitingLimitMs) {
+              // Final balance check before timing out — catches deposits
+              // missed by broken WebSocket subscriptions
+              await runFundingCheck(session.id);
+              const refreshed = await getSessionById(session.id);
+              if (refreshed && refreshed.status !== 'awaiting_funding') {
+                log('info', session.id, 'last-chance funding check detected deposit — not timing out');
+                break;
+              }
               await setSessionStatus(
                 session.id,
                 'stopping',

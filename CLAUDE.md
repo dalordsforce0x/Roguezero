@@ -615,14 +615,14 @@ Use:
 
 - `GET /swap/v2/build`
 - Router-style build + signed submit flow
-- `platformFeeBps`
-- platform fee token accounts
+- `platformFeeBps` = 0 (per-trade fees disabled; 0.33% performance fee at session end instead — BUILT)
+- platform fee token accounts (configured but unused while platformFeeBps=0)
 
 Do **not** switch this project back to `/order` + `/execute` unless the user explicitly changes architecture.
 
 Reason this path was chosen:
 
-- fee capture works through `platformFeeBps`
+- fee capture works through `platformFeeBps` (currently disabled, 0.33% performance fee model agreed instead)
 - no referral setup required for the main swap path
 - routing is acceptable for current needs
 - this is already wired in code and tested to return build instructions
@@ -635,12 +635,16 @@ Implementation note:
 
 ## Fee model
 
-Router path fee capture uses:
+**Per-trade platformFeeBps is 0** — disabled. Per-trade fees eat into bot profitability.
 
-- `platformFeeBps = 35`
-- fee token accounts from env/runtime config
+**Agreed revenue model: 0.33% performance fee on NET SESSION PROFIT at session end.**
+- OR 0.33% at take-profit payout if user chose profit-taking mode
+- Fee deducted before funds sent to owner wallet
+- **BUILT** — worker `sweepFunds` computes 33bps of net SOL profit, deducts before return transfer
+- Feature-gated: `performanceFeeEnabled` in `runtime_control_settings` + admin toggle
+- Env: `WORKER_PERFORMANCE_FEE_BPS` (default 33), `WORKER_PERFORMANCE_FEE_ENABLED` (default true)
 
-Configured fee accounts:
+Fee token accounts (for future per-trade fees if re-enabled):
 
 - SOL: `8B3zcBMcjpAJeR7ksEeJMiiNrW6dEf1oL3YK2GnQwGGK`
 - USDC: `AYE7gjGL2GrPHmQXieipTfT66CPvzWYu2onkGPWByJmo`
@@ -737,8 +741,8 @@ Important current behavior:
 This file is the source of truth for:
 
 - Jupiter Router API base URL
-- `platformFeeBps`
-- fee accounts
+- `platformFeeBps` (currently 0 — per-trade fees disabled)
+- fee accounts (for future use if per-trade fees re-enabled)
 - env validation / readiness
 
 ## Things Claude should not get wrong
