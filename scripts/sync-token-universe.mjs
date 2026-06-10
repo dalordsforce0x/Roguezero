@@ -231,6 +231,11 @@ const getTokenSafetySnapshot = (token) => {
     isSus: asBoolean(audit.isSus ?? audit.sus ?? audit.is_sus),
     topHoldersPercentage: asFiniteNumber(audit.topHoldersPercentage, audit.top_holders_percentage),
     devBalancePercentage: asFiniteNumber(audit.devBalancePercentage, audit.dev_balance_percentage),
+    // Momentum + market-cap windows from Jupiter v2 (persisted for runtime tier/size decisions).
+    priceChange1hPct: asFiniteNumber(token?.stats1h?.priceChange),
+    priceChange24hPct: asFiniteNumber(token?.stats24h?.priceChange),
+    mcapUsd: asFiniteNumber(token?.mcap, token?.marketCap, token?.fdv),
+    organicScoreLabel: typeof token?.organicScoreLabel === 'string' ? token.organicScoreLabel : null,
   };
 };
 
@@ -336,7 +341,23 @@ const main = async () => {
 
     await client.query(`
       ALTER TABLE public.rz_token_universe
-        ADD COLUMN IF NOT EXISTS notes TEXT
+        ADD COLUMN IF NOT EXISTS notes TEXT,
+        ADD COLUMN IF NOT EXISTS is_verified BOOLEAN,
+        ADD COLUMN IF NOT EXISTS organic_score NUMERIC,
+        ADD COLUMN IF NOT EXISTS organic_score_label TEXT,
+        ADD COLUMN IF NOT EXISTS liquidity_usd NUMERIC,
+        ADD COLUMN IF NOT EXISTS volume_24h_usd NUMERIC,
+        ADD COLUMN IF NOT EXISTS mcap_usd NUMERIC,
+        ADD COLUMN IF NOT EXISTS holder_count NUMERIC,
+        ADD COLUMN IF NOT EXISTS top_holders_pct NUMERIC,
+        ADD COLUMN IF NOT EXISTS dev_balance_pct NUMERIC,
+        ADD COLUMN IF NOT EXISTS price_change_1h_pct NUMERIC,
+        ADD COLUMN IF NOT EXISTS price_change_24h_pct NUMERIC,
+        ADD COLUMN IF NOT EXISTS mint_auth_disabled BOOLEAN,
+        ADD COLUMN IF NOT EXISTS freeze_auth_disabled BOOLEAN,
+        ADD COLUMN IF NOT EXISTS is_sus BOOLEAN,
+        ADD COLUMN IF NOT EXISTS discovery_source TEXT,
+        ADD COLUMN IF NOT EXISTS synced_at TIMESTAMPTZ
     `);
 
     // First disable all; selected set will be re-enabled.
@@ -351,16 +372,55 @@ const main = async () => {
       const notes = token._rzSafety?.bypassReason === 'core_always_enable'
         ? 'core-seed'
         : `jupiter-token-api-v2:${token._rzDiscoverySource ?? 'unknown'};safety=verified-audit-liquidity`;
+      const s = token._rzSafety?.safety ?? {};
       await client.query(
-        `INSERT INTO public.rz_token_universe (mint, symbol, enabled, priority, notes, updated_at)
-         VALUES ($1, $2, true, $3, $4, now())
+        `INSERT INTO public.rz_token_universe (
+           mint, symbol, enabled, priority, notes,
+           is_verified, organic_score, organic_score_label,
+           liquidity_usd, volume_24h_usd, mcap_usd,
+           holder_count, top_holders_pct, dev_balance_pct,
+           price_change_1h_pct, price_change_24h_pct,
+           mint_auth_disabled, freeze_auth_disabled, is_sus,
+           discovery_source, synced_at, updated_at
+         )
+         VALUES ($1, $2, true, $3, $4,
+                 $5, $6, $7,
+                 $8, $9, $10,
+                 $11, $12, $13,
+                 $14, $15,
+                 $16, $17, $18,
+                 $19, now(), now())
          ON CONFLICT (mint)
          DO UPDATE SET symbol = EXCLUDED.symbol,
                        enabled = true,
                        priority = EXCLUDED.priority,
                        notes = EXCLUDED.notes,
+                       is_verified = EXCLUDED.is_verified,
+                       organic_score = EXCLUDED.organic_score,
+                       organic_score_label = EXCLUDED.organic_score_label,
+                       liquidity_usd = EXCLUDED.liquidity_usd,
+                       volume_24h_usd = EXCLUDED.volume_24h_usd,
+                       mcap_usd = EXCLUDED.mcap_usd,
+                       holder_count = EXCLUDED.holder_count,
+                       top_holders_pct = EXCLUDED.top_holders_pct,
+                       dev_balance_pct = EXCLUDED.dev_balance_pct,
+                       price_change_1h_pct = EXCLUDED.price_change_1h_pct,
+                       price_change_24h_pct = EXCLUDED.price_change_24h_pct,
+                       mint_auth_disabled = EXCLUDED.mint_auth_disabled,
+                       freeze_auth_disabled = EXCLUDED.freeze_auth_disabled,
+                       is_sus = EXCLUDED.is_sus,
+                       discovery_source = EXCLUDED.discovery_source,
+                       synced_at = now(),
                        updated_at = now()`,
-        [mint, sym, priority, notes],
+        [
+          mint, sym, priority, notes,
+          s.isVerified, s.organicScore, s.organicScoreLabel,
+          s.liquidityUsd, s.volume24hUsd, s.mcapUsd,
+          s.holderCount, s.topHoldersPercentage, s.devBalancePercentage,
+          s.priceChange1hPct, s.priceChange24hPct,
+          s.mintAuthorityDisabled, s.freezeAuthorityDisabled, s.isSus,
+          token._rzDiscoverySource ?? null,
+        ],
       );
       idx++;
     }

@@ -7312,6 +7312,14 @@ const executeTrade = async (session: RawSession): Promise<void> => {
         delete reconciledPositions[mint];
         droppedMints.push(`${getPositionSymbol(position)}:${walletInventoryAtomic}/${trackedQuantityAtomic}`);
         reconcileChanged = true;
+      } else if (walletInventoryAtomic !== trackedQuantityAtomic) {
+        // SYNC: on-chain balance exists but differs from DB (e.g. API race doubled it).
+        reconciledPositions[mint] = {
+          ...position,
+          quantityAtomic: String(walletInventoryAtomic),
+        };
+        droppedMints.push(`${getPositionSymbol(position)}:qty_sync:${trackedQuantityAtomic}->${walletInventoryAtomic}`);
+        reconcileChanged = true;
       }
     }
 

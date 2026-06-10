@@ -258,3 +258,114 @@ what we have actually proven in this codebase:
   bleed circuit breaker** distinct from the per-session capital cap.
 - **"Govern parameter changes" → reinforces the Noah-canary-first, one-change-at-a-
   time, prove-on-real-data discipline already in force.**
+
+---
+
+## 5. Jupiter + Solana official docs (execution / cost / SOL-funded path)
+
+Added 2026-06-09 to diagnose the SOL-funded bot (RogueCEO) cost problem. These are
+the authoritative pages for our Router (`/build`) execution path. Research notes
+are mapped to our verified prod behavior, not generic theory.
+
+### URL list (as provided)
+- Solana token extensions: https://solana.com/docs/tokens/extensions
+- Solana transfer-fee extension: https://solana.com/docs/tokens/extensions/transfer-fees
+- Solana JS client: https://solana.com/docs/clients/official/javascript
+- Jupiter rate limits: https://developers.jup.ag/docs/portal/rate-limits
+- Jupiter order & execute: https://developers.jup.ag/docs/swap/order-and-execute
+- Jupiter build (Router): https://developers.jup.ag/docs/swap/build
+- Jupiter common instructions: https://developers.jup.ag/docs/swap/build/common-instructions
+- Jupiter submit: https://developers.jup.ag/docs/transaction/submit
+- Jupiter reduce tx size: https://developers.jup.ag/docs/swap/advanced/reduce-transaction-size
+- Jupiter reduce latency: https://developers.jup.ag/docs/swap/advanced/reduce-latency
+- Jupiter compute units: https://developers.jup.ag/docs/swap/advanced/compute-units
+- Jupiter slippage (RTSE): https://developers.jup.ag/docs/swap/advanced/slippage
+- Jupiter API ref /order: https://developers.jup.ag/docs/api-reference/swap/order
+- Jupiter API ref /execute: https://developers.jup.ag/docs/api-reference/swap/execute
+- Jupiter swap overview: https://developers.jup.ag/docs/swap
+- Jupiter docs repo: https://github.com/jup-ag/docs
+- Jupiter org: https://github.com/jup-ag
+- TeamRaccoons (Metis/router): https://github.com/TeamRaccoons
+
+### Hard facts pulled from the docs (verbatim-accurate)
+
+**Rate limits** (per *account*, NOT per key; 60s sliding window):
+- Keyless 0.5 / Free 1 / Developer 10 / Launch 50 / **Pro 150 RPS** general.
+- `/swap/v2/execute` and `/tx/v1/submit` have **their own dedicated buckets**,
+  separate from general and from each other: Keyless 20 / Free 50 / **Paid 100 RPS**.
+- → Our Jupiter is Pro: **150 RPS general + 100 RPS dedicated /submit**, all 3 keys
+  share one account bucket. Matches our `roguezero-constraints.md`.
+
+**Router `/build` defaults** (the path we use, per CLAUDE.md):
+- `slippageBps` **defaults to 50 (fixed 0.5%)** on `/build`. RTSE is **opt-in** — you
+  must pass the literal string `slippageBps=rtse` to get Jupiter's real-time
+  estimator. Meta-aggregator `/order` gets RTSE automatically; Router does NOT.
+- `platformFeeBps` default 0; needs `feeAccount`. Fee is added inside the swap
+  instruction; `feeAccount` is any SPL token account we control (no referral
+  program needed). → confirms our 35-bps capture wiring.
+- `maxAccounts` default 64 (1-64). `mode=fast` (BETA) for low-latency routing.
+- `computeBudgetInstructions` returns the **CU price but NOT the CU limit** — the
+  integrator must simulate and set the limit themselves.
+
+**Compute units = priority-fee cost (the SOL-cost lever):**
+- `priority fee = compute unit price × compute unit limit`.
+- Doc's exact warning: *"Setting it to the maximum (1,400,000) when you only use
+  200,000 means you pay 7x more than necessary."*
+- Correct flow: simulate with max CU → take `unitsConsumed` → set limit to **1.2×
+  simulated** (capped at 1.4M) → add the CU price instruction from `/build`.
+- `computeUnitPricePercentile`: "medium"=25th, "high"=50th (default), "veryHigh"=75th;
+  `mode=fast` with no percentile defaults to the **90th** percentile.
+
+**`/submit` (Jupiter landing) requires a SOL tip:**
+- **Minimum tip 1,000,000 lamports = 0.001 SOL** to one of 16 tip accounts.
+- `/submit` does NOT simulate (sends straight to TPU). Randomize tip account to
+  avoid write-lock contention. Dedicated 100 RPS bucket on Paid.
+- NOTE: per CLAUDE.md we submit via **Helius RPC**, not Jupiter `/submit` — so the
+  0.001 SOL Jupiter tip does **not** apply to us. But the same principle applies to
+  any Helius Sender tip we attach: a fixed lamport tip is a flat per-trade SOL cost
+  that hits small SOL-funded trades hardest.
+
+**Reduce tx size:** `maxAccounts` lower = simpler route (warning: <50 can break
+routing/pricing). The `/build` setup instructions always include
+`createAssociatedTokenAccountIdempotent` even when the ATA exists — these are no-ops
+that still consume tx bytes; can be stripped with a `getAccountInfo` check.
+
+**Token-2022 transfer-fee extension (PnL correctness):** `TransferFeeConfig` mints
+deduct a fee on **every transfer**, withheld on the destination account. The
+*received* amount is less than the *sent* amount by the fee. If RogueZero ever
+routes into a Token-2022 transfer-fee mint, our on-chain *received delta* already
+reflects the fee — but any sizing/PnL math that assumes received == quoted-out will
+be wrong. Our wallet-truth reconcile (tracks actual on-chain balances) is the
+correct defense; quote-based position math is not.
+
+### Direct mapping to the SOL-funded bot bug (RogueCEO, verified 2026-06-09)
+
+RogueCEO (SOL-funded) now sizes entries correctly (~$4.16 after the economic-floor
+fix) but every entry is cancelled `entry_edge_below_cost` — the **round-trip cost**
+the gate computes is bigger than the edge. The docs point at three concrete,
+checkable cost levers that disproportionately hurt the SOL-funded path:
+
+1. **CU limit may be inflated → priority fee 7× too high.** If our worker sets the
+   CU limit to a fixed max (1.4M) instead of `1.2 × simulated unitsConsumed`, every
+   trade overpays priority fee by up to 7×. That inflates
+   `estimatedNetworkCostLamports`, which feeds BOTH our economic floor AND the
+   `entry_edge_below_cost` gate. ACTION: verify the worker simulates and sets a
+   tight CU limit; if it uses a fixed max, fix it — this is the single highest-value
+   SOL-cost reduction in the docs.
+2. **Fixed lamport tip is a flat SOL tax on small trades.** Whatever tip we attach
+   (Helius Sender) is a constant lamport cost. On a $4 SOL trade it is a large bps
+   share; on a $10 USDC trade it is small — which is exactly why USDC bots (Foxy)
+   clear the cost gate and SOL RogueCEO does not. ACTION: confirm the per-trade tip
+   size and whether it scales or is flat; consider a smaller/scaled tip for small
+   SOL entries.
+3. **We may be on fixed 50-bps slippage, not RTSE.** Router `/build` defaults to a
+   FIXED 0.5% slippage unless we pass `slippageBps=rtse`. Fixed slippage that is too
+   wide widens the modeled cost; too tight raises failure/retry cost. ACTION: verify
+   what slippage value we send to `/build` and whether RTSE would model cost more
+   accurately for our exit-heavy tokens.
+
+> Net for the SOL problem: the floor/sizing fix was necessary but the remaining
+> `entry_edge_below_cost` block is a COST-MODEL problem. The docs say the dominant,
+> controllable SOL cost is priority fee = CU price × CU limit, and the #1 mistake is
+> a fixed max CU limit. That is the next thing to verify in our `/prepare` code
+> before touching the edge model.

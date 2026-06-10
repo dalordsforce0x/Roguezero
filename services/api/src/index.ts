@@ -408,12 +408,19 @@ const upsertPositionEntry = (params: {
   confirmedAt: string;
   markedPriceUsd: number | null;
   status: SessionPositionState['status'];
+  absoluteBalanceAtomic?: number | null;
 }): SessionPositionState => {
   const nextQuantityAtomic = Math.max(0, params.quantityAtomic);
   const existingQuantityAtomic = params.existingPosition?.quantityAtomic
     ? Number(params.existingPosition.quantityAtomic)
     : 0;
-  const totalQuantityAtomic = existingQuantityAtomic + nextQuantityAtomic;
+  // When the on-chain post-balance is available, use it as the authoritative
+  // total instead of additive accounting.  This prevents double-counting when
+  // the worker's inventory reconcile creates the position from on-chain data
+  // before the API reconcile adds the entry delta on top.
+  const totalQuantityAtomic = params.absoluteBalanceAtomic != null && params.absoluteBalanceAtomic > 0
+    ? params.absoluteBalanceAtomic
+    : existingQuantityAtomic + nextQuantityAtomic;
   const existingUiQuantity = params.existingPosition?.positionMint
     ? getPositionUiAmount(params.existingPosition.positionMint, existingQuantityAtomic, params.existingPosition.tokenDecimals ?? null)
     : 0;
@@ -1966,6 +1973,9 @@ const reconcileSubmittedExecutionRecord = async (
           : undefined;
 
         const entryPriceForState = costBasisPerSolUsd ?? markedPriceUsd;
+        const boughtMintPostBalance = transactionDetails
+          ? getTokenPostBalanceAtomic(transactionDetails, { mint: boughtMint, owner: updatedExecution.taker })
+          : null;
         nextPositionsState = normalizePositionsState({
           activePositionMint: boughtMint,
           positions: {
@@ -1981,6 +1991,7 @@ const reconcileSubmittedExecutionRecord = async (
               confirmedAt,
               markedPriceUsd,
               status: 'long',
+              absoluteBalanceAtomic: boughtMintPostBalance,
             }),
           },
         }, null);
@@ -2139,6 +2150,9 @@ const reconcileSubmittedExecutionRecord = async (
           ? { currentBalanceAtomic: String(walletBalanceSnapshot.postBalance) }
           : undefined;
         const entryPriceForState = costBasisPerSolUsd ?? existingPosition?.entryPriceUsd ?? null;
+        const boughtMintPostBalance = transactionDetails
+          ? getTokenPostBalanceAtomic(transactionDetails, { mint: boughtMint, owner: updatedExecution.taker })
+          : null;
         nextPositionsState = normalizePositionsState({
           activePositionMint: boughtMint,
           positions: {
@@ -2154,6 +2168,7 @@ const reconcileSubmittedExecutionRecord = async (
               confirmedAt,
               markedPriceUsd,
               status: 'long_sol',
+              absoluteBalanceAtomic: boughtMintPostBalance,
             }),
           },
         }, null);
