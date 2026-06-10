@@ -1190,29 +1190,30 @@ function RecentTradesTable({ trades }: { trades: SessionHealthData['recentTrades
                       : 'text-yellow-300';
 
                 // Row-level color coding so the receipt tape reads at a glance:
-                //   profit exit (take_profit)        -> green
-                //   loss exit (stop_loss)            -> red
-                //   profit-protect exit (trailing /  -> amber
-                //     signal_reversal)
-                //   entry / buy                      -> blue
-                //   reconcile / wallet / unconfirmed -> neutral
+                // Exit trigger labels — these describe the EXIT MECHANISM, not the
+                // financial outcome. A "TP" exit can still lose money after costs.
+                //   take_profit trigger (TP)          -> cyan (neutral, just a trigger)
+                //   stop_loss trigger (SL)            -> red
+                //   trailing_stop / signal_reversal   -> amber
+                //   entry / buy                       -> blue
+                //   reconcile / wallet / unconfirmed  -> neutral
                 const isConfirmed = trade.status === 'confirmed';
                 const exitReason = trade.exitReason;
                 const isEntry = !exitReason && !!trade.entryStrategy;
                 let rowTone = 'border-b border-gray-800/50';
                 let kindLabel: string | null = null;
                 if (isConfirmed && exitReason === 'take_profit') {
-                  rowTone = 'border-b border-gray-800/50 bg-emerald-950/30 border-l-2 border-l-emerald-400';
-                  kindLabel = 'PROFIT';
+                  rowTone = 'border-b border-gray-800/50 bg-cyan-950/25 border-l-2 border-l-cyan-400';
+                  kindLabel = 'TP';
                 } else if (isConfirmed && exitReason === 'stop_loss') {
                   rowTone = 'border-b border-gray-800/50 bg-rose-950/30 border-l-2 border-l-rose-400';
-                  kindLabel = 'LOSS';
+                  kindLabel = 'SL';
                 } else if (isConfirmed && (exitReason === 'trailing_stop' || exitReason === 'signal_reversal')) {
                   rowTone = 'border-b border-gray-800/50 bg-amber-950/25 border-l-2 border-l-amber-400';
-                  kindLabel = 'LOCK';
+                  kindLabel = 'EXIT';
                 } else if (isConfirmed && isEntry) {
                   rowTone = 'border-b border-gray-800/50 bg-sky-950/25 border-l-2 border-l-sky-400';
-                  kindLabel = 'BOUGHT';
+                  kindLabel = 'BUY';
                 }
 
                 return (
@@ -1225,9 +1226,9 @@ function RecentTradesTable({ trades }: { trades: SessionHealthData['recentTrades
                       {trade.status}
                       {kindLabel && (
                         <span className={`ml-1.5 rounded px-1 py-0.5 text-[9px] font-bold uppercase tracking-wider ${
-                          kindLabel === 'PROFIT' ? 'bg-emerald-500/20 text-emerald-300'
-                            : kindLabel === 'LOSS' ? 'bg-rose-500/20 text-rose-300'
-                              : kindLabel === 'LOCK' ? 'bg-amber-500/20 text-amber-300'
+                          kindLabel === 'TP' ? 'bg-cyan-500/20 text-cyan-300'
+                            : kindLabel === 'SL' ? 'bg-rose-500/20 text-rose-300'
+                              : kindLabel === 'EXIT' ? 'bg-amber-500/20 text-amber-300'
                                 : 'bg-sky-500/20 text-sky-300'
                         }`}>{kindLabel}</span>
                       )}

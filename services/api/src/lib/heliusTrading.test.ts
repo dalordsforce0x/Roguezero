@@ -5,6 +5,8 @@ import {
   buildPriorityFeeEstimateRequest,
   composePreparedSwapInstructions,
   getHeliusTradingConfig,
+  getSenderEndpointForTier,
+  getTipLamportsForTier,
   parsePriorityFeeEstimateResponse,
 } from './heliusTrading.js';
 
@@ -60,12 +62,17 @@ test('composePreparedSwapInstructions keeps Jupiter compute budget instructions 
   assert.equal(instructions[1], computeBudgetInstruction);
 });
 
-test('priority fee config defaults to trading-safe settings', () => {
+test('priority fee config defaults to SWQoS-only with low tip', () => {
   const config = getHeliusTradingConfig({});
   assert.equal(config.senderEnabled, true);
   assert.equal(config.gatekeeperEnabled, true);
+  assert.equal(config.senderUseSwqosOnly, true);
   assert.equal(config.priorityFeeLevel, 'Medium');
-  assert.equal(config.senderMinTipLamports, 200_000);
+  assert.equal(config.senderMinTipLamports, 5_000);
+  assert.equal(config.senderElevatedTipLamports, 50_000);
+  assert.equal(config.senderUrgentTipLamports, 200_000);
+  assert.ok(config.senderEndpoint.includes('swqos_only=true'));
+  assert.ok(!config.senderEscalationEndpoint.includes('swqos_only'));
 });
 
 test('buildPriorityFeeEstimateRequest uses recommended pricing', () => {
@@ -87,4 +94,26 @@ test('parsePriorityFeeEstimateResponse applies multiplier and fallback', () => {
     48_000,
   );
   assert.equal(parsePriorityFeeEstimateResponse({}, 50_000, 1.2), 60_000);
+});
+
+test('getTipLamportsForTier returns correct amounts per tier', () => {
+  const config = getHeliusTradingConfig({});
+  assert.equal(getTipLamportsForTier(config, 'normal'), 5_000);
+  assert.equal(getTipLamportsForTier(config, 'elevated'), 50_000);
+  assert.equal(getTipLamportsForTier(config, 'urgent'), 200_000);
+});
+
+test('getSenderEndpointForTier uses escalation endpoint for urgent tier', () => {
+  const config = getHeliusTradingConfig({});
+  assert.equal(getSenderEndpointForTier(config, 'normal'), config.senderEndpoint);
+  assert.equal(getSenderEndpointForTier(config, 'elevated'), config.senderEndpoint);
+  assert.equal(getSenderEndpointForTier(config, 'urgent'), config.senderEscalationEndpoint);
+});
+
+test('regional Sender endpoint is used when HELIUS_SENDER_REGION is set', () => {
+  const config = getHeliusTradingConfig({ HELIUS_SENDER_REGION: 'ewr' });
+  assert.ok(config.senderEndpoint.includes('ewr-sender'));
+  assert.ok(config.senderEndpoint.includes('swqos_only=true'));
+  assert.ok(config.senderEscalationEndpoint.includes('ewr-sender'));
+  assert.ok(!config.senderEscalationEndpoint.includes('swqos_only'));
 });

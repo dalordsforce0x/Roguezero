@@ -100,8 +100,11 @@ import {
   buildPriorityFeeEstimateRequest,
   composePreparedSwapInstructions,
   getHeliusTradingConfig,
+  getSenderEndpointForTier,
+  getTipLamportsForTier,
   parsePriorityFeeEstimateResponse,
   parseSenderSignature,
+  type TipTier,
 } from './lib/heliusTrading.js';
 import {
   computeSolInputEntryPriceUsd,
@@ -525,6 +528,7 @@ type JupiterSubmitRequestBody = {
   blockhash?: unknown;
   lastValidBlockHeight?: unknown;
   maxRetries?: unknown;
+  tipTier?: unknown;
 };
 
 type ValidatedJupiterSubmitRequest = {
@@ -533,6 +537,7 @@ type ValidatedJupiterSubmitRequest = {
   blockhash?: string;
   lastValidBlockHeight?: number;
   maxRetries?: number;
+  tipTier?: TipTier;
 };
 
 type JupiterInstructionAccount = {
@@ -900,12 +905,18 @@ const parseJupiterSubmitRequest = (body: JupiterSubmitRequestBody) => {
     return { ok: false as const, errors };
   }
 
+  const rawTipTier = asOptionalString(body.tipTier as unknown);
+  const tipTier: TipTier | undefined = rawTipTier === 'elevated' || rawTipTier === 'urgent'
+    ? rawTipTier
+    : rawTipTier === 'normal' ? 'normal' : undefined;
+
   const value: ValidatedJupiterSubmitRequest = {
     executionId: executionId!,
     signedTransactionBase64: signedTransactionBase64!,
     blockhash,
     lastValidBlockHeight,
     maxRetries,
+    tipTier,
   };
 
   return {
@@ -1353,11 +1364,12 @@ const estimatePriorityFeeMicroLamports = async (params: {
   );
 };
 
-const sendViaHeliusSender = async (signedTransactionBase64: string) => {
+const sendViaHeliusSender = async (signedTransactionBase64: string, tipTier: TipTier = 'normal') => {
+  const endpoint = getSenderEndpointForTier(heliusTradingConfig, tipTier);
   const result = await fetchJsonWithRetry({
     label: 'helius-sender',
     budget: { reserve: reserveHeliusSender },
-    request: () => fetch(heliusTradingConfig.senderEndpoint, {
+    request: () => fetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -2950,10 +2962,17 @@ app.post('/jupiter/swap/prepare', { config: { rateLimit: { max: INTERNAL_SWAP_PR
   const estimatedSenderTipLamports = heliusTradingConfig.senderEnabled
     ? (senderTipLamports ?? heliusTradingConfig.senderMinTipLamports)
     : 0;
+  // ATA rent: each setupInstruction that creates a new token account costs
+  // ~2,039,280 lamports of locked rent. Include this in the cost estimate so
+  // the worker's trade gate sees the real cost instead of approving underwater
+  // entries. Rent is recoverable when the ATA is closed, but the cost is real
+  // at entry time and must be accounted for.
+  const estimatedAtaRentLamports = (build.setupInstructions?.length ?? 0) * 2_039_280;
   const estimatedNetworkCostLamports =
     estimatedBaseTxFeeLamports +
     estimatedPriorityFeeLamports +
-    estimatedSenderTipLamports;
+    estimatedSenderTipLamports +
+    estimatedAtaRentLamports;
   const preparedInstructions = composePreparedSwapInstructions({
     senderEnabled: heliusTradingConfig.senderEnabled,
     payer,
@@ -3121,7 +3140,7 @@ app.post('/jupiter/swap/submit', { config: { rateLimit: { max: INTERNAL_SWAP_SUB
     return reply.status(400).send({ error: 'Invalid submit request', issues: parsed.errors });
   }
 
-  const { executionId, signedTransactionBase64, blockhash, lastValidBlockHeight, maxRetries } = parsed.value;
+  const { executionId, signedTransactionBase64, blockhash, lastValidBlockHeight, maxRetries, tipTier } = parsed.value;
   const existingExecution = await getExecutionById(executionId);
 
   if (!existingExecution) {
@@ -3301,8 +3320,9 @@ app.post('/jupiter/swap/submit', { config: { rateLimit: { max: INTERNAL_SWAP_SUB
   }
 
   try {
+    const effectiveTipTier: TipTier = tipTier ?? 'normal';
     const signature = heliusTradingConfig.senderEnabled
-      ? await sendViaHeliusSender(signedTransactionBase64)
+      ? await sendViaHeliusSender(signedTransactionBase64, effectiveTipTier)
       : await rlSendRawTransaction(transaction.serialize(), maxRetries);
     const now = new Date().toISOString();
     const persistedExecution = await updateSubmittedExecution({
@@ -3370,6 +3390,18 @@ app.post('/jupiter/swap/submit', { config: { rateLimit: { max: INTERNAL_SWAP_SUB
 const start = async () => {
   try {
     await app.listen({ port, host: '::' });
+
+    // Sender connection warming: ping every 5s to keep HTTP connections hot.
+    // Cold connections add latency to the first trade after idle periods.
+    if (heliusTradingConfig.senderEnabled) {
+      const warmSenderConnection = () => {
+        const endpoint = heliusTradingConfig.senderEndpoint.replace(/\/fast.*$/, '/ping');
+        fetch(endpoint).catch(() => {});
+      };
+      warmSenderConnection();
+      setInterval(warmSenderConnection, 5_000);
+      app.log.info({ endpoint: heliusTradingConfig.senderEndpoint }, 'sender connection warming started');
+    }
   } catch (error) {
     app.log.error(error);
     process.exit(1);

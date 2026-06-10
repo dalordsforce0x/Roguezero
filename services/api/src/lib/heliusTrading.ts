@@ -25,12 +25,18 @@ export const SENDER_TIP_ACCOUNTS = [
 export const priorityLevelValues = ['Medium', 'High', 'VeryHigh'] as const;
 export type PriorityLevel = (typeof priorityLevelValues)[number];
 
+export const tipTierValues = ['normal', 'elevated', 'urgent'] as const;
+export type TipTier = (typeof tipTierValues)[number];
+
 export type HeliusTradingConfig = {
   gatekeeperEnabled: boolean;
   senderEnabled: boolean;
   senderEndpoint: string;
+  senderEscalationEndpoint: string;
   senderUseSwqosOnly: boolean;
   senderMinTipLamports: number;
+  senderElevatedTipLamports: number;
+  senderUrgentTipLamports: number;
   priorityFeeLevel: PriorityLevel;
   priorityFeeMultiplier: number;
   priorityFeeFallbackMicroLamports: number;
@@ -57,19 +63,36 @@ const parsePriorityLevel = (value: string | undefined): PriorityLevel => {
 };
 
 export const getHeliusTradingConfig = (env: NodeJS.ProcessEnv): HeliusTradingConfig => {
-  const senderUseSwqosOnly = parseBoolean(env.HELIUS_SENDER_USE_SWQOS_ONLY, false);
-  const defaultSenderEndpoint = senderUseSwqosOnly
-    ? 'https://sender.helius-rpc.com/fast?swqos_only=true'
-    : 'https://sender.helius-rpc.com/fast';
+  // Default to SWQoS-only: staked connections without Jito auction.
+  // 38x cheaper tips (5K vs 200K lamports). Escalate to full Sender on congestion.
+  const senderUseSwqosOnly = parseBoolean(env.HELIUS_SENDER_USE_SWQOS_ONLY, true);
+  const senderRegion = (env.HELIUS_SENDER_REGION ?? '').toLowerCase().trim();
+  const regionalBase = senderRegion === 'slc'
+    ? 'http://slc-sender.helius-rpc.com/fast'
+    : senderRegion === 'ewr'
+      ? 'http://ewr-sender.helius-rpc.com/fast'
+      : 'https://sender.helius-rpc.com/fast';
+  const swqosEndpoint = `${regionalBase}${regionalBase.includes('?') ? '&' : '?'}swqos_only=true`;
+  const fullEndpoint = regionalBase;
+  const defaultSenderEndpoint = senderUseSwqosOnly ? swqosEndpoint : fullEndpoint;
 
   return {
     gatekeeperEnabled: parseBoolean(env.HELIUS_GATEKEEPER_ENABLED, true),
     senderEnabled: parseBoolean(env.HELIUS_SENDER_ENABLED, true),
     senderEndpoint: env.HELIUS_SENDER_ENDPOINT || defaultSenderEndpoint,
+    senderEscalationEndpoint: env.HELIUS_SENDER_ESCALATION_ENDPOINT || fullEndpoint,
     senderUseSwqosOnly,
     senderMinTipLamports: parsePositiveInt(
       env.HELIUS_SENDER_MIN_TIP_LAMPORTS,
-      senderUseSwqosOnly ? 5_000 : 200_000,
+      5_000,
+    ),
+    senderElevatedTipLamports: parsePositiveInt(
+      env.HELIUS_SENDER_ELEVATED_TIP_LAMPORTS,
+      50_000,
+    ),
+    senderUrgentTipLamports: parsePositiveInt(
+      env.HELIUS_SENDER_URGENT_TIP_LAMPORTS,
+      200_000,
     ),
     priorityFeeLevel: parsePriorityLevel(env.HELIUS_PRIORITY_FEE_LEVEL),
     priorityFeeMultiplier: parsePositiveNumber(env.HELIUS_PRIORITY_FEE_MULTIPLIER, 1.2),
@@ -78,6 +101,20 @@ export const getHeliusTradingConfig = (env: NodeJS.ProcessEnv): HeliusTradingCon
       50_000,
     ),
   };
+};
+
+export const getTipLamportsForTier = (config: HeliusTradingConfig, tier: TipTier): number => {
+  switch (tier) {
+    case 'urgent': return config.senderUrgentTipLamports;
+    case 'elevated': return config.senderElevatedTipLamports;
+    default: return config.senderMinTipLamports;
+  }
+};
+
+export const getSenderEndpointForTier = (config: HeliusTradingConfig, tier: TipTier): string => {
+  // urgent tier uses full Sender (SWQoS + Jito dual-route) for maximum landing probability
+  if (tier === 'urgent') return config.senderEscalationEndpoint;
+  return config.senderEndpoint;
 };
 
 export const selectSenderTipAccount = (random = Math.random) => {

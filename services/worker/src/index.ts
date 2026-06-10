@@ -483,6 +483,23 @@ let autoShiftUpStreak = 0;
 let lastAutoShiftEvalAt = 0;
 let lastAutoShiftReason = 'init';
 let lastAutoShiftTransitionAt: string | null = null;
+
+// ── Dynamic Sender tip tier ─────────────────────────────────────────────────
+// Maps fleet pressure state to a tip tier sent with each swap submit.
+// - normal (SWQoS-only, 5K lamport tip): default, cheapest path
+// - elevated (SWQoS-only, 50K tip): when fleet is under pressure or exits are stuck
+// - urgent (full Sender + Jito, 200K tip): glide mode or exit-critical trades
+type TipTier = 'normal' | 'elevated' | 'urgent';
+const getFleetTipTier = (isExitTrade: boolean = false): TipTier => {
+  // Urgent: glide mode means heavy pressure — use full Jito for better landing
+  if (liveSpeedProfileName === 'glide') return 'urgent';
+  // Exits that are stuck should escalate to ensure they land
+  if (isExitTrade && liveSpeedProfileName === 'pulse') return 'elevated';
+  // Pulse mode with budget pressure: elevated tips
+  if (liveSpeedProfileName === 'pulse') return 'elevated';
+  // Surge (healthy): cheapest path
+  return 'normal';
+};
 const WORKER_INSTANCE_ID = process.env.WORKER_INSTANCE_ID?.trim() || `worker-${process.pid}-${randomUUID()}`;
 
 // â”€â”€ DB pool â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -5218,6 +5235,7 @@ const convertSolToUsdc = async (
     signedTransactionBase64: Buffer.from(tx.serialize()).toString('base64'),
     blockhash: prepare.data.blockhash,
     lastValidBlockHeight: prepare.data.lastValidBlockHeight,
+    tipTier: getFleetTipTier(),
   });
 
   if (!submit.ok) {
@@ -5297,6 +5315,7 @@ const convertUsdcToSol = async (
     signedTransactionBase64: Buffer.from(tx.serialize()).toString('base64'),
     blockhash: prepare.data.blockhash,
     lastValidBlockHeight: prepare.data.lastValidBlockHeight,
+    tipTier: getFleetTipTier(),
   });
 
   if (!submit.ok) {
@@ -5405,6 +5424,61 @@ const CAPITAL_TOPUP_KEEP_LAMPORTS = Math.max(
 const CAPITAL_TOPUP_MIN_EXCESS_LAMPORTS = Number(
   process.env.WORKER_CAPITAL_TOPUP_MIN_EXCESS_LAMPORTS ?? 20_000_000, // 0.02 SOL default
 );
+
+// Close empty token accounts (ATAs) mid-session to reclaim locked rent (~0.00204 SOL
+// per account). Runs after exit sells confirm and positions are reconciled away.
+// Each close reclaims rent back to the session wallet, keeping gas reserves healthy
+// and avoiding capital drain from accumulated empty ATAs.
+const maybeCloseEmptyTokenAccounts = async (
+  session: RawSession,
+  keypair: Keypair,
+  onChainAccounts: SessionTokenAccount[],
+  currencyMints: Set<string>,
+  openPositionMints: Set<string>,
+): Promise<number> => {
+  const closeable: SessionTokenAccount[] = [];
+  for (const acct of onChainAccounts) {
+    const mint = acct.account.mint.toBase58();
+    // Never close ATAs for currency mints (SOL/USDC) or open positions.
+    if (currencyMints.has(mint) || openPositionMints.has(mint)) continue;
+    // Only close if balance is zero (empty after sell).
+    if (Number(acct.account.amount) > 0) continue;
+    // Skip if close authority is not the session wallet (foreign-controlled).
+    if (acct.account.closeAuthority && !acct.account.closeAuthority.equals(keypair.publicKey)) continue;
+    closeable.push(acct);
+  }
+  if (closeable.length === 0) return 0;
+
+  // Batch up to 20 closes per tx (to stay within compute limits).
+  const BATCH_SIZE = 20;
+  let totalClosed = 0;
+  for (let i = 0; i < closeable.length; i += BATCH_SIZE) {
+    const batch = closeable.slice(i, i + BATCH_SIZE);
+    const instructions = batch.map((acct) =>
+      createCloseAccountInstruction(acct.address, keypair.publicKey, keypair.publicKey, [], acct.programId),
+    );
+    try {
+      const { blockhash, lastValidBlockHeight } = await rlGetLatestBlockhash();
+      const tx = new VersionedTransaction(new TransactionMessage({
+        payerKey: keypair.publicKey,
+        recentBlockhash: blockhash,
+        instructions,
+      }).compileToV0Message());
+      tx.sign([keypair]);
+      const sig = await rlSendRawTransaction(tx.serialize());
+      const confirmation = await rlConfirmTransaction({ signature: sig, blockhash, lastValidBlockHeight });
+      if (confirmation.value.err) {
+        log('warn', session.id, `ATA close batch failed: ${JSON.stringify(confirmation.value.err)}`);
+        continue;
+      }
+      totalClosed += batch.length;
+      log('info', session.id, `closed ${batch.length} empty ATAs, reclaimed ~${(batch.length * 0.00204).toFixed(4)} SOL · sig ${sig}`);
+    } catch (err) {
+      log('warn', session.id, `ATA close batch error: ${(err as Error).message}`);
+    }
+  }
+  return totalClosed;
+};
 
 const maybeTopUpTradingCapitalFromSol = async (
   session: RawSession,
@@ -6322,13 +6396,6 @@ const evaluateExitTrigger = (
   }
 
   if (pnlBps !== null && pnlBps <= -thresholds.stopLossBps) {
-    // Cost-basis sanity guard: if the entryPriceUsd is wildly divergent from the
-    // current mark, it is a fabricated orphan mark, not a real fill. Suppress
-    // the stop_loss entirely  these phantom losses are not real market moves.
-    const entryDriftBps = positionState.entryPriceUsd && markPriceUsd && markPriceUsd > 0
-      ? Math.abs((positionState.entryPriceUsd - markPriceUsd) / markPriceUsd * 10_000)
-      : 0;
-    if (entryDriftBps <= WORKER_MAX_SANE_ENTRY_DRIFT_BPS) {
     // Anti-churn: suppress the stop inside the min-hold window unless the loss is a
     // genuine blowout past the hard floor. Recovering positions then exit via
     // take_profit/trailing; true disasters still cut immediately.
@@ -6344,7 +6411,6 @@ const evaluateExitTrigger = (
         trailingDrawdownBps,
         thresholds,
       };
-    }
     }
   }
 
@@ -7162,12 +7228,14 @@ const executeTrade = async (session: RawSession): Promise<void> => {
   //     forever (invisible to PnL, never sold).
   // Base/gas currencies (the funding mint, SOL, USDC) are managed by the capital
   // and gas keep-alive logic, not as tradeable positions, so they are excluded.
+  let onChainAccounts: SessionTokenAccount[] = [];
+
   {
     const fundingMint = session.funding.fundingMint;
     const currencyMints = new Set<string>([fundingMint, SOL_MINT, USDC_MINT]);
     const ORPHAN_RECOVERY_MIN_USD = Number(process.env.WORKER_ORPHAN_RECOVERY_MIN_USD ?? 0.5);
 
-    let onChainAccounts: SessionTokenAccount[] = [];
+    onChainAccounts = [];
     try {
       onChainAccounts = await getSessionTokenAccounts(keypair.publicKey);
     } catch (error) {
@@ -7298,6 +7366,21 @@ const executeTrade = async (session: RawSession): Promise<void> => {
   for (const mint of openPositionMints) {
     if (mint !== SOL_MINT && mint !== USDC_MINT && mint !== session.funding.fundingMint) {
       heldPositionMints.add(mint);
+    }
+  }
+
+  // Reclaim rent from empty ATAs left by exited positions. Runs after
+  // reconcile so we know which mints are truly gone, and after
+  // openPositionMints is computed so we never close an active position's ATA.
+  if (onChainAccounts.length > 0) {
+    const currencyMints = new Set<string>([session.funding.fundingMint, SOL_MINT, USDC_MINT]);
+    try {
+      const closed = await maybeCloseEmptyTokenAccounts(session, keypair, onChainAccounts, currencyMints, openPositionMints);
+      if (closed > 0) {
+        balance = await rlGetBalance(keypair.publicKey);
+      }
+    } catch (err) {
+      log('warn', session.id, `ATA cleanup error: ${(err as Error).message}`);
     }
   }
 
@@ -9142,6 +9225,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
     signedTransactionBase64: signedBase64,
     blockhash:              prepare.data.blockhash,
     lastValidBlockHeight:   prepare.data.lastValidBlockHeight,
+    tipTier:                getFleetTipTier(tradePlan.direction === 'exit_long'),
   });
 
   if (!submit.ok) {
@@ -10253,6 +10337,7 @@ const liquidateOpenPositionsToBase = async (session: RawSession): Promise<void> 
         signedTransactionBase64: Buffer.from(tx.serialize()).toString('base64'),
         blockhash: prepare.data.blockhash,
         lastValidBlockHeight: prepare.data.lastValidBlockHeight,
+    tipTier: 'urgent',
       });
 
       if (!submit.ok) {

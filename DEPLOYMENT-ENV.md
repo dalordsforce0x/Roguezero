@@ -62,6 +62,14 @@ Profit payout: `WORKER_MIN_PROFIT_TRANSFER_USD` (0.25).
 
 ## PENDING FOR NEXT DEPLOY
 
+- **Dynamic tip tier / SWQoS-only Sender** — safe defaults in code; all optional:
+   - `HELIUS_SENDER_USE_SWQOS_ONLY` default `true` (was `false`; now SWQoS-only by default — 5K vs 200K lamport tip)
+   - `HELIUS_SENDER_REGION` default empty (global endpoint). Set to `ewr` for US-East regional Sender.
+   - `HELIUS_SENDER_MIN_TIP_LAMPORTS` default `5000` (normal tier)
+   - `HELIUS_SENDER_ELEVATED_TIP_LAMPORTS` default `50000` (elevated tier, used under Pulse pressure)
+   - `HELIUS_SENDER_URGENT_TIP_LAMPORTS` default `200000` (urgent tier, used under Glide pressure or liquidation)
+   - `HELIUS_SENDER_ESCALATION_ENDPOINT` default full Sender URL (no `swqos_only` flag; enables Jito dual-route for urgent)
+
 - **Item 2/4 (ATR exits)** — safe defaults in code; add to Railway only if tuning is needed:
    - `WORKER_ATR_TP_MULT` default `1.8`
    - `WORKER_ATR_SL_MULT` default `1.0`
