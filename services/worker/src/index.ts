@@ -6382,6 +6382,12 @@ const refreshPositionsMarks = async (
     }
   }
   const roundedPortfolio = Number(totalPortfolioValueUsd.toFixed(6));
+  // Compute starting value in USD for PnL comparison
+  const startAtomic = Number(session.funding.startingBalanceAtomic ?? '0');
+  const startingValueUsd = session.funding.fundingMint === USDC_MINT
+    ? startAtomic / USDC_ATOMIC_PER_USD
+    : (startAtomic / 1_000_000_000) * solPriceForPortfolio;
+  const roundedStartingValue = Number(startingValueUsd.toFixed(6));
 
   const roundedUnrealized = Number(totalUnrealizedPnlUsd.toFixed(6));
   const fundingPatchObj: Record<string, unknown> = {};
@@ -6390,6 +6396,9 @@ const refreshPositionsMarks = async (
   }
   if (roundedPortfolio !== (session.funding as any).totalPortfolioValueUsd) {
     fundingPatchObj.totalPortfolioValueUsd = roundedPortfolio;
+  }
+  if (roundedStartingValue > 0 && roundedStartingValue !== (session.funding as any).startingValueUsd) {
+    fundingPatchObj.startingValueUsd = roundedStartingValue;
   }
   if (Object.keys(fundingPatchObj).length > 0) {
     await mergeFundingPatch(session, fundingPatchObj);
@@ -9547,6 +9556,7 @@ const entryGateReasons = new Set([
   'risk_circuit_breaker',
   'session_loss_limit_reached',
   'daily_loss_limit_reached',
+  'entry_cooldown_active',
 ]);
 
 const marketWaitReasons = new Set([
@@ -9644,7 +9654,7 @@ const buildSessionHealthState = ({
     };
   }
 
-  if (reason && (exitBlockedReasons.has(reason) || hasOpenPositions)) {
+  if (reason && exitBlockedReasons.has(reason)) {
     return {
       state: 'exit_blocked',
       severity: blockerCount >= 3 ? 'error' : 'warn',
