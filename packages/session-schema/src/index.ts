@@ -332,6 +332,9 @@ export const sessionPositionStateSchema = z.object({
   // correlated against entry quality. Shadow/diagnostic only; null when unscored.
   entryQualityScore: z.number().int().min(0).max(100).nullable().default(null),
   entryQualityBand: z.enum(['strong', 'fair', 'weak', 'reject']).nullable().default(null),
+  // Entry-leg cost in bps (slippage + network fees) captured at trade confirm.
+  // Used by exit cost floor to ensure take-profit covers round-trip costs.
+  entryCostBps: z.number().int().min(0).nullable().default(null),
   pendingExitReason: sessionPositionExitReasonSchema.nullable().default(null),
   exitReason: sessionPositionExitReasonSchema.nullable().default(null),
   partialExitDone: z.boolean().default(false),
@@ -456,6 +459,7 @@ const defaultSessionPositionState: NonNullable<SessionServiceControl['positionSt
   maxAdverseAt: null,
   entryQualityScore: null,
   entryQualityBand: null,
+  entryCostBps: null,
   pendingExitReason: null,
   exitReason: null,
   partialExitDone: false,

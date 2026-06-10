@@ -450,6 +450,7 @@ const upsertPositionEntry = (params: {
     maxAdverseAt: params.existingPosition?.maxAdverseAt ?? null,
     entryQualityScore: params.existingPosition?.entryQualityScore ?? null,
     entryQualityBand: params.existingPosition?.entryQualityBand ?? null,
+    entryCostBps: params.existingPosition?.entryCostBps ?? null,
     pendingExitReason: null,
     partialExitDone: params.existingPosition?.partialExitDone ?? false,
     exitReason: null,
@@ -1368,6 +1369,7 @@ const estimatePriorityFeeMicroLamports = async (params: {
     result.payload,
     heliusTradingConfig.priorityFeeFallbackMicroLamports,
     heliusTradingConfig.priorityFeeMultiplier,
+    heliusTradingConfig.priorityFeeCapMicroLamports,
   );
 };
 
@@ -2519,6 +2521,28 @@ app.get('/health', async () => ({
   timestamp: new Date().toISOString(),
 }));
 
+// ── DB proxy for admin (admin can't reach TigerData directly from Railway) ──
+app.post('/internal/db-query', async (request, reply) => {
+  const body = request.body as { text?: string; values?: unknown[] } | undefined;
+  if (!body?.text || typeof body.text !== 'string') {
+    return reply.status(400).send({ error: 'Missing "text" in request body' });
+  }
+  // Block destructive DDL — admin should only read + light writes
+  const upperText = body.text.trimStart().toUpperCase();
+  if (upperText.startsWith('DROP ') || upperText.startsWith('TRUNCATE ')) {
+    return reply.status(403).send({ error: 'Destructive DDL not allowed via proxy' });
+  }
+  try {
+    const pool = getPool();
+    const result = await pool.query(body.text, body.values ?? []);
+    return reply.send({ rows: result.rows, rowCount: result.rowCount });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    app.log.error({ err: msg }, 'db-query proxy error');
+    return reply.status(500).send({ error: msg });
+  }
+});
+
 app.get('/ops/deploy-drain', async () => {
   const pool = getPool();
   const runtimeControl = await getLiveRuntimeControl();
@@ -2978,16 +3002,17 @@ app.post('/jupiter/swap/prepare', { config: { rateLimit: { max: INTERNAL_SWAP_PR
     ? (senderTipLamports ?? heliusTradingConfig.senderMinTipLamports)
     : 0;
   // ATA rent: each setupInstruction that creates a new token account costs
-  // ~2,039,280 lamports of locked rent. Include this in the cost estimate so
-  // the worker's trade gate sees the real cost instead of approving underwater
-  // entries. Rent is recoverable when the ATA is closed, but the cost is real
-  // at entry time and must be accounted for.
+  // ~2,039,280 lamports of locked rent. Rent is recoverable when the ATA is
+  // closed at position exit, so it is NOT included in estimatedNetworkCostLamports
+  // (which the worker's trade gate uses to decide if a trade is economically
+  // viable). Including it was causing the gate to reject every first-time token
+  // entry because the "cost" dwarfed the trade size. Reported separately so the
+  // worker can still account for the SOL that will be temporarily locked.
   const estimatedAtaRentLamports = (build.setupInstructions?.length ?? 0) * 2_039_280;
   const estimatedNetworkCostLamports =
     estimatedBaseTxFeeLamports +
     estimatedPriorityFeeLamports +
-    estimatedSenderTipLamports +
-    estimatedAtaRentLamports;
+    estimatedSenderTipLamports;
   const preparedInstructions = composePreparedSwapInstructions({
     senderEnabled: heliusTradingConfig.senderEnabled,
     payer,
@@ -3094,6 +3119,7 @@ app.post('/jupiter/swap/prepare', { config: { rateLimit: { max: INTERNAL_SWAP_PR
         estimatedPriorityFeeLamports,
         senderTipLamports: estimatedSenderTipLamports,
         estimatedNetworkCostLamports,
+        estimatedAtaRentLamports,
       },
       blockhash,
       lastValidBlockHeight: build.blockhashWithMetadata.lastValidBlockHeight ?? null,
@@ -3127,6 +3153,7 @@ app.post('/jupiter/swap/prepare', { config: { rateLimit: { max: INTERNAL_SWAP_PR
       estimatedPriorityFeeLamports,
       senderTipLamports: estimatedSenderTipLamports,
       estimatedNetworkCostLamports,
+      estimatedAtaRentLamports,
     },
     blockhash,
     lastValidBlockHeight: build.blockhashWithMetadata.lastValidBlockHeight ?? null,

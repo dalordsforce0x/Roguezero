@@ -45,6 +45,9 @@ const envSchema = z.object({
   DATABASE_PROVIDER: z.enum(['tigerdata', 'supabase']).default('tigerdata'),
   DATABASE_URL: optionalConfiguredString(z.string().min(1)),
   DATABASE_PRIVATE_URL: optionalConfiguredString(z.string().min(1)),
+  // Performance fee: 0.33% of net session profit at session end
+  PERFORMANCE_FEE_BPS: z.coerce.number().int().min(0).max(1000).default(33),
+  PERFORMANCE_FEE_COLLECTOR_WALLET: optionalConfiguredString(z.string().min(32)),
   NEXT_PUBLIC_APP_NAME: z.string().min(1),
   NEXT_PUBLIC_SOLANA_NETWORK: z.enum(['mainnet-beta', 'devnet']).default('mainnet-beta'),
 });
@@ -396,6 +399,25 @@ export const getWorkerSizingPolicy = (env: NodeJS.ProcessEnv): WorkerSizingPolic
     tradeFractionBps,
     minTradeLamports,
     maxTradeLamports,
+  };
+};
+
+// ── Performance fee config ────────────────────────────────────────────────────
+// 0.33% of net session profit deducted at session end before funds return home.
+export type PerformanceFeeConfig = {
+  feeBps: number;
+  collectorWallet: string | null;
+  enabled: boolean;
+};
+
+export const getPerformanceFeeConfig = (env: NodeJS.ProcessEnv): PerformanceFeeConfig => {
+  const config = envSchema.parse(env);
+  const feeBps = config.PERFORMANCE_FEE_BPS;
+  const collectorWallet = config.PERFORMANCE_FEE_COLLECTOR_WALLET ?? null;
+  return {
+    feeBps,
+    collectorWallet,
+    enabled: feeBps > 0 && collectorWallet !== null,
   };
 };
 

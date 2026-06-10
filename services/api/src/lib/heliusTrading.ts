@@ -40,6 +40,7 @@ export type HeliusTradingConfig = {
   priorityFeeLevel: PriorityLevel;
   priorityFeeMultiplier: number;
   priorityFeeFallbackMicroLamports: number;
+  priorityFeeCapMicroLamports: number;
 };
 
 const parseBoolean = (value: string | undefined, defaultValue: boolean) => {
@@ -99,6 +100,10 @@ export const getHeliusTradingConfig = (env: NodeJS.ProcessEnv): HeliusTradingCon
     priorityFeeFallbackMicroLamports: parsePositiveInt(
       env.HELIUS_PRIORITY_FEE_FALLBACK_MICROLAMPORTS,
       50_000,
+    ),
+    priorityFeeCapMicroLamports: parsePositiveInt(
+      env.HELIUS_PRIORITY_FEE_CAP_MICROLAMPORTS,
+      senderUseSwqosOnly ? 100_000 : 0,
     ),
   };
 };
@@ -231,12 +236,14 @@ export const parsePriorityFeeEstimateResponse = (
   payload: unknown,
   fallbackMicroLamports: number,
   multiplier: number,
+  capMicroLamports?: number,
 ) => {
   const estimate = (payload as { result?: { priorityFeeEstimate?: unknown } } | null)?.result?.priorityFeeEstimate;
   const numericEstimate = typeof estimate === 'number' && Number.isFinite(estimate)
     ? estimate
     : fallbackMicroLamports;
-  return Math.max(1, Math.ceil(numericEstimate * multiplier));
+  const scaled = Math.max(1, Math.ceil(numericEstimate * multiplier));
+  return capMicroLamports && capMicroLamports > 0 ? Math.min(scaled, capMicroLamports) : scaled;
 };
 
 export const parseSenderSignature = (payload: unknown) => {
