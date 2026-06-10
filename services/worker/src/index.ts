@@ -1196,6 +1196,9 @@ const GECKO_CANDLES_REQUIRED_FOR_ENTRY = GECKO_CANDLES_ENABLED
 // the loss is a genuine blowout past the hard floor.
 const WORKER_ANTI_CHURN_MIN_HOLD_MS = Math.max(0, Number(process.env.WORKER_ANTI_CHURN_MIN_HOLD_MS ?? 120_000));
 const WORKER_ANTI_CHURN_HARD_STOP_BPS = Math.max(0, Number(process.env.WORKER_ANTI_CHURN_HARD_STOP_BPS ?? 250));
+// If the recorded entryPriceUsd diverges from the current mark by more than this,
+// the cost basis is a fabricated orphan mark, not a real fill. Block stop_loss.
+const WORKER_MAX_SANE_ENTRY_DRIFT_BPS = Math.max(0, Number(process.env.WORKER_MAX_SANE_ENTRY_DRIFT_BPS ?? 500));
 const geckoCandleLimiter = createSharedTokenBucket({
   pool: sharedRatePool,
   key: 'geckoterminal-ohlcv',
@@ -6319,6 +6322,13 @@ const evaluateExitTrigger = (
   }
 
   if (pnlBps !== null && pnlBps <= -thresholds.stopLossBps) {
+    // Cost-basis sanity guard: if the entryPriceUsd is wildly divergent from the
+    // current mark, it is a fabricated orphan mark, not a real fill. Suppress
+    // the stop_loss entirely  these phantom losses are not real market moves.
+    const entryDriftBps = positionState.entryPriceUsd && markPriceUsd && markPriceUsd > 0
+      ? Math.abs((positionState.entryPriceUsd - markPriceUsd) / markPriceUsd * 10_000)
+      : 0;
+    if (entryDriftBps <= WORKER_MAX_SANE_ENTRY_DRIFT_BPS) {
     // Anti-churn: suppress the stop inside the min-hold window unless the loss is a
     // genuine blowout past the hard floor. Recovering positions then exit via
     // take_profit/trailing; true disasters still cut immediately.
@@ -6335,7 +6345,9 @@ const evaluateExitTrigger = (
         thresholds,
       };
     }
+    }
   }
+
 
   if (
     pnlBps !== null
