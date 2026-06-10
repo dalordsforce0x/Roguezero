@@ -1362,6 +1362,13 @@ const previousJupiterUsdByMint = new Map<string, number>();
 const latestJupiterDecimalsByMint = new Map<string, number>();
 const latestPriceImpactBpsByMint = new Map<string, number>();
 const pendingEntryQualityByMint = new Map<string, { score: number; band: string }>();
+// Real executed entry price (USD per output token) captured at submit time from the
+// actual swap fill, keyed `${sessionId}:${outputMint}`. Consumed by the inventory
+// re-track so a freshly bought position uses its TRUE cost basis instead of a Jupiter
+// USD mark that can be decoupled from the executable route price (which births
+// positions instantly underwater and triggers a spurious stop_loss).
+const pendingEntryFillPriceByMint = new Map<string, { priceUsd: number; strategy: StrategyKey | null; at: number }>();
+const PENDING_ENTRY_FILL_TTL_MS = 5 * 60_000;
 
 const TOKEN_UNIVERSE_REFRESH_MS = Number(process.env.WORKER_TOKEN_UNIVERSE_REFRESH_MS ?? 60000);
 const TOKEN_UNIVERSE_TABLE_CANDIDATES = (process.env.RZ_TOKEN_UNIVERSE_TABLES
@@ -7208,18 +7215,33 @@ const executeTrade = async (session: RawSession): Promise<void> => {
       if (approxUsd !== null && approxUsd < ORPHAN_RECOVERY_MIN_USD) continue;
 
       const nowIso = new Date().toISOString();
+      // Prefer the REAL executed entry price captured at submit time over the current
+      // Jupiter USD mark. The mark is decoupled from the executable route price for
+      // many tokens, so using it as cost basis births positions instantly underwater
+      // and fires a spurious stop_loss. The stash is only populated for our own buys;
+      // genuine orphans (manual deposits) fall back to the mark.
+      const entryFillStashKey = `${session.id}:${mint}`;
+      const stashedEntryFill = pendingEntryFillPriceByMint.get(entryFillStashKey) ?? null;
+      const stashedEntryFillFresh = stashedEntryFill !== null
+        && Date.now() - stashedEntryFill.at <= PENDING_ENTRY_FILL_TTL_MS
+        && stashedEntryFill.priceUsd > 0;
+      if (stashedEntryFill !== null) {
+        pendingEntryFillPriceByMint.delete(entryFillStashKey);
+      }
+      const recoveredEntryPriceUsd = stashedEntryFillFresh ? stashedEntryFill!.priceUsd : markPriceUsd;
+      const recoveredEntryStrategy = stashedEntryFillFresh ? stashedEntryFill!.strategy : null;
       reconciledPositions[mint] = {
         status: 'long',
         positionMint: mint,
         positionSymbol: resolveTokenSymbol(mint),
-        entryStrategy: null,
-        entryPriceUsd: markPriceUsd,
+        entryStrategy: recoveredEntryStrategy,
+        entryPriceUsd: recoveredEntryPriceUsd,
         entryAt: nowIso,
         quantityAtomic: String(holding.atomic),
         tokenDecimals: holding.decimals,
-        highWaterPriceUsd: markPriceUsd,
-        lastMarkedPriceUsd: markPriceUsd,
-        lastMarkedAt: markPriceUsd !== null ? nowIso : null,
+        highWaterPriceUsd: recoveredEntryPriceUsd,
+        lastMarkedPriceUsd: recoveredEntryPriceUsd,
+        lastMarkedAt: recoveredEntryPriceUsd !== null ? nowIso : null,
         lastComputedAtrUsd: null,
         lastComputedAtrBps: null,
         atrComputedAt: null,
@@ -9165,6 +9187,32 @@ const executeTrade = async (session: RawSession): Promise<void> => {
   }
 
   if (tradePlan.direction === 'enter_long') {
+    // Capture the REAL executed entry price from this fill so the position's cost
+    // basis matches what we actually paid. Without this, inventory re-track stamps
+    // entryPriceUsd from a Jupiter USD mark decoupled from the executable price,
+    // birthing positions instantly underwater and firing a spurious stop_loss.
+    const entryQuoteForBasis = prepare?.data.quote ?? null;
+    if (entryQuoteForBasis) {
+      const entryInAtomic = Number(entryQuoteForBasis.inAmount);
+      const entryOutAtomic = Number(entryQuoteForBasis.outAmount);
+      const entryInputMint = tradePlan.inventory.inputMint;
+      const entryOutputMint = tradePlan.inventory.outputMint;
+      const solUsdForBasis = lastPythSolSample?.usdPrice ?? lastJupiterSolSample?.usdPrice ?? null;
+      let entryInputUsd: number | null = null;
+      if (entryInputMint === USDC_MINT) {
+        entryInputUsd = entryInAtomic / 1_000_000;
+      } else if (entryInputMint === SOL_MINT && solUsdForBasis && solUsdForBasis > 0) {
+        entryInputUsd = (entryInAtomic / 1_000_000_000) * solUsdForBasis;
+      }
+      const entryOutUi = entryOutAtomic > 0 ? toUiAmount(entryOutputMint, entryOutAtomic) : 0;
+      if (entryInputUsd !== null && entryInputUsd > 0 && entryOutUi > 0) {
+        pendingEntryFillPriceByMint.set(`${session.id}:${entryOutputMint}`, {
+          priceUsd: entryInputUsd / entryOutUi,
+          strategy: tradePlan.entryStrategy ?? null,
+          at: Date.now(),
+        });
+      }
+    }
     const nextScannerStrategy = getNextStrategyInSequence(
       tradePlan.entryStrategy ?? tradePlan.scannerStrategy,
       enabledStrategies,
