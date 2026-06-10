@@ -86,6 +86,7 @@ interface SessionSizingSnapshot {
   realizedPnlUsd: number | null;
   unrealizedPnlUsd: number | null;
   totalPnlUsd: number | null;
+  portfolioPnlUsd: number | null;
   tradeContext: {
     inputMint: string;
     inputSymbol: 'SOL' | 'USDC' | 'USDT';
@@ -1063,8 +1064,8 @@ function SizingTable({ snapshots }: { snapshots: SessionSizingSnapshot[] }) {
                     </td>
                     <td className="py-2 pr-3 text-gray-300 font-mono">{amountLabel}</td>
                     <td className="py-2 pr-3 font-mono">
-                      <span className={s.totalPnlUsd !== null && s.totalPnlUsd >= 0 ? 'text-emerald-300' : 'text-rose-300'}>
-                        {formatSignedUsd(s.totalPnlUsd)}
+                      <span className={(s.portfolioPnlUsd ?? s.totalPnlUsd ?? 0) >= 0 ? 'text-emerald-300' : 'text-rose-300'}>
+                        {formatSignedUsd(s.portfolioPnlUsd ?? s.totalPnlUsd)}
                       </span>
                     </td>
                     <td className="py-2 pr-3 text-gray-500">{formatDateTime(s.at)}</td>
@@ -1277,7 +1278,7 @@ function getSizingDisplay(snapshot: SessionSizingSnapshot) {
         { label: 'Risk Budget', value: snapshot.remainingRiskBudgetUsd !== null ? `$${snapshot.remainingRiskBudgetUsd.toFixed(4)}` : '—' },
         { label: 'Realized PnL', value: formatSignedUsd(snapshot.realizedPnlUsd) },
         { label: 'Unrealized PnL', value: formatSignedUsd(snapshot.unrealizedPnlUsd) },
-        { label: 'Total PnL', value: formatSignedUsd(snapshot.totalPnlUsd) },
+        { label: 'Portfolio PnL', value: formatSignedUsd(snapshot.portfolioPnlUsd ?? snapshot.totalPnlUsd) },
       ],
       detailChips: [
         `min ${lamportsToSolString(snapshot.minTradeLamports)}`,
@@ -1302,7 +1303,7 @@ function getSizingDisplay(snapshot: SessionSizingSnapshot) {
       { label: 'Risk Budget', value: snapshot.remainingRiskBudgetUsd !== null ? `$${snapshot.remainingRiskBudgetUsd.toFixed(4)}` : '—' },
       { label: 'Realized PnL', value: formatSignedUsd(snapshot.realizedPnlUsd) },
       { label: 'Unrealized PnL', value: formatSignedUsd(snapshot.unrealizedPnlUsd) },
-      { label: 'Total PnL', value: formatSignedUsd(snapshot.totalPnlUsd) },
+      { label: 'Portfolio PnL', value: formatSignedUsd(snapshot.portfolioPnlUsd ?? snapshot.totalPnlUsd) },
     ],
     detailChips: [
       `input ${ctx.inputSymbol} → ${ctx.outputSymbol}`,

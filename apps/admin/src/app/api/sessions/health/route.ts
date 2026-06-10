@@ -40,6 +40,10 @@ type SessionHealthRow = {
   last_sizing_risk_adjusted_amount_lamports: string | null;
   realized_pnl_usd: number | null;
   unrealized_pnl_usd: number | null;
+  total_portfolio_value_usd: number | null;
+  starting_value_usd: number | null;
+  starting_balance_atomic: string | null;
+  funding_mint: string | null;
   last_sizing_trade_context: {
     inputMint: string;
     inputSymbol: 'SOL' | 'USDC' | 'USDT';
@@ -115,6 +119,7 @@ type SessionSizingSnapshot = {
   realizedPnlUsd: number | null;
   unrealizedPnlUsd: number | null;
   totalPnlUsd: number | null;
+  portfolioPnlUsd: number | null;
   tradeContext: SessionHealthRow['last_sizing_trade_context'];
 };
 
@@ -439,6 +444,10 @@ export async function GET() {
          s.service_control -> 'lastSizing' ->> 'riskAdjustedAmountLamports' AS last_sizing_risk_adjusted_amount_lamports,
          (s.funding ->> 'realizedPnlUsd')::double precision AS realized_pnl_usd,
          (s.funding ->> 'unrealizedPnlUsd')::double precision AS unrealized_pnl_usd,
+         (s.funding ->> 'totalPortfolioValueUsd')::double precision AS total_portfolio_value_usd,
+         (s.funding ->> 'startingValueUsd')::double precision AS starting_value_usd,
+         (s.funding ->> 'startingBalanceAtomic') AS starting_balance_atomic,
+         s.funding ->> 'fundingMint' AS funding_mint,
          s.service_control -> 'lastSizing' -> 'tradeContext' AS last_sizing_trade_context,
          s.service_control -> 'riskState' AS risk_state,
          s.service_control -> 'lastExecutionAudit' AS last_execution_audit
@@ -636,6 +645,9 @@ export async function GET() {
           realizedPnlUsd: row.realized_pnl_usd,
           unrealizedPnlUsd: row.unrealized_pnl_usd,
           totalPnlUsd: (row.realized_pnl_usd ?? 0) + (row.unrealized_pnl_usd ?? 0),
+          portfolioPnlUsd: row.total_portfolio_value_usd != null && row.starting_value_usd != null
+            ? Number((row.total_portfolio_value_usd - row.starting_value_usd).toFixed(2))
+            : null,
           tradeContext: row.last_sizing_trade_context,
         });
       }

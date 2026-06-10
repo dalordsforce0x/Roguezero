@@ -217,6 +217,7 @@ export const sessionHealthStateSchema = z.object({
     'active_trading',
     'waiting_market',
     'blocked',
+    'at_capacity',
     'exit_blocked',
     'gas_danger',
     'recovery_required',

@@ -6362,9 +6362,37 @@ const refreshPositionsMarks = async (
     await persistPositionsState(session, nextState);
   }
 
+  // Compute total portfolio value: base balance + all position values at mark
+  const solPriceForPortfolio = lastPythSolSample?.usdPrice ?? lastJupiterSolSample?.usdPrice ?? 0;
+  let totalPortfolioValueUsd = 0;
+  // Add base balance value (SOL always counted + USDC if that's the funding mint)
+  const solBalanceForPortfolio = Number(session.funding.currentBalanceAtomic ?? '0');
+  if (session.funding.fundingMint === 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v') {
+    // USDC-based session: base balance is USDC
+    totalPortfolioValueUsd += solBalanceForPortfolio / 1_000_000;
+  } else {
+    // SOL-based session: base balance is SOL lamports
+    totalPortfolioValueUsd += (solBalanceForPortfolio / 1_000_000_000) * solPriceForPortfolio;
+  }
+  // Add position values at mark price
+  for (const [pMint, pPos] of Object.entries(nextPositions)) {
+    if (isLongPositionStatus(pPos.status) && pPos.lastMarkedPriceUsd && pPos.quantityAtomic) {
+      const pQty = toUiAmount(pMint, Number(pPos.quantityAtomic), pPos.tokenDecimals ?? undefined);
+      totalPortfolioValueUsd += pPos.lastMarkedPriceUsd * pQty;
+    }
+  }
+  const roundedPortfolio = Number(totalPortfolioValueUsd.toFixed(6));
+
   const roundedUnrealized = Number(totalUnrealizedPnlUsd.toFixed(6));
+  const fundingPatchObj: Record<string, unknown> = {};
   if (roundedUnrealized !== session.funding.unrealizedPnlUsd) {
-    await mergeFundingPatch(session, { unrealizedPnlUsd: roundedUnrealized });
+    fundingPatchObj.unrealizedPnlUsd = roundedUnrealized;
+  }
+  if (roundedPortfolio !== (session.funding as any).totalPortfolioValueUsd) {
+    fundingPatchObj.totalPortfolioValueUsd = roundedPortfolio;
+  }
+  if (Object.keys(fundingPatchObj).length > 0) {
+    await mergeFundingPatch(session, fundingPatchObj);
   }
 
   return nextState;
@@ -9510,6 +9538,17 @@ const trimBlockedReasonCounts = (counts: Record<string, number>) => {
 
 type SessionHealthPatch = NonNullable<SessionServiceControlPatch['healthState']>;
 
+const entryGateReasons = new Set([
+  'max_open_positions_reached',
+  'entry_quality_range_top',
+  'entry_below_economic_floor',
+  'entry_edge_below_cost',
+  'entry_leg_cost_too_high',
+  'risk_circuit_breaker',
+  'session_loss_limit_reached',
+  'daily_loss_limit_reached',
+]);
+
 const marketWaitReasons = new Set([
   'flat_regime_routed_fallback_suppressed',
   'no_strategy_entry_signal',
@@ -9589,6 +9628,17 @@ const buildSessionHealthState = ({
       severity: 'error',
       reason,
       detail: 'Session fee reserve is too low for safe trading/exits. Entries are unsafe until gas is restored or session is stopped.',
+      updatedAt,
+      blockerCount,
+    };
+  }
+
+  if (reason && entryGateReasons.has(reason) && hasOpenPositions) {
+    return {
+      state: 'at_capacity',
+      severity: 'info',
+      reason,
+      detail: 'Bot is at max positions or entry quality gates are blocking new entries. Exits are working normally.',
       updatedAt,
       blockerCount,
     };
