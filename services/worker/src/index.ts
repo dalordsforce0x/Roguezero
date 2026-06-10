@@ -8928,23 +8928,13 @@ const executeTrade = async (session: RawSession): Promise<void> => {
       inputMint: tradePlan.inventory.inputMint,
       solMint: SOL_MINT,
     })) {
-      const setupReserveLamports = Math.max(
-        0,
-        tradePlan.inventory.reserveAtomic - MIN_SOL_OPERATING_RESERVE_LAMPORTS,
-      );
       const rawNetworkCostLamports = prepare.data.costs?.estimatedNetworkCostLamports ?? 0;
-      // The API's estimate bakes in worst-case new-ATA rent (~2.04M lamports) even
-      // when the output token account already exists (it does for any session that
-      // has already traded its base currency). Selling SOL->USDC opens no net new
-      // account: the USDC ATA exists and the wrapped-SOL temp account is opened and
-      // closed in the same tx (rent reclaimed). Simulation already passed above, so
-      // the tx is affordable on-chain. Cap the reserve calc to the realistic swap
-      // cost (base fee + priority + tip headroom, no ATA rent) so phantom rent can't
-      // fabricate a shortfall that cancel-retries the SOL exit forever.
+      // Cap to realistic swap cost (no ATA rent). tradeAmount already has
+      // reserveAtomic subtracted (via computeFullExitAmountAtomic), so
+      // post-exit SOL = balance - tradeAmount. Don't subtract reserve again.
       const estimatedNetworkCostLamports = Math.min(rawNetworkCostLamports, GAS_REFILL_SWAP_COST_LAMPORTS);
-      const inputLamportsSpent = tradePlan.inventory.inputMint === SOL_MINT ? tradeAmount : 0;
       const expectedPostExitLamports =
-        balance - inputLamportsSpent - setupReserveLamports - estimatedNetworkCostLamports;
+        balance - tradeAmount - estimatedNetworkCostLamports;
       const reserveShortfallLamports = Math.max(
         0,
         MIN_SOL_OPERATING_RESERVE_LAMPORTS - expectedPostExitLamports,
