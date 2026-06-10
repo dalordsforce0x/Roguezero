@@ -196,8 +196,8 @@ export type SupertrendConfig = {
 };
 
 export const DEFAULT_SUPERTREND_CONFIG: SupertrendConfig = {
-  candleSamples: 10,
-  atrPeriod: 10,
+  candleSamples: 14,
+  atrPeriod: 14,
   multiplier: 3.0,
 };
 
