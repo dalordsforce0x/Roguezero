@@ -7229,6 +7229,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
         pendingEntryFillPriceByMint.delete(entryFillStashKey);
       }
       const recoveredEntryPriceUsd = stashedEntryFillFresh ? stashedEntryFill!.priceUsd : markPriceUsd;
+      log('info', session.id, `entry-fill DIAG consume mint=${mint} stash=${stashedEntryFill ? 'y' : 'n'} fresh=${stashedEntryFillFresh} recovered=${recoveredEntryPriceUsd} mark=${markPriceUsd}`);
       const recoveredEntryStrategy = stashedEntryFillFresh ? stashedEntryFill!.strategy : null;
       reconciledPositions[mint] = {
         status: 'long',
@@ -9192,6 +9193,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
     // entryPriceUsd from a Jupiter USD mark decoupled from the executable price,
     // birthing positions instantly underwater and firing a spurious stop_loss.
     const entryQuoteForBasis = prepare?.data.quote ?? null;
+    if (!entryQuoteForBasis) { log('warn', session.id, `entry-fill DIAG: missing prepare.data.quote prepare=${prepare ? 'y' : 'n'}`); }
     if (entryQuoteForBasis) {
       const entryInAtomic = Number(entryQuoteForBasis.inAmount);
       const entryOutAtomic = Number(entryQuoteForBasis.outAmount);
@@ -9205,6 +9207,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
         entryInputUsd = (entryInAtomic / 1_000_000_000) * solUsdForBasis;
       }
       const entryOutUi = entryOutAtomic > 0 ? toUiAmount(entryOutputMint, entryOutAtomic) : 0;
+      log('info', session.id, `entry-fill DIAG basis out=${entryOutputMint} inMint=${entryInputMint} inAtomic=${entryInAtomic} inputUsd=${entryInputUsd} outUi=${entryOutUi} solUsd=${solUsdForBasis}`);
       if (entryInputUsd !== null && entryInputUsd > 0 && entryOutUi > 0) {
         pendingEntryFillPriceByMint.set(`${session.id}:${entryOutputMint}`, {
           priceUsd: entryInputUsd / entryOutUi,
