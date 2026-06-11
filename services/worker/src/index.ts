@@ -5587,7 +5587,7 @@ const maybeTransferRealizedProfit = async (
   }
 
   const transferredProfitUsd = session.service_control.schedulingState?.transferredProfitUsd ?? 0;
-  const cumulativeAvailableProfitUsd = session.funding.realizedPnlUsd - transferredProfitUsd;
+  const cumulativeAvailableProfitUsd = ((session.funding as any).balancePnlUsd ?? session.funding.realizedPnlUsd) - transferredProfitUsd;
   const availableProfitUsd = maxTransferUsd === undefined
     ? cumulativeAvailableProfitUsd
     : Math.min(cumulativeAvailableProfitUsd, maxTransferUsd);
@@ -5828,7 +5828,7 @@ const maybeMarkPendingExitProfitPayout = async (
     pendingProfitPayout: {
       executionId,
       submittedAt: new Date().toISOString(),
-      preRealizedPnlUsd: session.funding.realizedPnlUsd,
+      preRealizedPnlUsd: (session.funding as any).balancePnlUsd ?? session.funding.realizedPnlUsd,
       exitReason: tradePlan.exitReason,
       attempts: 0,
     },
@@ -5887,7 +5887,7 @@ const attemptPendingExitProfitPayout = async (session: RawSession, keypair: Keyp
     return;
   }
 
-  const exitProfitUsd = Number((latestSession.funding.realizedPnlUsd - pending.preRealizedPnlUsd).toFixed(6));
+  const exitProfitUsd = Number((((latestSession.funding as any).balancePnlUsd ?? latestSession.funding.realizedPnlUsd) - pending.preRealizedPnlUsd).toFixed(6));
   if (!Number.isFinite(exitProfitUsd) || exitProfitUsd < MIN_PROFIT_TRANSFER_USD) {
     await clearPendingProfitPayout(latestSession);
     log('info', session.id, `exit profit payout skipped: confirmed ${pending.exitReason} delta $${exitProfitUsd.toFixed(6)} below threshold`);
@@ -6454,6 +6454,15 @@ const refreshPositionsMarks = async (
   }
   if (roundedStartingValue > 0 && roundedStartingValue !== (session.funding as any).startingValueUsd) {
     fundingPatchObj.startingValueUsd = roundedStartingValue;
+  }
+  // Balance-derived PnL: on-chain truth. totalPortfolioValueUsd already
+  // includes base balance + open position mark values; subtracting the
+  // starting value gives true net PnL without per-trade accumulation drift.
+  if (roundedStartingValue > 0) {
+    const computedBalancePnl = Number((roundedPortfolio - roundedStartingValue).toFixed(6));
+    if (computedBalancePnl !== (session.funding as any).balancePnlUsd) {
+      fundingPatchObj.balancePnlUsd = computedBalancePnl;
+    }
   }
   if (Object.keys(fundingPatchObj).length > 0) {
     await mergeFundingPatch(session, fundingPatchObj);
@@ -7800,8 +7809,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
   }
 
   if (!tradePlan) {
-    const { realizedPnlUsd } = session.funding;
-    const sessionLoss = Math.abs(Math.min(0, realizedPnlUsd));
+    const sessionLoss = Math.abs(Math.min(0, (session.funding as any).balancePnlUsd ?? session.funding.realizedPnlUsd));
     const circuitBreakerReason = getRiskCircuitBreakerReason(session, sessionLoss);
     if (circuitBreakerReason) {
       const riskState = getSessionRiskState(session);
@@ -8747,7 +8755,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
 
   const remainingRiskBudgetUsd = Math.max(
     0,
-    session.risk_limits.maxSessionLossUsd - Math.abs(Math.min(0, session.funding.realizedPnlUsd)),
+    session.risk_limits.maxSessionLossUsd - Math.abs(Math.min(0, (session.funding as any).balancePnlUsd ?? session.funding.realizedPnlUsd)),
   );
   const baseTradeAmount = tradePlan.inventory.amountAtomic ?? 0;
   let tradeAmount = baseTradeAmount;
