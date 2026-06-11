@@ -42,6 +42,7 @@ import {
   markExecutionFailed,
   updateSubmittedExecution,
 } from './swapExecutionStore.js';
+import { EnhancedWebSocketClient } from './lib/enhancedWebSocket.js';
 import {
   createSessionWithKey,
   getSessionById,
@@ -149,6 +150,10 @@ const jupiterSwapBuildConfig = configReport.readyForLiveIntegration
 const jupiterApiKeySelector = jupiterSwapBuildConfig
   ? createRoundRobinKeySelector(jupiterSwapBuildConfig.apiKeys)
   : null;
+// Jupiter Ultra (Meta-Aggregator): /order + /execute path with JupiterZ RFQ,
+// RTSE automatic slippage, and Jupiter Beam managed landing. Feature-flagged.
+const JUPITER_USE_ULTRA = process.env.JUPITER_USE_ULTRA === 'true';
+const JUPITER_ULTRA_BASE_URL = 'https://api.jup.ag/ultra/v1';
 const heliusTradingConfig = getHeliusTradingConfig(process.env);
 const workerFundingThresholds = getWorkerFundingThresholds(process.env);
 const workerSignalPolicy = getWorkerSignalPolicy(process.env);
@@ -156,6 +161,15 @@ const heliusRpcConnections = configReport.readyForLiveIntegration
   ? getHeliusRpcUrls(process.env).map((rpcUrl) => new Connection(rpcUrl, 'confirmed'))
   : [];
 const heliusConnection = heliusRpcConnections[0] ?? null;
+// Enhanced WebSocket for transactionSubscribe (Business+ plan).
+// Provides parsed transaction data in confirmation notifications.
+const HELIUS_ENHANCED_WS_ENABLED = process.env.HELIUS_ENHANCED_WS_ENABLED === 'true';
+const enhancedWsClient = HELIUS_ENHANCED_WS_ENABLED && process.env.HELIUS_API_KEY
+  ? new EnhancedWebSocketClient({
+      apiKey: process.env.HELIUS_API_KEY,
+      network: process.env.SOLANA_NETWORK === 'devnet' ? 'devnet' : 'mainnet',
+    })
+  : null;
 let heliusRpcConnectionCursor = 0;
 const getHeliusRpcConnection = () => {
   if (!heliusConnection || heliusRpcConnections.length === 0) {
@@ -409,6 +423,8 @@ const upsertPositionEntry = (params: {
   markedPriceUsd: number | null;
   status: SessionPositionState['status'];
   absoluteBalanceAtomic?: number | null;
+  entryCostBps?: number | null;
+  measuredExitImpactBps?: number | null;
 }): SessionPositionState => {
   const nextQuantityAtomic = Math.max(0, params.quantityAtomic);
   const existingQuantityAtomic = params.existingPosition?.quantityAtomic
@@ -450,7 +466,8 @@ const upsertPositionEntry = (params: {
     maxAdverseAt: params.existingPosition?.maxAdverseAt ?? null,
     entryQualityScore: params.existingPosition?.entryQualityScore ?? null,
     entryQualityBand: params.existingPosition?.entryQualityBand ?? null,
-    entryCostBps: params.existingPosition?.entryCostBps ?? null,
+    entryCostBps: params.entryCostBps ?? params.existingPosition?.entryCostBps ?? null,
+    measuredExitImpactBps: params.measuredExitImpactBps ?? params.existingPosition?.measuredExitImpactBps ?? null,
     pendingExitReason: null,
     partialExitDone: params.existingPosition?.partialExitDone ?? false,
     exitReason: null,
@@ -515,6 +532,8 @@ type JupiterBuildRequestBody = {
   entryStrategy?: unknown;
   exitStrategy?: unknown;
   exitReason?: unknown;
+  entryCostBps?: unknown;
+  measuredExitImpactBps?: unknown;
 };
 
 type ValidatedJupiterBuildRequest = {
@@ -528,6 +547,8 @@ type ValidatedJupiterBuildRequest = {
   entryStrategy?: typeof strategyKeyValues[number];
   exitStrategy?: typeof strategyKeyValues[number];
   exitReason?: NonNullable<SessionPositionState['exitReason']>;
+  entryCostBps?: number;
+  measuredExitImpactBps?: number;
 };
 
 type JupiterSubmitRequestBody = {
@@ -879,6 +900,12 @@ const parseJupiterBuildRequest = (body: JupiterBuildRequestBody) => {
     entryStrategy,
     exitStrategy,
     exitReason,
+    entryCostBps: typeof body.entryCostBps === 'number' && Number.isInteger(body.entryCostBps) && body.entryCostBps >= 0
+      ? body.entryCostBps
+      : undefined,
+    measuredExitImpactBps: typeof body.measuredExitImpactBps === 'number' && Number.isInteger(body.measuredExitImpactBps) && body.measuredExitImpactBps >= 0
+      ? body.measuredExitImpactBps
+      : undefined,
   };
 
   return {
@@ -1544,6 +1571,102 @@ const fetchJupiterBuild = async (
   };
 };
 
+// ── Jupiter Ultra (Meta-Aggregator) /order + /execute ───────────────────────
+// JupiterZ RFQ market-makers beat on-chain by 5-20 BPS on major pairs.
+// RTSE handles slippage estimation automatically.
+// Jupiter Beam handles transaction landing and priority fees.
+type JupiterOrderResponse = {
+  requestId: string;
+  inputMint: string;
+  outputMint: string;
+  inAmount: string;
+  outAmount: string;
+  otherAmountThreshold: string;
+  swapType: string;
+  slippageBps: number;
+  priceImpactPct: string;
+  router: string;
+  contextSlot: number;
+  transaction: string; // base64 serialized VersionedTransaction
+  prioritizationType: { computeBudget?: { microLamports: number; estimatedMicroLamports: number } };
+  dynamicSlippageReport?: { slippageBps: number; otherAmount: number; simulatedIncurredSlippageBps: number; amplificationRatio: string };
+  totalFees?: { signatureFee: number; ataDeposits: number; totalFeeAndDeposits: number; minimumSOLForTransaction: number };
+};
+
+const fetchJupiterOrder = async (params: {
+  inputMint: string;
+  outputMint: string;
+  amount: string;
+  taker: string;
+  slippageBps?: string;
+}) => {
+  if (!jupiterSwapBuildConfig) {
+    throw new Error('Jupiter integration is not ready');
+  }
+
+  const body: Record<string, unknown> = {
+    inputMint: params.inputMint,
+    outputMint: params.outputMint,
+    amount: Number(params.amount),
+    taker: params.taker,
+  };
+
+  // If slippageBps is provided, use it; otherwise let RTSE decide automatically
+  if (params.slippageBps !== undefined) {
+    body.slippageBps = Number(params.slippageBps);
+  }
+
+  const result = await fetchJsonWithRetry({
+    label: 'jupiter-order',
+    budget: { reserve: reserveJupiterRequest },
+    request: () => fetch(`${JUPITER_ULTRA_BASE_URL}/order`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': (jupiterApiKeySelector?.next() ?? jupiterSwapBuildConfig.apiKey),
+      },
+      body: JSON.stringify(body),
+    }),
+  });
+
+  return {
+    ok: result.ok,
+    status: result.status,
+    payload: result.payload as JupiterOrderResponse,
+  };
+};
+
+const submitJupiterExecute = async (params: {
+  signedTransaction: string; // base64
+  requestId: string;
+}) => {
+  if (!jupiterSwapBuildConfig) {
+    throw new Error('Jupiter integration is not ready');
+  }
+
+  const result = await fetchJsonWithRetry({
+    label: 'jupiter-execute',
+    budget: { reserve: reserveJupiterRequest },
+    request: () => fetch(`${JUPITER_ULTRA_BASE_URL}/execute`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': (jupiterApiKeySelector?.next() ?? jupiterSwapBuildConfig.apiKey),
+      },
+      body: JSON.stringify({
+        signedTransaction: params.signedTransaction,
+        requestId: params.requestId,
+      }),
+    }),
+  });
+
+  return {
+    ok: result.ok,
+    status: result.status,
+    payload: result.payload as { signature: string; status: string; slot?: number; inputAmountResult?: string; outputAmountResult?: string },
+  };
+};
+
 const createSimulationSwapTransaction = (
   taker: string,
   blockhash: string,
@@ -1994,6 +2117,8 @@ const reconcileSubmittedExecutionRecord = async (
               markedPriceUsd,
               status: 'long',
               absoluteBalanceAtomic: boughtMintPostBalance,
+              entryCostBps: typeof updatedExecution.metadata.entryCostBps === 'number' ? updatedExecution.metadata.entryCostBps : undefined,
+              measuredExitImpactBps: typeof updatedExecution.metadata.measuredExitImpactBps === 'number' ? updatedExecution.metadata.measuredExitImpactBps : undefined,
             }),
           },
         }, null);
@@ -2171,6 +2296,8 @@ const reconcileSubmittedExecutionRecord = async (
               markedPriceUsd,
               status: 'long_sol',
               absoluteBalanceAtomic: boughtMintPostBalance,
+              entryCostBps: typeof updatedExecution.metadata.entryCostBps === 'number' ? updatedExecution.metadata.entryCostBps : undefined,
+              measuredExitImpactBps: typeof updatedExecution.metadata.measuredExitImpactBps === 'number' ? updatedExecution.metadata.measuredExitImpactBps : undefined,
             }),
           },
         }, null);
@@ -2308,6 +2435,38 @@ const watchSubmittedExecution = (executionId: string, signature: string) => {
     stopWatchingSubmittedExecution(executionId);
   }
 
+  // Prefer Enhanced WS (transactionSubscribe) — gives parsed transaction data
+  // in the notification, saving a separate getTransaction RPC call.
+  if (enhancedWsClient?.isConnected) {
+    enhancedWsClient.transactionSubscribe(
+      signature,
+      (notification) => {
+        app.log.info(
+          { executionId, signature, slot: notification.slot, err: notification.err },
+          'enhanced WS transaction notification received',
+        );
+        void reconcileExecutionByIdSafely(executionId);
+      },
+      'confirmed',
+    ).then((subId) => {
+      submittedExecutionWatchers.set(executionId, { signature, listenerId: subId });
+    }).catch((err) => {
+      app.log.warn({ err, executionId, signature }, 'enhanced WS transactionSubscribe failed, falling back to onSignature');
+      // Fall back to standard onSignature
+      const listenerId = heliusConnection.onSignature(
+        signature,
+        (result, context) => {
+          app.log.info({ executionId, signature, slot: context.slot, err: result.err }, 'submitted execution signature notification received');
+          void reconcileExecutionByIdSafely(executionId);
+        },
+        'confirmed',
+      );
+      submittedExecutionWatchers.set(executionId, { signature, listenerId });
+    });
+    return;
+  }
+
+  // Standard WS fallback: onSignature (confirmed/failed only, no parsed data)
   const listenerId = heliusConnection.onSignature(
     signature,
     (result, context) => {
@@ -2919,6 +3078,132 @@ app.post('/jupiter/swap/prepare', { config: { rateLimit: { max: INTERNAL_SWAP_PR
     });
   }
 
+  // ── Jupiter Ultra (Meta-Aggregator) path ──────────────────────────────────
+  // Uses /order + /execute: JupiterZ RFQ (5-20 BPS better fills on major pairs),
+  // RTSE automatic slippage, Jupiter Beam managed landing.
+  if (JUPITER_USE_ULTRA) {
+    const orderResult = await fetchJupiterOrder({
+      inputMint: parsed.value.inputMint,
+      outputMint: parsed.value.outputMint,
+      amount: parsed.value.amount,
+      taker: parsed.value.taker,
+      slippageBps: parsed.value.slippageBps,
+    });
+
+    if (!orderResult.ok) {
+      return reply.status(orderResult.status).send({
+        error: 'Jupiter /order request failed',
+        feeTokenSymbol,
+        feeAccount,
+        platformFeeBps: effectivePlatformFeeBps,
+        upstream: orderResult.payload,
+      });
+    }
+
+    const order = orderResult.payload;
+    const now = new Date().toISOString();
+    const executionId = randomUUID();
+    const estimatedNetworkCostLamports = order.totalFees?.signatureFee ?? 5_000;
+
+    try {
+      await createPreparedExecution({
+        id: executionId,
+        swapPath: '/build',
+        status: 'prepared',
+        inputMint: parsed.value.inputMint,
+        outputMint: parsed.value.outputMint,
+        amount: parsed.value.amount,
+        taker: parsed.value.taker,
+        feeTokenSymbol,
+        feeAccount,
+        platformFeeBps: effectivePlatformFeeBps,
+        blockhash: '',
+        lastValidBlockHeight: null,
+        recommendedComputeUnitLimit: 0,
+        preparedTransactionBase64: order.transaction,
+        simulation: { err: null, unitsConsumed: null, logs: [] },
+        build: {
+          inAmount: order.inAmount,
+          outAmount: order.outAmount,
+          otherAmountThreshold: order.otherAmountThreshold,
+          priceImpactPct: order.priceImpactPct,
+          router: order.router,
+          requestId: order.requestId,
+          swapType: order.swapType,
+          slippageBps: order.slippageBps,
+          ultraPath: true,
+        } as unknown as Record<string, unknown>,
+        confirmation: null,
+        signatureStatus: null,
+        lastError: null,
+        metadata: {
+          scannerStrategy: parsed.value.scannerStrategy ?? null,
+          entryStrategy: parsed.value.entryStrategy ?? null,
+          exitStrategy: parsed.value.exitStrategy ?? null,
+          exitReason: parsed.value.exitReason ?? null,
+          entryCostBps: parsed.value.entryCostBps ?? null,
+          measuredExitImpactBps: parsed.value.measuredExitImpactBps ?? null,
+        },
+        preparedAt: now,
+        submittedAt: null,
+        confirmedAt: null,
+        createdAt: now,
+        updatedAt: now,
+        signature: null,
+        confirmationStatus: null,
+      });
+    } catch (error) {
+      if (isSwapExecutionUniqueViolation(error)) {
+        const conflictingExecution = await getActiveExecutionByTaker(taker);
+        return reply.status(409).send({
+          error: 'Execution already in flight for taker',
+          executionId: conflictingExecution?.id ?? null,
+          status: conflictingExecution?.status ?? null,
+          taker,
+        });
+      }
+      app.log.error({ error }, 'failed to persist prepared ultra swap execution');
+      return reply.status(500).send({ error: 'Failed to persist prepared swap execution' });
+    }
+
+    return {
+      executionId,
+      swapPath: '/order',
+      feeTokenSymbol,
+      feeAccount,
+      platformFeeBps: effectivePlatformFeeBps,
+      quote: {
+        inAmount: order.inAmount,
+        outAmount: order.outAmount,
+        otherAmountThreshold: order.otherAmountThreshold,
+        priceImpactPct: order.priceImpactPct,
+      },
+      costs: {
+        baseTxFeeLamports: order.totalFees?.signatureFee ?? 5_000,
+        priorityFeeMicroLamports: order.prioritizationType?.computeBudget?.microLamports ?? null,
+        estimatedPriorityFeeLamports: 0,
+        senderTipLamports: 0,
+        estimatedNetworkCostLamports,
+        estimatedAtaRentLamports: order.totalFees?.ataDeposits ?? 0,
+      },
+      blockhash: '',
+      lastValidBlockHeight: null,
+      recommendedComputeUnitLimit: 0,
+      simulation: { err: null, unitsConsumed: null, logs: [] },
+      preparedTransactionBase64: order.transaction,
+      build: {
+        inAmount: order.inAmount,
+        outAmount: order.outAmount,
+        otherAmountThreshold: order.otherAmountThreshold,
+        priceImpactPct: order.priceImpactPct,
+        router: order.router,
+        requestId: order.requestId,
+        ultraPath: true,
+      },
+    };
+  }
+
+  // ── Jupiter Router path (existing /build) ─────────────────────────────────
   let candidate = await buildPreparedSimulationCandidate({
     request: parsed.value,
     feeAccount,
@@ -3071,6 +3356,8 @@ app.post('/jupiter/swap/prepare', { config: { rateLimit: { max: INTERNAL_SWAP_PR
         entryStrategy: parsed.value.entryStrategy ?? null,
         exitStrategy: parsed.value.exitStrategy ?? null,
         exitReason: parsed.value.exitReason ?? null,
+        entryCostBps: parsed.value.entryCostBps ?? null,
+        measuredExitImpactBps: parsed.value.measuredExitImpactBps ?? null,
       },
       preparedAt: now,
       submittedAt: null,
@@ -3362,10 +3649,34 @@ app.post('/jupiter/swap/submit', { config: { rateLimit: { max: INTERNAL_SWAP_SUB
   }
 
   try {
-    const effectiveTipTier: TipTier = tipTier ?? 'normal';
-    const signature = heliusTradingConfig.senderEnabled
-      ? await sendViaHeliusSender(signedTransactionBase64, effectiveTipTier)
-      : await rlSendRawTransaction(transaction.serialize(), maxRetries);
+    const isUltraPath = !!(existingExecution.build as Record<string, unknown>)?.ultraPath;
+    const ultraRequestId = (existingExecution.build as Record<string, unknown>)?.requestId as string | undefined;
+    let signature: string;
+
+    if (isUltraPath && ultraRequestId) {
+      // Jupiter Ultra: use /execute for managed landing (Jupiter Beam + JupiterZ)
+      const executeResult = await submitJupiterExecute({
+        signedTransaction: signedTransactionBase64,
+        requestId: ultraRequestId,
+      });
+
+      if (!executeResult.ok) {
+        // Fall back to Helius Sender if Jupiter /execute fails
+        app.log.warn({ executionId, status: executeResult.status }, 'Jupiter /execute failed, falling back to Helius Sender');
+        const effectiveTipTier: TipTier = tipTier ?? 'normal';
+        signature = heliusTradingConfig.senderEnabled
+          ? await sendViaHeliusSender(signedTransactionBase64, effectiveTipTier)
+          : await rlSendRawTransaction(transaction.serialize(), maxRetries);
+      } else {
+        signature = executeResult.payload.signature;
+      }
+    } else {
+      const effectiveTipTier: TipTier = tipTier ?? 'normal';
+      signature = heliusTradingConfig.senderEnabled
+        ? await sendViaHeliusSender(signedTransactionBase64, effectiveTipTier)
+        : await rlSendRawTransaction(transaction.serialize(), maxRetries);
+    }
+
     const now = new Date().toISOString();
     const persistedExecution = await updateSubmittedExecution({
       id: executionId,
@@ -3432,6 +3743,12 @@ app.post('/jupiter/swap/submit', { config: { rateLimit: { max: INTERNAL_SWAP_SUB
 const start = async () => {
   try {
     await app.listen({ port, host: '::' });
+
+    // Enhanced WebSocket connection (transactionSubscribe for swap confirmations)
+    if (enhancedWsClient) {
+      enhancedWsClient.connect();
+      app.log.info('Enhanced WebSocket (transactionSubscribe) enabled');
+    }
 
     // Sender connection warming: ping every 5s to keep HTTP connections hot.
     // Cold connections add latency to the first trade after idle periods.
@@ -3930,6 +4247,7 @@ app.post('/sessions', { config: { rateLimit: { max: 5, timeWindow: '1 minute' } 
           blockedReasonCounts: {},
           lastProfitTransferAt: null,
           transferredProfitUsd: 0,
+          collectedPerformanceFeeUsd: 0,
           pendingProfitPayout: null,
           recentStopLossLocks: {},
         },

@@ -100,6 +100,7 @@ export const sessionSchedulingStateSchema = z.object({
   blockedReasonCounts: z.record(z.string(), z.number().int().nonnegative()).default({}),
   lastProfitTransferAt: isoDatetimeSchema.nullable().default(null),
   transferredProfitUsd: z.number().nonnegative().default(0),
+  collectedPerformanceFeeUsd: z.number().nonnegative().default(0),
   pendingProfitPayout: z.object({
     executionId: z.string().uuid(),
     submittedAt: isoDatetimeSchema,
@@ -335,6 +336,9 @@ export const sessionPositionStateSchema = z.object({
   // Entry-leg cost in bps (slippage + network fees) captured at trade confirm.
   // Used by exit cost floor to ensure take-profit covers round-trip costs.
   entryCostBps: z.number().int().min(0).nullable().default(null),
+  // Measured exit price-impact in bps from the reverse Jupiter probe at entry.
+  // Persisted so the exit cost floor survives worker restarts.
+  measuredExitImpactBps: z.number().int().min(0).nullable().default(null),
   pendingExitReason: sessionPositionExitReasonSchema.nullable().default(null),
   exitReason: sessionPositionExitReasonSchema.nullable().default(null),
   partialExitDone: z.boolean().default(false),
@@ -460,6 +464,7 @@ const defaultSessionPositionState: NonNullable<SessionServiceControl['positionSt
   entryQualityScore: null,
   entryQualityBand: null,
   entryCostBps: null,
+  measuredExitImpactBps: null,
   pendingExitReason: null,
   exitReason: null,
   partialExitDone: false,
@@ -481,6 +486,7 @@ const defaultSessionSchedulingState: NonNullable<SessionServiceControl['scheduli
   blockedReasonCounts: {},
   lastProfitTransferAt: null,
   transferredProfitUsd: 0,
+  collectedPerformanceFeeUsd: 0,
   pendingProfitPayout: null,
   recentStopLossLocks: {},
 };
@@ -683,11 +689,15 @@ export const swapExecutionSchema = z.object({
     entryStrategy: strategyKeySchema.nullable().default(null),
     exitStrategy: strategyKeySchema.nullable().default(null),
     exitReason: sessionPositionExitReasonSchema.nullable().default(null),
+    entryCostBps: z.number().int().min(0).nullable().default(null),
+    measuredExitImpactBps: z.number().int().min(0).nullable().default(null),
   }).default({
     scannerStrategy: null,
     entryStrategy: null,
     exitStrategy: null,
     exitReason: null,
+    entryCostBps: null,
+    measuredExitImpactBps: null,
   }),
   preparedAt: isoDatetimeSchema,
   submittedAt: isoDatetimeSchema.nullable(),

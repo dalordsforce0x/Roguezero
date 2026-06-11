@@ -349,7 +349,7 @@ const WORKER_PARTIAL_TP_MAX_FRACTION_BPS = Number(process.env.WORKER_PARTIAL_TP_
 // Phase 4 (Noah-only, default OFF): when enabled + canary-scoped, exit ATR multipliers become
 // token-class aware (runners get a wider take-profit leash; majors/betas bank quicker). Floors
 // and the no-TP-below-breakeven rule are unchanged, so stops are never disabled.
-const WORKER_TOKEN_CLASS_EXIT_PROFILES_ENABLED = process.env.WORKER_TOKEN_CLASS_EXIT_PROFILES_ENABLED === 'true';
+const WORKER_TOKEN_CLASS_EXIT_PROFILES_ENABLED = process.env.WORKER_TOKEN_CLASS_EXIT_PROFILES_ENABLED !== 'false';
 // Major cost-floor reachability gate (Noah-only until graduated, ON by default for
 // the canary). SOL (and any 'major') entries bypass the trending-shape and
 // entry-quality gates, but live data proved their ATR-based take-profit target
@@ -6131,10 +6131,25 @@ const recordTradePlanEntryRejectCooldown = (
   recordEntryRejectCooldown(session, tradePlan.inventory.outputMint, reason);
 };
 
-const computeExitCostFloorBps = (session: RawSession): number => Math.max(
-  positionExitPolicy.exitCostFloorBps,
-  session.risk_limits.maxSlippageBps + session.service_control.platformFeeBps + signalPolicy.edgeSafetyBufferBps,
-);
+const computeExitCostFloorBps = (
+  session: RawSession,
+  positionState?: NonNullable<Session['serviceControl']['positionState']> | null,
+): number => {
+  // Use per-position measured exit impact when available (persisted in position state).
+  // When HIGHER than assumed slippage, it overrides — never under-price the real exit toll.
+  const measuredExitImpactBps = positionState?.measuredExitImpactBps ?? null;
+  const slippageComponentBps = measuredExitImpactBps !== null
+    ? Math.max(measuredExitImpactBps, session.risk_limits.maxSlippageBps)
+    : session.risk_limits.maxSlippageBps;
+  // Round-trip cost: entry-leg cost (from position state if tracked, else
+  // mirror exit as conservative estimate) + exit-leg cost.
+  const entryCostBps = positionState?.entryCostBps ?? slippageComponentBps;
+  const exitOnlyCostBps = Math.max(
+    positionExitPolicy.exitCostFloorBps,
+    slippageComponentBps + session.service_control.platformFeeBps + signalPolicy.edgeSafetyBufferBps,
+  );
+  return exitOnlyCostBps + entryCostBps;
+};
 
 const getTokenTradeClass = (mint: string, symbol?: string | null): TokenTradeClass => {
   if (mint === SOL_MINT || mint === USDC_MINT) {
@@ -6238,7 +6253,7 @@ const computeDynamicExitThresholds = (
   positionState: NonNullable<Session['serviceControl']['positionState']>,
   signalSnapshot: NonNullable<Session['serviceControl']['lastSignal']>,
 ): DynamicExitThresholds => {
-  const costFloorBps = computeExitCostFloorBps(session);
+  const costFloorBps = computeExitCostFloorBps(session, positionState);
   const atrBps = positionState.lastComputedAtrBps ?? null;
 
   // ── B4: Regime-based exit scaling ─────────────────────────────────────────
@@ -6285,7 +6300,7 @@ const computeDynamicExitThresholds = (
   if (!atrBps || atrBps <= 0) {
     return {
       takeProfitBps: applyTakeProfitTimeDecay(Math.max(Math.round(positionExitPolicy.takeProfitBps * regimeTpScale), costFloorBps)),
-      stopLossBps: Math.max(positionExitPolicy.stopLossBps, costFloorBps),
+      stopLossBps: positionExitPolicy.stopLossBps,
       trailingStopBps: Math.max(Math.round(positionExitPolicy.trailingStopBps * regimeTrailingScale), positionExitPolicy.trailingStopFloorBps),
       atrBps: null,
       costFloorBps,
@@ -6301,7 +6316,7 @@ const computeDynamicExitThresholds = (
       Math.round(atrBps * exitProfile.takeProfitMult * (1 + signalStrengthBoost) * regimeTpScale),
     )),
     stopLossBps: Math.max(
-      costFloorBps,
+      positionExitPolicy.stopLossBps,
       Math.round(atrBps * exitProfile.stopLossMult),
     ),
     trailingStopBps: Math.max(
@@ -7442,6 +7457,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
         entryQualityScore: null,
         entryQualityBand: null,
         entryCostBps: null,
+        measuredExitImpactBps: null,
         pendingExitReason: null,
         exitReason: null,
         partialExitDone: false,
@@ -9466,6 +9482,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
               entryQualityScore: null,
               entryQualityBand: null,
               entryCostBps: null,
+              measuredExitImpactBps: null,
               pendingExitReason: null,
               exitReason: null,
               partialExitDone: false,

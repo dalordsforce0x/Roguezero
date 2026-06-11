@@ -59,8 +59,8 @@ const parsePositiveNumber = (value: string | undefined, fallback: number) => {
 };
 
 const parsePriorityLevel = (value: string | undefined): PriorityLevel => {
-  if (value === 'High' || value === 'VeryHigh') return value;
-  return 'Medium';
+  if (value === 'Medium' || value === 'VeryHigh') return value;
+  return 'High';
 };
 
 export const getHeliusTradingConfig = (env: NodeJS.ProcessEnv): HeliusTradingConfig => {
