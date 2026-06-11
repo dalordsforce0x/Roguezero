@@ -350,6 +350,13 @@ const WORKER_PARTIAL_TP_MAX_FRACTION_BPS = Number(process.env.WORKER_PARTIAL_TP_
 // token-class aware (runners get a wider take-profit leash; majors/betas bank quicker). Floors
 // and the no-TP-below-breakeven rule are unchanged, so stops are never disabled.
 const WORKER_TOKEN_CLASS_EXIT_PROFILES_ENABLED = process.env.WORKER_TOKEN_CLASS_EXIT_PROFILES_ENABLED !== 'false';
+// Restrict entries to these token classes (comma or space separated). Empty = all allowed.
+// SOL signal only predicts SOL-correlated tokens — restrict to 'major,sol_beta' to stop bleeding.
+const WORKER_ALLOWED_TOKEN_CLASSES: ReadonlySet<string> | null = (() => {
+  const raw = process.env.WORKER_ALLOWED_TOKEN_CLASSES?.trim();
+  if (!raw) return null;
+  return new Set(raw.split(/[,\s]+/).map((s) => s.trim()).filter(Boolean));
+})();
 // Major cost-floor reachability gate (Noah-only until graduated, ON by default for
 // the canary). SOL (and any 'major') entries bypass the trending-shape and
 // entry-quality gates, but live data proved their ATR-based take-profit target
@@ -4756,6 +4763,7 @@ const getUniverseScoutCandidateMints = (params: {
         && !isHardBlockedUniverseToken({ mint, symbol })
         && (!WORKER_ENTRY_CORE_UNIVERSE_ONLY || TRUSTED_ENTRY_UNIVERSE_MINT_SET.has(mint))
         && (!WORKER_BLOCK_PUMP_MINT_ENTRIES || !mint.toLowerCase().endsWith('pump'))
+        && (!WORKER_ALLOWED_TOKEN_CLASSES || WORKER_ALLOWED_TOKEN_CLASSES.has(getTokenTradeClass(mint, symbol ?? undefined)))
         && !(params.excludedMints?.has(mint) ?? false)
         && !(params.excludedClusters?.has(getClusterForMint(mint)) ?? false);
     })
@@ -8354,7 +8362,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
       }
     }
 
-    if (tokenEntrySignal.status !== 'ready' || tokenEntrySignal.regime !== 'bullish') {
+    if (tokenEntrySignal.status !== 'ready' || tokenEntrySignal.regime === 'bearish') {
       await persistTradeDecision(session, 'blocked', 'entry_token_signal_not_bullish');
       await persistLastTradeGate(session, {
         at: new Date().toISOString(),
@@ -8364,7 +8372,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
         estimatedCostBps: null,
         safetyBufferBps: strategyConfig.momentum.edgeSafetyBufferBps,
       });
-      log('info', session.id, `entry blocked: token signal not bullish for ${resolveTokenSymbol(selectedEntryMint)} (${selectedEntryMint})`);
+      log('info', session.id, `entry blocked: token signal bearish for ${resolveTokenSymbol(selectedEntryMint)} (${selectedEntryMint})`);
       return;
     }
 
