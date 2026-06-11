@@ -7255,6 +7255,9 @@ const executeTrade = async (session: RawSession): Promise<void> => {
     log('info', session.id, `strategy override: ${configuredActiveStrategy} disabled → ${activeStrategy}`);
   }
 
+  const rotationIntervalMinutes =
+    session.service_control.rotationState?.rotationIntervalMinutes ?? DEFAULT_ROTATION_INTERVAL_MINUTES;
+
   const pythTape: PriceSample[] = sharedMarketTape.solUsdPyth.map(p => ({
     usdPrice: p.usdPrice,
     sampledAt: p.sampledAt,
@@ -7274,7 +7277,7 @@ const executeTrade = async (session: RawSession): Promise<void> => {
       : buildSessionSignalForStrategy(strategy, pythTape, strategyConfig);
     strategySignalByKey.set(strategy, signal);
 
-    if (signal.status === 'ready' && signal.regime === 'bullish') {
+    if (signal.status === 'ready' && signal.regime !== 'bearish') {
       selectedEntryStrategy = strategy;
       selectedEntrySignal = signal;
       runtimeSignal = signal;
@@ -7283,6 +7286,26 @@ const executeTrade = async (session: RawSession): Promise<void> => {
   }
 
   await persistLastSignal(session, selectedEntrySignal ?? runtimeSignal);
+
+  // Always advance the rotation pointer for next loop so we don't dwell on
+  // a blocked strategy. Advance past whichever strategy was selected (or past
+  // activeStrategy if all were blocked).
+  if (strategyConfig.autoRotationEnabled && enabledStrategies.length > 1) {
+    const advanceFrom = selectedEntryStrategy ?? activeStrategy;
+    const nextStrategy = getNextStrategyInSequence(advanceFrom, enabledStrategies);
+    if (nextStrategy !== activeStrategy) {
+      await persistServiceControl(session, {
+        rotationState: {
+          activeStrategy: nextStrategy,
+          queuedStrategy: nextStrategy,
+          rotationIntervalMinutes,
+          lastRotatedAt: new Date().toISOString(),
+          lockedUntil: null,
+        },
+      } as any);
+      log('info', session.id, `strategy rotation: ${activeStrategy} → ${nextStrategy} (selected=${selectedEntryStrategy ?? 'none'})`);
+    }
+  }
 
   const lastTradeSubmittedMs = getLastTradeSubmittedMs(session);
   const msSinceLastSubmit = lastTradeSubmittedMs > 0 ? (Date.now() - lastTradeSubmittedMs) : Number.POSITIVE_INFINITY;
