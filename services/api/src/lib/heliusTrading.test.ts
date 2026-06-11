@@ -67,7 +67,7 @@ test('priority fee config defaults to SWQoS-only with low tip', () => {
   assert.equal(config.senderEnabled, true);
   assert.equal(config.gatekeeperEnabled, true);
   assert.equal(config.senderUseSwqosOnly, true);
-  assert.equal(config.priorityFeeLevel, 'Medium');
+  assert.equal(config.priorityFeeLevel, 'High');
   assert.equal(config.senderMinTipLamports, 5_000);
   assert.equal(config.senderElevatedTipLamports, 50_000);
   assert.equal(config.senderUrgentTipLamports, 200_000);
