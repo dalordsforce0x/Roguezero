@@ -924,8 +924,8 @@ const parseJupiterSubmitRequest = (body: JupiterSubmitRequestBody) => {
   const errors = [
     !executionId || !uuidPattern.test(executionId) ? 'executionId must be a UUID' : null,
     !signedTransactionBase64 ? 'signedTransactionBase64 must be a base64-encoded signed transaction' : null,
-    body.blockhash !== undefined && !blockhash ? 'blockhash must be a non-empty string' : null,
-    body.lastValidBlockHeight !== undefined && lastValidBlockHeight === undefined
+    body.blockhash != null && !blockhash ? 'blockhash must be a non-empty string' : null,
+    body.lastValidBlockHeight != null && lastValidBlockHeight === undefined
       ? 'lastValidBlockHeight must be a non-negative integer'
       : null,
     body.maxRetries !== undefined && maxRetries === undefined
