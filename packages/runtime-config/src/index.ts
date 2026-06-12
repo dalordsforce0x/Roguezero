@@ -84,15 +84,21 @@ export type RuntimeSpeedProfile = {
 };
 
 const runtimeSpeedProfileDefinitions = {
+  // Exit timing is decoupled from the fleet throttle. `activeInPosition` (the
+  // re-check cadence for an OPEN position = stop-loss / take-profit reaction) is
+  // held at the price-mark rate (~3s) in EVERY mode, because an in-position visit
+  // reads only in-memory marks from the single shared price poll and makes ZERO
+  // per-bot provider calls — checking exits faster costs nothing and scales to
+  // 350 bots for free. The fleet downshift (glide) instead throttles ENTRY-side
+  // work — `activeFlat` (flat scouting), `readyStarting`, `activeGuarded`, and
+  // `maxOpenPositions` — which is where real per-bot provider load lives.
   glide: {
     label: 'Glide',
     capacityDivisor: 1,
     maxOpenPositions: 3,
     cadenceMs: {
-      // activeInPosition lifted 9_000 -> 11_000 to clear the 350-bot Jupiter fleet floor
-      // (350 bots / 135 RPS safe cap = 2.59s/call; deep-fallback Glide must stay above ~10.4s).
       readyStarting: 6_000,
-      activeInPosition: 11_000,
+      activeInPosition: 3_000,
       activeFlat: 45_000,
       activeGuarded: 60_000,
       stopping: 6_000,
@@ -105,7 +111,7 @@ const runtimeSpeedProfileDefinitions = {
     maxOpenPositions: 10,
     cadenceMs: {
       readyStarting: 3_500,
-      activeInPosition: 5_500,
+      activeInPosition: 3_000,
       activeFlat: 30_000,
       activeGuarded: 45_000,
       stopping: 5_000,
@@ -555,7 +561,12 @@ export type WorkerPricePollPolicy = {
 
 export const getWorkerPricePollPolicy = (env: NodeJS.ProcessEnv): WorkerPricePollPolicy => {
   const pythPollMs = Number(env.WORKER_PYTH_POLL_MS ?? 3_000);
-  const jupiterPricePollMs = Number(env.WORKER_JUPITER_PRICE_POLL_MS ?? 60_000);
+  // Token marks drive token stop-loss / take-profit. A 60s poll let a token blow
+  // through its stop unseen for up to a minute (a 20bps stop realizing ~70bps).
+  // Matched to the Pyth 3s SOL cadence and the Jupiter Price REST reprice floor.
+  // This is ONE shared batched call for the whole fleet (not per-bot), so the
+  // 60s->3s change is ~+0.16% of the monthly Jupiter request budget at any size.
+  const jupiterPricePollMs = Number(env.WORKER_JUPITER_PRICE_POLL_MS ?? 3_000);
   const maxConsecutiveFailures = Number(env.WORKER_PRICE_MAX_CONSECUTIVE_FAILURES ?? 10);
   const sharedTapeSize = Number(env.WORKER_SHARED_MARKET_TAPE_SIZE ?? 900);
   return { pythPollMs, jupiterPricePollMs, maxConsecutiveFailures, sharedTapeSize };

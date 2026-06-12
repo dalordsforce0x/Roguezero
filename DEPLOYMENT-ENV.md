@@ -62,6 +62,12 @@ Profit payout: `WORKER_MIN_PROFIT_TRANSFER_USD` (0.25).
 
 ## PENDING FOR NEXT DEPLOY
 
+- **Exit-timing tuning (2026-06-12)** — safe defaults in code; all optional, no Railway var required to boot:
+   - `WORKER_JUPITER_PRICE_POLL_MS` default `3000` (was `60000`). Token mark poll = token stop-loss/take-profit reaction speed. One shared batched fleet call (~1 Jupiter req/poll), ~+0.16% of monthly Jupiter budget. Set on Railway only to override.
+   - `WORKER_GECKO_CANDLE_MAX_MINTS` default `80`. Caps how many mints one GeckoTerminal candle-refresh tick pulls (trusted majors first, then enabled universe by priority).
+   - Speed-profile `activeInPosition` cadence is now `3000` in glide/pulse/surge (in-position exit re-check decoupled from fleet throttle; in-memory only, zero per-bot provider cost). No env var — lives in `@roguezero/runtime-config`.
+   - Deploy-proof marker: worker boot log `sourceRev = exit-timing-3s-poll-candle-exits-v1-2026-06-12`. After deploy, confirm this string in the worker boot log to verify Railway took the commit.
+
 - **Dynamic tip tier / SWQoS-only Sender** — safe defaults in code; all optional:
    - `HELIUS_SENDER_USE_SWQOS_ONLY` default `true` (was `false`; now SWQoS-only by default — 5K vs 200K lamport tip)
    - `HELIUS_SENDER_REGION` default empty (global endpoint). Set to `ewr` for US-East regional Sender.

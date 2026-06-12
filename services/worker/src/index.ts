@@ -145,7 +145,7 @@ const DATABASE_STATEMENT_TIMEOUT_MS = Number(process.env.DATABASE_STATEMENT_TIME
 const DATABASE_LOCK_TIMEOUT_MS = Number(process.env.DATABASE_LOCK_TIMEOUT_MS ?? 5000);
 const DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS = Number(process.env.DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS ?? 10000);
 const DEPLOY_CANARY = process.env.DEPLOY_CANARY ?? 'rz-canary-2026-06-01-01';
-const WORKER_SOURCE_REV = 'entry-reject-cooldown-v1-2026-06-07';
+const WORKER_SOURCE_REV = 'exit-timing-3s-poll-candle-exits-v1-2026-06-12';
 const fundingThresholds = getWorkerFundingThresholds(process.env);
 const sizingPolicy = getWorkerSizingPolicy(process.env);
 const performanceFeeConfig = getPerformanceFeeConfig(process.env);
@@ -1172,7 +1172,8 @@ const reserveJupiterRequest = async () => {
 // â”€â”€ Stage 4 price feeds (chunk 2) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Two independent pollers, two independent rate buckets:
 //   â€¢ Pyth Hermes â€” primary, ~3s cadence, no auth, separate vendor
-//   â€¢ Jupiter /price/v3 â€” slow drift check, ~60s cadence, on jupiter bucket
+//   â€¢ Jupiter /price/v3 â€” token marks + SOL drift, ~3s cadence, on jupiter bucket
+//     (one shared batched call for the whole fleet; drives token stop/TP timing)
 // Outputs are LOG-ONLY in chunk 2. No DB writes, no signal, no trade impact.
 
 type PythSample = {
@@ -1403,6 +1404,13 @@ const GECKO_CANDLES_ENABLED = process.env.WORKER_GECKO_CANDLES_ENABLED !== 'fals
 const GECKO_CANDLE_REFRESH_MS = Math.max(60_000, Number(process.env.WORKER_GECKO_CANDLE_REFRESH_MS ?? 300_000));
 const GECKO_CANDLE_RPM = Math.max(1, Math.min(28, Number(process.env.WORKER_GECKO_CANDLE_RPM ?? 20)));
 const GECKO_CANDLE_MIN_SAMPLES = Math.max(5, Number(process.env.WORKER_GECKO_CANDLE_MIN_SAMPLES ?? 30));
+// Upper bound on how many mints one refresh tick pulls. GeckoTerminal free is
+// ~30 req/min and the feed spaces calls ~1.2s apart, so a full pass of N mints
+// costs ~N*1.2s after pool addresses are cached. Capping keeps a growing
+// enabled universe from overrunning the refresh interval / rate budget. Trusted
+// majors are always included first; the remaining slots go to enabled universe
+// mints in priority order.
+const GECKO_CANDLE_MAX_MINTS = Math.max(1, Number(process.env.WORKER_GECKO_CANDLE_MAX_MINTS ?? 80));
 // Freshness gate: block non-SOL entries when the token has no fresh candle data.
 const GECKO_CANDLES_REQUIRED_FOR_ENTRY = GECKO_CANDLES_ENABLED
   && process.env.WORKER_GECKO_CANDLES_REQUIRED_FOR_ENTRY !== 'false';
@@ -2604,7 +2612,10 @@ const persistPositionsState = async (
 const buildMintMomentumSignal = (mint: string, config: { lookbackSamples: number; thresholdBps: number }) => {
   const latestUsd = latestJupiterUsdByMint.get(mint) ?? null;
   const priorUsd = previousJupiterUsdByMint.get(mint) ?? null;
-  const tape = getMomentumTapeForMint(mint);
+  // Candle-backed tape: real GeckoTerminal 1-min candles when fresh, else the
+  // thin Jupiter tape (unchanged fallback). Entry and exit both read this one
+  // view so a token's signal is computed off the same chart in and out.
+  const tape = getCandleBackedPriceTape(mint);
   const momentumBps = computeMomentumBps(tape, config.lookbackSamples);
   const fallbackMomentumBps = computePriceMomentumBps(latestUsd, priorUsd);
   const ready = momentumBps !== null;
@@ -2634,7 +2645,7 @@ const buildRuntimeSignalForMint = (
   }
 
   if (activeStrategy === 'mean_reversion') {
-    const tape = getMomentumTapeForMint(mint).map((sample) => ({
+    const tape = getCandleBackedPriceTape(mint).map((sample) => ({
       sampledAt: sample.sampledAt,
       usdPrice: sample.usdPrice,
     }));
@@ -2653,7 +2664,7 @@ const buildRuntimeSignalForMint = (
   }
 
   if (activeStrategy === 'supertrend') {
-    const tape = getMomentumTapeForMint(mint).map((sample) => ({
+    const tape = getCandleBackedPriceTape(mint).map((sample) => ({
       sampledAt: sample.sampledAt,
       usdPrice: sample.usdPrice,
     }));
@@ -2711,7 +2722,18 @@ const applyTokenUniverseAutoSort = async () => {
   }
 
   const candidateMints = dedupeMints(tokenUniverseMints)
-    .filter((mint) => mint !== SOL_MINT && mint !== USDC_MINT)
+    .filter((mint) => {
+      if (mint === SOL_MINT || mint === USDC_MINT) return false;
+      // We trade only real liquid tokens a candle feed can actually price.
+      // pump.fun mints (GeckoTerminal returns no_pool → blind tape) and the
+      // hard-blocked list are excluded at the SOURCE so they are never probed,
+      // never ranked, and never written back as enabled. This also lets the
+      // one-time DB disable of these rows stay clean — the auto-sort no longer
+      // touches them — instead of re-enabling them on the next cycle.
+      if (WORKER_BLOCK_PUMP_MINT_ENTRIES && mint.toLowerCase().endsWith('pump')) return false;
+      if (isHardBlockedUniverseToken({ mint, symbol: tokenUniverseSymbolByMint.get(mint) ?? null })) return false;
+      return true;
+    })
     .slice(0, Math.max(1, TOKEN_UNIVERSE_AUTO_SORT_MAX_MINTS));
 
   if (candidateMints.length === 0) {
@@ -3864,14 +3886,31 @@ let pythTimer: NodeJS.Timeout | null = null;
 let jupiterPriceTimer: NodeJS.Timeout | null = null;
 
 // ── Dedicated GeckoTerminal candle refresh loop ──────────────────────────────
-// Only refreshes trusted liquid majors: these are the mints the entry-quality /
-// shape / ATR gates actually apply to, AND the only ones GeckoTerminal reliably
-// indexes with real 1-min OHLCV. Feeding the full universe (incl. pump.fun)
-// just burns the rate budget on tokens that always return no_pool.
+// Refreshes the tokens the entry-quality / shape / ATR gates AND the exit ATR
+// stops actually price: the trusted liquid majors PLUS the enabled token
+// universe (pump.fun and hard-blocked mints are already excluded upstream, so
+// the universe here is the real liquid set GeckoTerminal can index). Trusted
+// majors come first so they always get covered; remaining capacity (up to
+// GECKO_CANDLE_MAX_MINTS) goes to the enabled universe in priority order. This
+// is what lets A1's candle-backed exits reach every tradeable token, not just
+// the hardcoded 21.
 const runGeckoCandleRefreshTick = async (): Promise<void> => {
   if (!GECKO_CANDLES_ENABLED) return;
-  const mints = TRUSTED_ENTRY_UNIVERSE_MINTS
-    .filter((mint) => mint && mint !== SOL_MINT && !STABLE_ENTRY_TARGET_MINTS.has(mint));
+  const isCandleEligible = (mint: string) =>
+    !!mint
+    && mint !== SOL_MINT
+    && !STABLE_ENTRY_TARGET_MINTS.has(mint)
+    && !mint.toLowerCase().endsWith('pump')
+    && !isHardBlockedUniverseToken({ mint, symbol: tokenUniverseSymbolByMint.get(mint) ?? null });
+
+  // Trusted majors first, then enabled universe mints (already priority-ordered
+  // by the auto-sort engine), deduped and capped to the rate budget.
+  const mints = dedupeMints([
+    ...TRUSTED_ENTRY_UNIVERSE_MINTS,
+    ...tokenUniverseActiveMints,
+  ])
+    .filter(isCandleEligible)
+    .slice(0, GECKO_CANDLE_MAX_MINTS);
   if (mints.length === 0) return;
   try {
     const result = await geckoFeed.refreshMints(mints);
@@ -6644,7 +6683,7 @@ const refreshPositionsMarks = async (
     const atr = computeAtrFromTape(
       mint === SOL_MINT
         ? sharedMarketTape.solUsdPyth
-        : getMomentumTapeForMint(mint),
+        : getCandleBackedPriceTape(mint),
       strategyConfig.supertrend,
     );
     const markedAt = new Date().toISOString();
@@ -7240,6 +7279,52 @@ const buildSessionSignalForStrategy = (
     momentumBps,
     guardReason,
   };
+};
+
+// ── Exit decision plane (read-only) ─────────────────────────────────────────
+// Returns true if ANY open position currently triggers an exit. This makes
+// ZERO provider calls — it reads the same in-memory marks/tape the background
+// poll loops maintain and reuses evaluateExitTrigger, the single source of
+// truth for exit logic that executeTrade's exit block also calls. The main
+// loop runs this on every cadence-visit (every 3-11s) so stop-loss /
+// take-profit are evaluated continuously instead of only when the 30s entry
+// cooldown happens to open — closing the window where stops blow through and
+// take-profits reverse before executeTrade is ever allowed to run.
+const sessionHasTriggeredExit = (
+  session: RawSession,
+  positionsState: SessionPositionsState,
+): boolean => {
+  const openPositions = listOpenPositions(positionsState);
+  if (openPositions.length === 0) return false;
+
+  const strategyConfig = getSessionStrategyConfig(session);
+  const enabledStrategies = (session.service_control.strategyUniverse ?? [])
+    .filter((strategy) => strategy.enabled)
+    .map((strategy) => strategy.key as StrategyKey);
+  const configuredActiveStrategy = (session.service_control.rotationState?.activeStrategy ?? 'momentum') as StrategyKey;
+  const fallbackStrategy = enabledStrategies[0] ?? 'momentum';
+  const activeStrategy = enabledStrategies.includes(configuredActiveStrategy)
+    ? configuredActiveStrategy
+    : fallbackStrategy;
+
+  const pythTape: PriceSample[] = sharedMarketTape.solUsdPyth.map((p) => ({
+    usdPrice: p.usdPrice,
+    sampledAt: p.sampledAt,
+  }));
+
+  for (const { mint, position } of openPositions) {
+    const positionStrategy = position.entryStrategy && enabledStrategies.includes(position.entryStrategy)
+      ? position.entryStrategy
+      : activeStrategy;
+    const signalForPosition = mint === SOL_MINT
+      ? buildSessionSignalForStrategy(positionStrategy, pythTape, strategyConfig)
+      : buildRuntimeSignalForMint(mint, positionStrategy, strategyConfig);
+    if (evaluateExitTrigger(session, position, signalForPosition).shouldExit) {
+      return true;
+    }
+  }
+
+  return false;
 };
 
 const executeTrade = async (session: RawSession): Promise<void> => {
@@ -10371,13 +10456,37 @@ const tick = async (): Promise<number> => {
             log('warn', session.id, `no trade attempt for ${STALE_SESSION_MINUTES}min — preserving active session; only user stop may close`);
           }
 
+          // ── Exit decision plane (every cadence-visit, no provider calls) ──
+          // Stop-loss / take-profit cannot wait for the 30s entry cooldown
+          // below. On every visit (3-11s), refresh marks from the in-memory
+          // price caches (free) and, if any open position triggers an exit,
+          // enqueue a HIGH-priority execution so the exit is taken now.
+          // executeTrade always evaluates exits before entries, and the
+          // per-session queue dedup means this never double-submits. The
+          // entry path below stays gated by reserveTradeWindow — entries are
+          // unchanged, only exit responsiveness improves.
+          let exitEnqueued = false;
+          const positionsStateForExit = getPositionsState(session);
+          if (countOpenPositions(positionsStateForExit) > 0) {
+            const markedPositions = await refreshPositionsMarks(session, positionsStateForExit).catch((err) => {
+              log('warn', session.id, `exit-plane mark refresh failed: ${String(err)}`);
+              return positionsStateForExit;
+            });
+            if (sessionHasTriggeredExit(session, markedPositions)) {
+              exitEnqueued = await enqueueExecutionIntent(session, {
+                priority: 100,
+                reason: 'exit_trigger',
+              });
+            }
+          }
+
           if (await reserveTradeWindow(session)) {
             const queued = await enqueueExecutionIntent(session, {
               priority: isLongPositionStatus(getPositionState(session).status) ? 50 : 0,
               reason: 'active_trade_window',
             });
 
-            if (!queued) {
+            if (!queued && !exitEnqueued) {
               await persistTradeDecision(session, 'blocked', 'execution_already_queued');
             }
           } else {

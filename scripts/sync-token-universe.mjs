@@ -130,6 +130,16 @@ const HARD_BLOCKED_MINTS = new Set([
   'mb1eu7TzEc71KxDpsmsKoucSSuuoGLv1drys1oP2jh6',  // MOBILE (thin)
 ]);
 
+// Mirror the worker's TOKEN_UNIVERSE_HARD_BLOCKED_SYMBOLS. The worker blocks
+// these by symbol at runtime; the sync writer must block the same set or it
+// will re-enable them in the DB on the next run and recreate the admin-tab
+// mixup (e.g. USELESS showing enabled while the worker refuses to trade it).
+const HARD_BLOCKED_SYMBOLS = new Set([
+  'CAVE',
+  'APPLE',
+  'USELESS',
+]);
+
 const symbolOk = (symbol) => (
   typeof symbol === 'string'
   && symbol.length >= 2
@@ -302,6 +312,7 @@ const main = async () => {
     if (HARD_BLOCKED_MINTS.has(mint)) continue;
     const sym = getTokenSymbol(token);
     if (!symbolOk(sym)) continue;
+    if (HARD_BLOCKED_SYMBOLS.has(String(sym).toUpperCase())) continue;
     const safetyResult = evaluateTokenSafety(token);
     if (!safetyResult.admitted) {
       for (const flag of safetyResult.riskFlags) {
