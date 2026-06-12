@@ -3151,9 +3151,9 @@ app.post('/jupiter/swap/prepare', { config: { rateLimit: { max: INTERNAL_SWAP_PR
         feeTokenSymbol,
         feeAccount,
         platformFeeBps: effectivePlatformFeeBps,
-        blockhash: '',
+        blockhash: null,
         lastValidBlockHeight: null,
-        recommendedComputeUnitLimit: 0,
+        recommendedComputeUnitLimit: null,
         preparedTransactionBase64: order.transaction,
         simulation: { err: null, unitsConsumed: null, logs: [] },
         build: {
@@ -3220,9 +3220,9 @@ app.post('/jupiter/swap/prepare', { config: { rateLimit: { max: INTERNAL_SWAP_PR
         estimatedNetworkCostLamports,
         estimatedAtaRentLamports: order.rentFeeLamports ?? order.totalFees?.ataDeposits ?? 0,
       },
-      blockhash: '',
+      blockhash: null,
       lastValidBlockHeight: null,
-      recommendedComputeUnitLimit: 0,
+      recommendedComputeUnitLimit: null,
       simulation: { err: null, unitsConsumed: null, logs: [] },
       preparedTransactionBase64: order.transaction,
       build: {
