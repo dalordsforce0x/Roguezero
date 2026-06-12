@@ -199,7 +199,17 @@ export const createGeckoTerminalCandleFeed = (
     const json = await deps.fetchJson(url);
     const points = parseOhlcvList(json);
     if (points.length === 0) {
-      log({ kind: 'gecko_candle_empty', mint, poolAddress });
+      // Log the response shape so we can diagnose empty candles from cloud IPs.
+      const responseKeys = json && typeof json === 'object' ? Object.keys(json) : [];
+      const dataType = (json as { data?: unknown })?.data;
+      const ohlcvList = (json as { data?: { attributes?: { ohlcv_list?: unknown } } })
+        ?.data?.attributes?.ohlcv_list;
+      log({
+        kind: 'gecko_candle_empty', mint, poolAddress,
+        responseKeys: responseKeys.join(','),
+        hasData: dataType !== undefined,
+        ohlcvType: ohlcvList === undefined ? 'missing' : Array.isArray(ohlcvList) ? `array(${ohlcvList.length})` : typeof ohlcvList,
+      });
       return 'failed';
     }
     const trimmed = points.length > maxCandles ? points.slice(points.length - maxCandles) : points;

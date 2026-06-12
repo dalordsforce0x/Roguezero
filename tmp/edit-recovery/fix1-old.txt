@@ -1,0 +1,24 @@
+  // Recovery guard: older funding flow could incorrectly mark a session as
+  // long position before any submitted trade exists. Reset to flat so entry logic
+  // can run normally.
+  if (
+    countOpenPositions(positionsState) > 0
+    && !session.service_control.schedulingState?.lastTradeSubmittedAt
+  ) {
+    const markedAt = new Date().toISOString();
+    const markedPriceUsd = positionState.lastMarkedPriceUsd ?? lastPythSolSample?.usdPrice ?? null;
+
+    positionsState = await persistPositionsState(session, {
+      activePositionMint: null,
+      positions: {},
+    }, {
+      lastMarkedPriceUsd: markedPriceUsd,
+      lastMarkedAt: markedAt,
+    });
+
+    positionState = summarizePositionsState(positionsState, {
+      lastMarkedPriceUsd: markedPriceUsd,
+      lastMarkedAt: markedAt,
+    });
+    log('warn', session.id, 'recovered inconsistent bootstrap position state (long without submitted trade)');
+  }

@@ -1,0 +1,39 @@
+  // Recovery guard: an older funding flow could mark a session 'long' before any
+  // real buy executed. Such bootstrap phantoms carry NO tracked quantity. Clear
+  // ONLY those zero-quantity phantoms here — never positions that hold a real
+  // tracked balance. Wiping real positions to {} (the old behavior) orphaned the
+  // on-chain tokens out of tracking: they became invisible to PnL and were never
+  // sold. Positions whose tokens are genuinely gone on-chain are dropped by the
+  // wallet-truth reconcile below, which checks the chain instead of guessing.
+  if (
+    countOpenPositions(positionsState) > 0
+    && !session.service_control.schedulingState?.lastTradeSubmittedAt
+  ) {
+    const realPositions = Object.fromEntries(
+      Object.entries(positionsState.positions).filter(([, position]) => {
+        const qty = Number(position.quantityAtomic ?? 0);
+        return Number.isFinite(qty) && qty > 0;
+      }),
+    );
+
+    if (Object.keys(realPositions).length !== Object.keys(positionsState.positions).length) {
+      const markedAt = new Date().toISOString();
+      const markedPriceUsd = positionState.lastMarkedPriceUsd ?? lastPythSolSample?.usdPrice ?? null;
+
+      positionsState = await persistPositionsState(session, {
+        activePositionMint: positionsState.activePositionMint && realPositions[positionsState.activePositionMint]
+          ? positionsState.activePositionMint
+          : null,
+        positions: realPositions,
+      }, {
+        lastMarkedPriceUsd: markedPriceUsd,
+        lastMarkedAt: markedAt,
+      });
+
+      positionState = summarizePositionsState(positionsState, {
+        lastMarkedPriceUsd: markedPriceUsd,
+        lastMarkedAt: markedAt,
+      });
+      log('warn', session.id, 'cleared zero-quantity bootstrap position phantom (kept real on-chain holdings)');
+    }
+  }

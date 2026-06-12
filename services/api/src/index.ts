@@ -224,7 +224,7 @@ const jupiterMonthlyBudget = createMonthlyBudgetGovernor({
   monthlyLimitUnits: JUPITER_MONTHLY_REQUEST_LIMIT,
   enforceLimit: JUPITER_MONTHLY_BUDGET_ENFORCE,
 });
-const submittedExecutionWatchers = new Map<string, { signature: string; listenerId: number }>();
+const submittedExecutionWatchers = new Map<string, { signature: string; listenerId: number; enhanced: boolean }>();
 const executionReconcilesInFlight = new Set<string>();
 
 type ProviderLaneName = 'helius-rpc' | 'helius-sender' | 'jupiter-general' | 'helius-rpc-cache-hit';
@@ -931,8 +931,10 @@ const parseJupiterSubmitRequest = (body: JupiterSubmitRequestBody) => {
     body.maxRetries !== undefined && maxRetries === undefined
       ? 'maxRetries must be a non-negative integer'
       : null,
-    (blockhash && lastValidBlockHeight === undefined) || (!blockhash && lastValidBlockHeight !== undefined)
-      ? 'blockhash and lastValidBlockHeight must be provided together for confirmation'
+    body.blockhash != null && body.lastValidBlockHeight != null
+      ? ((blockhash && lastValidBlockHeight === undefined) || (!blockhash && lastValidBlockHeight !== undefined)
+        ? 'blockhash and lastValidBlockHeight must be provided together for confirmation'
+        : null)
       : null,
   ].filter((value): value is string => value !== null);
 
@@ -2396,13 +2398,17 @@ const reconcileSubmittedExecutionRecord = async (
 const stopWatchingSubmittedExecution = (executionId: string) => {
   const watcher = submittedExecutionWatchers.get(executionId);
 
-  if (!watcher || !heliusConnection) {
+  if (!watcher) {
     return;
   }
 
-  heliusConnection.removeSignatureListener(watcher.listenerId).catch((error) => {
-    app.log.warn({ error, executionId, signature: watcher.signature }, 'failed to remove submitted execution signature listener');
-  });
+  if (watcher.enhanced && enhancedWsClient) {
+    enhancedWsClient.unsubscribe(watcher.listenerId);
+  } else if (heliusConnection) {
+    heliusConnection.removeSignatureListener(watcher.listenerId).catch((error) => {
+      app.log.warn({ error, executionId, signature: watcher.signature }, 'failed to remove submitted execution signature listener');
+    });
+  }
   submittedExecutionWatchers.delete(executionId);
 };
 
@@ -2459,7 +2465,7 @@ const watchSubmittedExecution = (executionId: string, signature: string) => {
       },
       'confirmed',
     ).then((subId) => {
-      submittedExecutionWatchers.set(executionId, { signature, listenerId: subId });
+      submittedExecutionWatchers.set(executionId, { signature, listenerId: subId, enhanced: true });
     }).catch((err) => {
       app.log.warn({ err, executionId, signature }, 'enhanced WS transactionSubscribe failed, falling back to onSignature');
       // Fall back to standard onSignature
@@ -2471,7 +2477,7 @@ const watchSubmittedExecution = (executionId: string, signature: string) => {
         },
         'confirmed',
       );
-      submittedExecutionWatchers.set(executionId, { signature, listenerId });
+      submittedExecutionWatchers.set(executionId, { signature, listenerId, enhanced: false });
     });
     return;
   }
@@ -2486,7 +2492,7 @@ const watchSubmittedExecution = (executionId: string, signature: string) => {
     'confirmed',
   );
 
-  submittedExecutionWatchers.set(executionId, { signature, listenerId });
+  submittedExecutionWatchers.set(executionId, { signature, listenerId, enhanced: false });
 };
 
 const syncSubmittedExecutionWatchers = async () => {

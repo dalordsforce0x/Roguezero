@@ -1,0 +1,85 @@
+6236: const computeDynamicExitThresholds = (
+6237:   session: RawSession,
+6238:   positionState: NonNullable<Session['serviceControl']['positionState']>,
+6239:   signalSnapshot: NonNullable<Session['serviceControl']['lastSignal']>,
+6240: ): DynamicExitThresholds => {
+6241:   const costFloorBps = computeExitCostFloorBps(session);
+6242:   const atrBps = positionState.lastComputedAtrBps ?? null;
+6243: 
+6244:   // ── B4: Regime-based exit scaling ─────────────────────────────────────────
+6245:   // Trending: widen TP (+30%) and trailing (+20%) — let winners ride.
+6246:   // Ranging: tighten TP (-20%) and trailing (-20%) — take quick profits.
+6247:   const regime = recommendStrategy(sharedMarketTape.solUsdPyth);
+6248:   let regimeTpScale = 1.0;
+6249:   let regimeTrailingScale = 1.0;
+6250:   if (regime.reason === 'expanding_bands_steep_slope') {
+6251:     regimeTpScale = 1.3;
+6252:     regimeTrailingScale = 1.2;
+6253:   } else if (regime.reason === 'narrow_bands_flat_slope') {
+6254:     regimeTpScale = 0.8;
+6255:     regimeTrailingScale = 0.8;
+6256:   }
+6257:   // Token-class exit profile (flag-gated, Noah-scoped). OFF => exact global multipliers as before.
+6258:   const exitProfilesActive = isFeatureActiveForSession(session, WORKER_TOKEN_CLASS_EXIT_PROFILES_ENABLED, 'token_class_exit');
+6259:   const exitProfile: TokenClassExitProfile = exitProfilesActive
+6260:     ? getTokenClassExitProfile(getTokenTradeClass(positionState.positionMint ?? '', positionState.positionSymbol))
+6261:     : {
+6262:         takeProfitMult: positionExitPolicy.atrTakeProfitMultiplier,
+6263:         stopLossMult: positionExitPolicy.atrStopLossMultiplier,
+6264:         trailingStopMult: positionExitPolicy.atrTrailingStopMultiplier,
+6265:       };
+6266: 
+6267:   // Time-decay take-profit ladder: a fresh position must clear its full target,
+6268:   // but as it ages the required take-profit decays linearly toward the cost
+6269:   // floor (breakeven + fees). This frees capital from stale positions that are
+6270:   // green-but-stuck without ever realizing a take-profit below cost. Stop-loss
+6271:   // and trailing thresholds are unaffected.
+6272:   const entryAtMs = positionState.entryAt ? Date.parse(positionState.entryAt) : NaN;
+6273:   const positionAgeMs = Number.isFinite(entryAtMs) ? Math.max(0, Date.now() - entryAtMs) : 0;
+6274:   const decayStartMs = positionExitPolicy.takeProfitTimeDecayStartMs;
+6275:   const decayFullMs = positionExitPolicy.takeProfitTimeDecayFullMs;
+6276:   const applyTakeProfitTimeDecay = (rawTakeProfitBps: number): number => {
+6277:     if (!WORKER_TP_TIME_DECAY_ENABLED || decayFullMs <= decayStartMs || positionAgeMs <= decayStartMs || rawTakeProfitBps <= costFloorBps) {
+6278:       return rawTakeProfitBps;
+6279:     }
+6280:     const progress = Math.min(1, (positionAgeMs - decayStartMs) / (decayFullMs - decayStartMs));
+6281:     const decayed = Math.round(rawTakeProfitBps - (rawTakeProfitBps - costFloorBps) * progress);
+6282:     return Math.max(costFloorBps, decayed);
+6283:   };
+6284: 
+6285:   if (!atrBps || atrBps <= 0) {
+6286:     return {
+6287:       takeProfitBps: applyTakeProfitTimeDecay(Math.max(Math.round(positionExitPolicy.takeProfitBps * regimeTpScale), costFloorBps)),
+6288:       stopLossBps: Math.max(positionExitPolicy.stopLossBps, costFloorBps),
+6289:       trailingStopBps: Math.max(Math.round(positionExitPolicy.trailingStopBps * regimeTrailingScale), positionExitPolicy.trailingStopFloorBps),
+6290:       atrBps: null,
+6291:       costFloorBps,
+6292:       mode: 'fallback',
+6293:     };
+6294:   }
+6295: 
+6296:   const signalStrengthBps = Math.abs(signalSnapshot.momentumBps ?? 0);
+6297:   const signalStrengthBoost = Math.min(0.5, signalStrengthBps / 200);
+6298:   return {
+6299:     takeProfitBps: applyTakeProfitTimeDecay(Math.max(
+6300:       costFloorBps,
+6301:       Math.round(atrBps * exitProfile.takeProfitMult * (1 + signalStrengthBoost) * regimeTpScale),
+6302:     )),
+6303:     stopLossBps: Math.max(
+6304:       costFloorBps,
+6305:       Math.round(atrBps * exitProfile.stopLossMult),
+6306:     ),
+6307:     trailingStopBps: Math.max(
+6308:       positionExitPolicy.trailingStopFloorBps,
+6309:       Math.round(atrBps * exitProfile.trailingStopMult * regimeTrailingScale),
+6310:     ),
+6311:     atrBps,
+6312:     costFloorBps,
+6313:     mode: 'atr',
+6314:   };
+6315: };
+6316: 
+6317: const refreshPositionsMarks = async (
+6318:   session: RawSession,
+6319:   positionsState: SessionPositionsState,
+6320: ) => {

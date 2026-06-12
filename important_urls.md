@@ -200,8 +200,8 @@ what we have actually proven in this codebase:
 
 ### Direct mapping to RogueZero's verified state (2026-06-09)
 - **"~2% fee per trade kills edge" → EXACTLY our finding.** Our round-trip cost is
-  ~110-150 bps (35 bps platform fee × 2 legs = 70 bps alone) while captured moves
-  are only **13-27 bps**. The article's structural warning is our literal P&L.
+  ~110-150 bps (per-trade platform fee was 35 bps × 2 legs = 70 bps alone, NOW DISABLED to 0) while captured moves
+  were only **13-27 bps**. Per-trade fee removed; 0.33% performance fee at session end agreed instead (NOT YET BUILT).
 - **"Sizing > entry precision" → confirmed by our data.** Entry-quality band did
   NOT predict outcome (strong −32.7 bps vs weak −21.9 bps). Stop chasing entry
   selectivity; fix sizing + the cost/exit asymmetry.
@@ -302,7 +302,7 @@ are mapped to our verified prod behavior, not generic theory.
   estimator. Meta-aggregator `/order` gets RTSE automatically; Router does NOT.
 - `platformFeeBps` default 0; needs `feeAccount`. Fee is added inside the swap
   instruction; `feeAccount` is any SPL token account we control (no referral
-  program needed). → confirms our 35-bps capture wiring.
+  program needed). → per-trade fee now disabled (0); 0.33% performance fee at session end agreed (NOT YET BUILT).
 - `maxAccounts` default 64 (1-64). `mode=fast` (BETA) for low-latency routing.
 - `computeBudgetInstructions` returns the **CU price but NOT the CU limit** — the
   integrator must simulate and set the limit themselves.

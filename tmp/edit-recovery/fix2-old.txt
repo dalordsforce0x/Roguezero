@@ -1,0 +1,33 @@
+  if (openPositions.length > 0) {
+    const reconciledPositions = { ...positionsState.positions };
+    const droppedMints: string[] = [];
+
+    for (const { mint, position } of openPositions) {
+      const trackedQuantityAtomic = Number(position.quantityAtomic ?? 0);
+      if (!Number.isFinite(trackedQuantityAtomic) || trackedQuantityAtomic <= 0) {
+        continue;
+      }
+
+      const walletInventoryAtomic = mint === SOL_MINT
+        ? Math.max(0, balance - MIN_SOL_OPERATING_RESERVE_LAMPORTS)
+        : await getTokenBalanceAtomic(keypair.publicKey, mint, TOKEN_PROGRAM_ID).catch(() => 0);
+      const minimumExpectedInventoryAtomic = Math.max(1, Math.floor(trackedQuantityAtomic * 0.1));
+
+      if (walletInventoryAtomic < minimumExpectedInventoryAtomic) {
+        delete reconciledPositions[mint];
+        droppedMints.push(`${getPositionSymbol(position)}:${walletInventoryAtomic}/${trackedQuantityAtomic}`);
+      }
+    }
+
+    if (droppedMints.length > 0) {
+      positionsState = await persistPositionsState(session, {
+        activePositionMint: positionsState.activePositionMint && reconciledPositions[positionsState.activePositionMint]
+          ? positionsState.activePositionMint
+          : null,
+        positions: reconciledPositions,
+      });
+      positionState = summarizePositionsState(positionsState, session.service_control.positionState ?? undefined);
+      openPositions = listOpenPositions(positionsState);
+      log('warn', session.id, `reconciled stale position inventory; dropped ${droppedMints.join(', ')}`);
+    }
+  }

@@ -1,0 +1,823 @@
+[
+  {
+    "mint": "x95HN3DWvbfCBtTjGm587z8suK3ec6cwQwgZNLbWKyp",
+    "symbol": "$HACHI",
+    "buyBps": 2.2264682710767163,
+    "sellBps": 32.95330265014216,
+    "roundTripImpact": 35.17977092121888,
+    "totalCost": 105.17977092121887
+  },
+  {
+    "mint": "HhJpBhRRn4g56VsyLuT8DL5Bv31HkXqsrahTTUCZeZg4",
+    "symbol": "$MYRO",
+    "buyBps": 0,
+    "sellBps": 50.565000000000005,
+    "roundTripImpact": 50.565000000000005,
+    "totalCost": 120.565
+  },
+  {
+    "mint": "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm",
+    "symbol": "$WIF",
+    "buyBps": 1.655264449728131,
+    "sellBps": 7.139917395415732,
+    "roundTripImpact": 8.795181845143862,
+    "totalCost": 78.79518184514386
+  },
+  {
+    "mint": "5mbK36SZ7J19An8jFochhQS4of8g6BwUjbeCSxBSoWdp",
+    "symbol": "$michi",
+    "buyBps": 2.6624571500012872,
+    "sellBps": 49.40716599244081,
+    "roundTripImpact": 52.0696231424421,
+    "totalCost": 122.0696231424421
+  },
+  {
+    "mint": "9AvytnUKsLxPxFHFqS6VLxaxt5p6BhYNr53SD2Chpump",
+    "symbol": "67",
+    "buyBps": 0,
+    "sellBps": 124.25047716310296,
+    "roundTripImpact": 124.25047716310296,
+    "totalCost": 194.25047716310297
+  },
+  {
+    "mint": "9qriMjPPAJTMCtfQnz7Mo9BsV2jAWTr2ff7yc3JWpump",
+    "symbol": "9qri",
+    "buyBps": 1.9857838915346286,
+    "sellBps": 49.03495339052187,
+    "roundTripImpact": 51.0207372820565,
+    "totalCost": 121.0207372820565
+  },
+  {
+    "mint": "GJAFwWjJ3vnTsrQVabjBVK2TYB1YtRCQXRDfDgUnpump",
+    "symbol": "ACT",
+    "buyBps": 1.720873637796611,
+    "sellBps": 48.488090705983055,
+    "roundTripImpact": 50.20896434377966,
+    "totalCost": 120.20896434377966
+  },
+  {
+    "mint": "4UeLCRqARmfb6e6KQijtiktqqXUxbfk6jZng7DhuBAGS",
+    "symbol": "ASTEROID",
+    "buyBps": 0,
+    "sellBps": 152.40589940810025,
+    "roundTripImpact": 152.40589940810025,
+    "totalCost": 222.40589940810025
+  },
+  {
+    "mint": "F5tfztTnE4sYsMhZT5KrFpWvHmYSfJZoRjCuxKPbpump",
+    "symbol": "Aliens",
+    "buyBps": 0,
+    "sellBps": 186.58361037493887,
+    "roundTripImpact": 186.58361037493887,
+    "totalCost": 256.58361037493887
+  },
+  {
+    "mint": "6qdzMx4c9rL2X3Ns3SwZ8uEo4zReDPjdXpAEmpo7pump",
+    "symbol": "BABYTROLL",
+    "buyBps": 0,
+    "sellBps": 222.87557085065347,
+    "roundTripImpact": 222.87557085065347,
+    "totalCost": 292.8755708506535
+  },
+  {
+    "mint": "ukHH6c7mMyiWCf1b9pnWe25TSpkDDt3H5pQZgZ74J82",
+    "symbol": "BOME",
+    "buyBps": 1.5659841211291756,
+    "sellBps": 53.489920748370075,
+    "roundTripImpact": 55.05590486949925,
+    "totalCost": 125.05590486949924
+  },
+  {
+    "mint": "3B1ijcocM5EDga6XxQ7JLW7weocQPWWjuhBYG8Vepump",
+    "symbol": "BP",
+    "buyBps": 0,
+    "sellBps": 132.47151643240707,
+    "roundTripImpact": 132.47151643240707,
+    "totalCost": 202.47151643240707
+  },
+  {
+    "mint": "3TYgKwkE2Y3rxdw9osLRSpxpXmSC1C1oo19W9KHspump",
+    "symbol": "BULL",
+    "buyBps": 0,
+    "sellBps": 147.47139875809307,
+    "roundTripImpact": 147.47139875809307,
+    "totalCost": 217.47139875809307
+  },
+  {
+    "mint": "CGEDT9QZDvvH5GmVkWJH2BXiMJqMJySC9ihWyr7Spump",
+    "symbol": "BURNIE",
+    "buyBps": 19.761487647073178,
+    "sellBps": 118.1285356631065,
+    "roundTripImpact": 137.89002331017969,
+    "totalCost": 207.89002331017969
+  },
+  {
+    "mint": "9PR7nCP9DpcUotnDPVLUBUZKu5WAYkwrCUx9wDnSpump",
+    "symbol": "Ban",
+    "buyBps": 19.79190068919548,
+    "sellBps": 49.96098158939973,
+    "roundTripImpact": 69.75288227859521,
+    "totalCost": 139.75288227859522
+  },
+  {
+    "mint": "HgBRWfYxEfvPhtqkaeymCQtHCrKE46qQ43pKe8HCpump",
+    "symbol": "Bert",
+    "buyBps": 21.050335087721706,
+    "sellBps": 20.93769106675334,
+    "roundTripImpact": 41.98802615447505,
+    "totalCost": 111.98802615447505
+  },
+  {
+    "mint": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+    "symbol": "Bonk",
+    "buyBps": 19.438229079921392,
+    "sellBps": 5.027543574449552,
+    "roundTripImpact": 24.465772654370944,
+    "totalCost": 94.46577265437094
+  },
+  {
+    "mint": "Cm6fNnMk7NfzStP9CZpsQA2v3jjzbcYGAxdJySmHpump",
+    "symbol": "Buttcoin",
+    "buyBps": 0.41553650433410744,
+    "sellBps": 74.84683779819062,
+    "roundTripImpact": 75.26237430252473,
+    "totalCost": 145.26237430252473
+  },
+  {
+    "mint": "Df6yfrKC8kZE3KNkrHERKzAetSxbrWeniQfyJY4Jpump",
+    "symbol": "CHILLGUY",
+    "buyBps": 0,
+    "sellBps": 12.197647051019723,
+    "roundTripImpact": 12.197647051019723,
+    "totalCost": 82.19764705101973
+  },
+  {
+    "mint": "GkyPYa7NnCFbduLknCfBfP7p8564X1VZhwZYJ6CZpump",
+    "symbol": "CHILLHOUSE",
+    "buyBps": 711.4945178722702,
+    "sellBps": 0,
+    "roundTripImpact": 711.4945178722702,
+    "totalCost": 781.4945178722702
+  },
+  {
+    "mint": "3qq54YqAKG3TcrwNHXFSpMCWoL8gmMuPceJ4FG9npump",
+    "symbol": "CLANKER",
+    "buyBps": 2.40990927019019,
+    "sellBps": 50.257660735405764,
+    "roundTripImpact": 52.667570005595955,
+    "totalCost": 122.66757000559596
+  },
+  {
+    "mint": "6yjNqPzTSanBWSa6dxVEgTjePXBrZ2FoHLDQwYwEsyM6",
+    "symbol": "Chud",
+    "buyBps": 1.1152896354245279,
+    "sellBps": 47.35407855055658,
+    "roundTripImpact": 48.46936818598111,
+    "totalCost": 118.46936818598111
+  },
+  {
+    "mint": "6nR8wBnfsmXfcdDr1hovJKjvFQxNSidN6XFyfAFZpump",
+    "symbol": "Clash",
+    "buyBps": 1.1748554900478687,
+    "sellBps": 57.05929454281359,
+    "roundTripImpact": 58.23415003286146,
+    "totalCost": 128.23415003286146
+  },
+  {
+    "mint": "AWGCDT2gd8JadbYbYyZy1iKxfWokPNgrEQoU24zUpump",
+    "symbol": "Clude",
+    "buyBps": 3.8446943851404822,
+    "sellBps": 155.54862793260222,
+    "roundTripImpact": 159.3933223177427,
+    "totalCost": 229.3933223177427
+  },
+  {
+    "mint": "4Cnk9EPnW5ixfLZatCPJjDB1PUtcRpVVgTQukm9epump",
+    "symbol": "DADDY",
+    "buyBps": 1.5245514317562854,
+    "sellBps": 46.07883684715516,
+    "roundTripImpact": 47.603388278911446,
+    "totalCost": 117.60338827891144
+  },
+  {
+    "mint": "5oVNBeEEQvYi1cX3ir8Dx5n1P7pdxydbGF2X4TxVusJm",
+    "symbol": "DRIFT",
+    "buyBps": 21.443609910605637,
+    "sellBps": 0.24228728346141232,
+    "roundTripImpact": 21.68589719406705,
+    "totalCost": 91.68589719406705
+  },
+  {
+    "mint": "AUdUEc98MGfEHJiJfCgMaW8gKdcfNDio8BFzGKBwjztC",
+    "symbol": "Digi",
+    "buyBps": 4.893960329273063,
+    "sellBps": 48.462757151821755,
+    "roundTripImpact": 53.35671748109482,
+    "totalCost": 123.35671748109482
+  },
+  {
+    "mint": "HmBdm8vbisABUjkxms6ZUnoaXbfwFM6ymxShWfAENaoi",
+    "symbol": "EITHER",
+    "buyBps": 3.6455478052522086,
+    "sellBps": 18.308702571117546,
+    "roundTripImpact": 21.954250376369757,
+    "totalCost": 91.95425037636976
+  },
+  {
+    "mint": "A8C3xuqscfmyLrte3VmTqrAq8kgMASius9AFNANwpump",
+    "symbol": "FWOG",
+    "buyBps": 1.7920693897316144,
+    "sellBps": 46.25514798636546,
+    "roundTripImpact": 48.04721737609707,
+    "totalCost": 118.04721737609708
+  },
+  {
+    "mint": "9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump",
+    "symbol": "Fartcoin",
+    "buyBps": 0,
+    "sellBps": 6.579939515329619,
+    "roundTripImpact": 6.579939515329619,
+    "totalCost": 76.57993951532961
+  },
+  {
+    "mint": "BBKPiLM9KjdJW7oQSKt99RVWcZdhF6sEHRKnwqeBGHST",
+    "symbol": "GHOST",
+    "buyBps": 1.6289505354933107,
+    "sellBps": 112.82242767990518,
+    "roundTripImpact": 114.45137821539849,
+    "totalCost": 184.4513782153985
+  },
+  {
+    "mint": "63LfDmNb3MQ8mw9MtZ2To9bEA2M71kZUUGq5tiJxcqj9",
+    "symbol": "GIGA",
+    "buyBps": 1.625815969659501,
+    "sellBps": 48.28203380050054,
+    "roundTripImpact": 49.90784977016004,
+    "totalCost": 119.90784977016004
+  },
+  {
+    "mint": "8wXtPeU6557ETkp9WHFY1n1EcU6NxDvbAggHGsMYiHsB",
+    "symbol": "GME",
+    "buyBps": 3.9874771745635678,
+    "sellBps": 46.26697167478537,
+    "roundTripImpact": 50.25444884934893,
+    "totalCost": 120.25444884934893
+  },
+  {
+    "mint": "KENJSUYLASHUMfHyy5o4Hp2FdNqZg1AsUPhfH2kYvEP",
+    "symbol": "GRIFFAIN",
+    "buyBps": 2.019330118454158,
+    "sellBps": 47.502262156412556,
+    "roundTripImpact": 49.52159227486671,
+    "totalCost": 119.52159227486672
+  },
+  {
+    "mint": "EaxAUcXxNnVwcqm2BBocbows7D1XVY2Q63V38NEypump",
+    "symbol": "GTA 6 Coin",
+    "buyBps": 3.8288740318722647,
+    "sellBps": 48.677764070805765,
+    "roundTripImpact": 52.50663810267803,
+    "totalCost": 122.50663810267804
+  },
+  {
+    "mint": "3KHMZhpthXuiCcgfTv7vVu9PpEz64KAEURFwi6Lopump",
+    "symbol": "Goblin",
+    "buyBps": 39.80683535671466,
+    "sellBps": 90.67812556476655,
+    "roundTripImpact": 130.48496092148122,
+    "totalCost": 200.48496092148122
+  },
+  {
+    "mint": "hntyVP6YFm1Hg25TN9WGLqM12b8TQmcknKrdu1oxWux",
+    "symbol": "HNT",
+    "buyBps": 5.171944778772991,
+    "sellBps": 33.60743680195659,
+    "roundTripImpact": 38.77938158072958,
+    "totalCost": 108.77938158072958
+  },
+  {
+    "mint": "Hh3oTaqDCKKfdBgsQEvxp9sUwyNf8x9qmKqEMLBWpump",
+    "symbol": "HODL",
+    "buyBps": 3.837290377888954,
+    "sellBps": 146.9821109261089,
+    "roundTripImpact": 150.81940130399786,
+    "totalCost": 220.81940130399786
+  },
+  {
+    "mint": "jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL",
+    "symbol": "JTO",
+    "buyBps": 0,
+    "sellBps": 50.9366910738772,
+    "roundTripImpact": 50.9366910738772,
+    "totalCost": 120.9366910738772
+  },
+  {
+    "mint": "9VY2rDbtsBmTsBxoRF8hWSEUKGqnoQoe9V6W3JnjNgfm",
+    "symbol": "JTVO",
+    "buyBps": 6.606296318327358,
+    "sellBps": 351.1126591083912,
+    "roundTripImpact": 357.71895542671854,
+    "totalCost": 427.71895542671854
+  },
+  {
+    "mint": "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
+    "symbol": "JUP",
+    "buyBps": 5.803870085096413,
+    "sellBps": 1.887843617783935,
+    "roundTripImpact": 7.691713702880349,
+    "totalCost": 77.69171370288035
+  },
+  {
+    "mint": "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn",
+    "symbol": "JitoSOL",
+    "buyBps": 5.363236464506518,
+    "sellBps": 0,
+    "roundTripImpact": 5.363236464506518,
+    "totalCost": 75.36323646450651
+  },
+  {
+    "mint": "Tqj8yFmagrg7oorpQkVGYR52r96RFTamvWfth9bpump",
+    "symbol": "KINS",
+    "buyBps": 4.23658582574488,
+    "sellBps": 96.26019563229504,
+    "roundTripImpact": 100.49678145803992,
+    "totalCost": 170.49678145803992
+  },
+  {
+    "mint": "1zJX5gRnjLgmTpq5sVwkq69mNDQkCemqoasyjaPW6jm",
+    "symbol": "KLED",
+    "buyBps": 5.5903319933902775,
+    "sellBps": 70.00380245626275,
+    "roundTripImpact": 75.59413444965303,
+    "totalCost": 145.59413444965304
+  },
+  {
+    "mint": "KMNo3nJsBXfcpJTVhZcXLW7RmTwTt4GVFE7suUBo9sS",
+    "symbol": "KMNO",
+    "buyBps": 0,
+    "sellBps": 2.484021436178718,
+    "roundTripImpact": 2.484021436178718,
+    "totalCost": 72.48402143617872
+  },
+  {
+    "mint": "9voQQTTdfbqfXwc9rZAdJEeXXjUWjHnB4wkShMT8pump",
+    "symbol": "LAYOFF",
+    "buyBps": 5.595461081398092,
+    "sellBps": 165.82032303500662,
+    "roundTripImpact": 171.41578411640472,
+    "totalCost": 241.41578411640472
+  },
+  {
+    "mint": "H74CYmXgMkYHYuSRsZt6RJb4NYp2u72Vw8BS5huApump",
+    "symbol": "LMAO!",
+    "buyBps": 13.936273475072356,
+    "sellBps": 57.82910484721546,
+    "roundTripImpact": 71.76537832228782,
+    "totalCost": 141.7653783222878
+  },
+  {
+    "mint": "AVF9F4C4j8b1Kh4BmNHqybDaHgnZpJ7W7yLvL7hUpump",
+    "symbol": "Lobstar",
+    "buyBps": 4.246160970126178,
+    "sellBps": 164.46432829362098,
+    "roundTripImpact": 168.71048926374715,
+    "totalCost": 238.71048926374715
+  },
+  {
+    "mint": "madHpjRn6bd8t78Rsy7NuSuNwWa2HU8ByPobZprHbHv",
+    "symbol": "MAD",
+    "buyBps": 20.258171164634444,
+    "sellBps": 49.265817879017455,
+    "roundTripImpact": 69.5239890436519,
+    "totalCost": 139.5239890436519
+  },
+  {
+    "mint": "Hon2rHAiqkcDtUzL5gA2vjXPr7T1MPCK2UT2AHKCpump",
+    "symbol": "MAGA",
+    "buyBps": 4.17776220521259,
+    "sellBps": 29.195434953258655,
+    "roundTripImpact": 33.37319715847124,
+    "totalCost": 103.37319715847124
+  },
+  {
+    "mint": "METvsvVRapdj9cFLzq4Tr43xK4tAjQfwX76z3n6mWQL",
+    "symbol": "MET",
+    "buyBps": 22.987050883705447,
+    "sellBps": 0.03377310210497339,
+    "roundTripImpact": 23.02082398581042,
+    "totalCost": 93.02082398581042
+  },
+  {
+    "mint": "MEW1gQWJ3nEXg2qgERiKu7FAFj79PHvQVREQUzScPP5",
+    "symbol": "MEW",
+    "buyBps": 1.8728128889386337,
+    "sellBps": 47.741128131071,
+    "roundTripImpact": 49.613941020009634,
+    "totalCost": 119.61394102000963
+  },
+  {
+    "mint": "5LafQUrVco6o7KMz42eqVEJ9LW31StPyGjeeu5sKoMtA",
+    "symbol": "MUMU",
+    "buyBps": 20.511362440205286,
+    "sellBps": 48.76257602393482,
+    "roundTripImpact": 69.2739384641401,
+    "totalCost": 139.2739384641401
+  },
+  {
+    "mint": "C29ebrgYjYoJPMGPnPSGY1q3mMGk4iDSqnQeQQA7moon",
+    "symbol": "NOBODY",
+    "buyBps": 4.595248033704248,
+    "sellBps": 96.2819959315443,
+    "roundTripImpact": 100.87724396524855,
+    "totalCost": 170.87724396524857
+  },
+  {
+    "mint": "F7pB3ZdfBnyFw2LRHydWEn9BmhEa5XihXLjhySFRpump",
+    "symbol": "NOTHING",
+    "buyBps": 0,
+    "sellBps": 184.95289177703592,
+    "roundTripImpact": 184.95289177703592,
+    "totalCost": 254.95289177703592
+  },
+  {
+    "mint": "orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1kektZE",
+    "symbol": "ORCA",
+    "buyBps": 1.3023343356349335,
+    "sellBps": 2.053842206553042,
+    "roundTripImpact": 3.356176542187976,
+    "totalCost": 73.35617654218798
+  },
+  {
+    "mint": "HfMbPyDdZH6QMaDDUokjYCkHxzjoGBMpgaUvpLWGbF5p",
+    "symbol": "PBTC",
+    "buyBps": 1.9453582957515438,
+    "sellBps": 33.16605219968809,
+    "roundTripImpact": 35.111410495439635,
+    "totalCost": 105.11141049543963
+  },
+  {
+    "mint": "8Jx8AAHj86wbQgUTjGuj6GTTL5Ps3cqxKRTvpaJApump",
+    "symbol": "PENGUIN",
+    "buyBps": 4.452054061294267,
+    "sellBps": 29.05087954733302,
+    "roundTripImpact": 33.50293360862729,
+    "totalCost": 103.50293360862729
+  },
+  {
+    "mint": "5z3EqYQo9HiCEs3R84RCDMu2n7anpDMxRhdK8PSWmrRC",
+    "symbol": "PONKE",
+    "buyBps": 3.6507951667766836,
+    "sellBps": 46.31211243684808,
+    "roundTripImpact": 49.962907603624764,
+    "totalCost": 119.96290760362476
+  },
+  {
+    "mint": "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr",
+    "symbol": "POPCAT",
+    "buyBps": 4.599629874374199,
+    "sellBps": 16.412168854187076,
+    "roundTripImpact": 21.011798728561274,
+    "totalCost": 91.01179872856127
+  },
+  {
+    "mint": "Eg2ymQ2aQqjMcibnmTt8erC6Tvk9PVpJZCxvVPJz2agu",
+    "symbol": "PUMPCADE",
+    "buyBps": 2.3840570923408086,
+    "sellBps": 58.987659636048114,
+    "roundTripImpact": 61.371716728388925,
+    "totalCost": 131.37171672838892
+  },
+  {
+    "mint": "HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3",
+    "symbol": "PYTH",
+    "buyBps": 17.1281144661308,
+    "sellBps": 27.319611587632604,
+    "roundTripImpact": 44.447726053763404,
+    "totalCost": 114.4477260537634
+  },
+  {
+    "mint": "8PzFWyLpCVEmbZmVJcaRTU5r69XKJx1rd7YGpWvnpump",
+    "symbol": "Percolator",
+    "buyBps": 0,
+    "sellBps": 297.5456366458391,
+    "roundTripImpact": 297.5456366458391,
+    "totalCost": 367.5456366458391
+  },
+  {
+    "mint": "2nP9yKQNSGQy851iyawDvBkzkK2R2aqKArQCKc2gpump",
+    "symbol": "PsyopAnime",
+    "buyBps": 0,
+    "sellBps": 134.59428515217917,
+    "roundTripImpact": 134.59428515217917,
+    "totalCost": 204.59428515217917
+  },
+  {
+    "mint": "NV2RYH954cTJ3ckFUpvfqaQXU4ARqqDH3562nFSpump",
+    "symbol": "Punch",
+    "buyBps": 0,
+    "sellBps": 102.931,
+    "roundTripImpact": 102.931,
+    "totalCost": 172.93099999999998
+  },
+  {
+    "mint": "AUuCEHQ7sm2i5GmaHrpE961voWcTY8U6mgrkhcV7pump",
+    "symbol": "QST",
+    "buyBps": 0.5935543384411609,
+    "sellBps": 49.47198441257393,
+    "roundTripImpact": 50.06553875101509,
+    "totalCost": 120.06553875101508
+  },
+  {
+    "mint": "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R",
+    "symbol": "RAY",
+    "buyBps": 4.529647893607373,
+    "sellBps": 5.603240883209408,
+    "roundTripImpact": 10.132888776816781,
+    "totalCost": 80.13288877681678
+  },
+  {
+    "mint": "7HgfXftRBBqsYtAEYcqjGLQrNJLL6Tww9ek4rE3Apump",
+    "symbol": "RKC",
+    "buyBps": 96.49361672966673,
+    "sellBps": 0,
+    "roundTripImpact": 96.49361672966673,
+    "totalCost": 166.4936167296667
+  },
+  {
+    "mint": "G8aVC4nk5oPWzTHp4PDm3kAuixCebv9WRQMD93h9pump",
+    "symbol": "RWA",
+    "buyBps": 4.548327895575654,
+    "sellBps": 54.6573292086465,
+    "roundTripImpact": 59.205657104222155,
+    "totalCost": 129.20565710422215
+  },
+  {
+    "mint": "SHDWyBxihqiCjDYwvisits5jfez2EfbR347c5cKAgqje",
+    "symbol": "SHDW",
+    "noRoute": true
+  },
+  {
+    "mint": "E6ifp2mJy8cYQehUGUtFvrXriRKxRuonLmrvTFypump",
+    "symbol": "SPCX",
+    "buyBps": 23.1562755076918,
+    "sellBps": 86.39769289335759,
+    "roundTripImpact": 109.55396840104939,
+    "totalCost": 179.5539684010494
+  },
+  {
+    "mint": "EN2nnxrg8uUi6x2sJkzNPd2eT6rB9rdSoQNNaENA4RZA",
+    "symbol": "SQUIRE",
+    "buyBps": 4.958753538578697,
+    "sellBps": 94.35819994130888,
+    "roundTripImpact": 99.31695347988757,
+    "totalCost": 169.31695347988756
+  },
+  {
+    "mint": "SV151D5pjygAKA8aJJcKzm4wFnRX5G92Fye94jQJk7g",
+    "symbol": "SV151",
+    "buyBps": 3.4518929894433357,
+    "sellBps": 55.74739324076428,
+    "roundTripImpact": 59.19928623020762,
+    "totalCost": 129.19928623020763
+  },
+  {
+    "mint": "6ehEcTMCc85aNF4x9CWx8HuvWGhxQtvKdhKVf2HDpump",
+    "symbol": "TOESCOIN",
+    "buyBps": 4.1396449360918925,
+    "sellBps": 53.005297374994555,
+    "roundTripImpact": 57.144942311086446,
+    "totalCost": 127.14494231108645
+  },
+  {
+    "mint": "5UUH9RTDiSpq6HKS6bp4NdU9PNJpXRXuiw6ShBTBhgH2",
+    "symbol": "TROLL",
+    "buyBps": 6.452644476465034,
+    "sellBps": 4.723326593987239,
+    "roundTripImpact": 11.175971070452274,
+    "totalCost": 81.17597107045228
+  },
+  {
+    "mint": "463SK47VkB7uE7XenTHKiVcMtxRsfNE2X4Q9wByaURVA",
+    "symbol": "TSUKI",
+    "buyBps": 6.10761682946991,
+    "sellBps": 42.09009018484678,
+    "roundTripImpact": 48.19770701431669,
+    "totalCost": 118.19770701431669
+  },
+  {
+    "mint": "H8xQ6poBjB9DTPMDTKWzWPrnxu4bDEhybxiouF8Ppump",
+    "symbol": "Tokabu",
+    "buyBps": 6.328967727759997,
+    "sellBps": 161.1810432343357,
+    "roundTripImpact": 167.5100109620957,
+    "totalCost": 237.5100109620957
+  },
+  {
+    "mint": "J8PSdNP3QewKq2Z1JJJFDMaqF7KcaiJhR7gbr5KZpump",
+    "symbol": "TripleT",
+    "buyBps": 11.14694904409003,
+    "sellBps": 56.147638442376284,
+    "roundTripImpact": 67.29458748646631,
+    "totalCost": 137.2945874864663
+  },
+  {
+    "mint": "eL5fUxj2J4CiQsmW85k5FG9DvuQjjUoBHoQBi2Kpump",
+    "symbol": "UFD",
+    "buyBps": 16.879383589996074,
+    "sellBps": 0,
+    "roundTripImpact": 16.879383589996074,
+    "totalCost": 86.87938358999608
+  },
+  {
+    "mint": "BFgdzMkTPdKKJeTipv2njtDEwhKxkgFueJQfJGt1jups",
+    "symbol": "URANUS",
+    "buyBps": 6.633872159536517,
+    "sellBps": 38.343564470947605,
+    "roundTripImpact": 44.97743663048412,
+    "totalCost": 114.97743663048412
+  },
+  {
+    "mint": "69kdRLyP5DTRkpHraaSZAQbWmAwzF9guKjZfzMXzcbAs",
+    "symbol": "USA",
+    "buyBps": 7.4581749154219175,
+    "sellBps": 40.406961303098,
+    "roundTripImpact": 47.86513621851992,
+    "totalCost": 117.86513621851992
+  },
+  {
+    "mint": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+    "symbol": "USDT",
+    "buyBps": 2.222271517213911,
+    "sellBps": 0,
+    "roundTripImpact": 2.222271517213911,
+    "totalCost": 72.22227151721391
+  },
+  {
+    "mint": "Dz9mQ9NzkBcCsuGPFJ3r1bS4wgqKMHBPiVuniW8Mbonk",
+    "symbol": "USELESS",
+    "buyBps": 0,
+    "sellBps": 0,
+    "roundTripImpact": 0,
+    "totalCost": 70
+  },
+  {
+    "mint": "6AJcP7wuLwmRYLBNbi825wgguaPsWzPBEHcHndpRpump",
+    "symbol": "VINE",
+    "buyBps": 3.251807322112969,
+    "sellBps": 40.224389467011555,
+    "roundTripImpact": 43.47619678912452,
+    "totalCost": 113.47619678912451
+  },
+  {
+    "mint": "BiywH8Eq2CbGhwMHKwCnfTiccWJwN7r1Q4Qn9hsypump",
+    "symbol": "VIRL",
+    "buyBps": 7.266739732772307,
+    "sellBps": 74.73256647824364,
+    "roundTripImpact": 81.99930621101595,
+    "totalCost": 151.99930621101595
+  },
+  {
+    "mint": "85VBFQZC9TZkfaptBWjvUw7YbZjy52A6mjtPGjstQAmQ",
+    "symbol": "W",
+    "buyBps": 7.514322971648277,
+    "sellBps": 29.22063435675103,
+    "roundTripImpact": 36.73495732839931,
+    "totalCost": 106.7349573283993
+  },
+  {
+    "mint": "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh",
+    "symbol": "WBTC",
+    "buyBps": 5.553156043684828,
+    "sellBps": 0,
+    "roundTripImpact": 5.553156043684828,
+    "totalCost": 75.55315604368482
+  },
+  {
+    "mint": "WENWENvqqNya429ubCdR81ZmD69brwQaaBYY6p3LCpk",
+    "symbol": "WEN",
+    "buyBps": 0,
+    "sellBps": 50.69980961743253,
+    "roundTripImpact": 50.69980961743253,
+    "totalCost": 120.69980961743252
+  },
+  {
+    "mint": "8J69rbLTzWWgUJziFY8jeu5tDwEPBwUz4pKBMr5rpump",
+    "symbol": "WOJAK",
+    "buyBps": 0,
+    "sellBps": 91.20298836655003,
+    "roundTripImpact": 91.20298836655003,
+    "totalCost": 161.20298836655002
+  },
+  {
+    "mint": "33eum82LaAhtv5YkUq1BdwEviSErH5CnFxqVNLT5pump",
+    "symbol": "WORLDCUP",
+    "buyBps": 2.5001286494741306,
+    "sellBps": 35.59301410393308,
+    "roundTripImpact": 38.09314275340721,
+    "totalCost": 108.09314275340721
+  },
+  {
+    "mint": "DtR4D9FtVoTX2569gaL837ZgrB6wNjj6tkmnX9Rdk9B2",
+    "symbol": "aura",
+    "buyBps": 19.872535481297028,
+    "sellBps": 46.1401181796204,
+    "roundTripImpact": 66.01265366091744,
+    "totalCost": 136.01265366091744
+  },
+  {
+    "mint": "bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1",
+    "symbol": "bSOL",
+    "buyBps": 4.886659451784041,
+    "sellBps": 0,
+    "roundTripImpact": 4.886659451784041,
+    "totalCost": 74.88665945178404
+  },
+  {
+    "mint": "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",
+    "symbol": "mSOL",
+    "buyBps": 4.641181560096287,
+    "sellBps": 0,
+    "roundTripImpact": 4.641181560096287,
+    "totalCost": 74.64118156009629
+  },
+  {
+    "mint": "32CdQdBUxbCsLy5AUHWmyidfwhgGUr9N573NBUrDpump",
+    "symbol": "maxxing",
+    "buyBps": 2.5012399214451353,
+    "sellBps": 165.20408158295896,
+    "roundTripImpact": 167.7053215044041,
+    "totalCost": 237.7053215044041
+  },
+  {
+    "mint": "Bb4jR951QtVjeFAYFLBYXDSMKjbTDroCLPbFLdd7pump",
+    "symbol": "memecoin",
+    "buyBps": 6.277686044362382,
+    "sellBps": 26.355544437331,
+    "roundTripImpact": 32.63323048169338,
+    "totalCost": 102.63323048169337
+  },
+  {
+    "mint": "Ce2gx9KGXJ6C9Mp5b5x1sn9Mg87JwEbrQby4Zqo3pump",
+    "symbol": "neet",
+    "buyBps": 1.1054677640713166,
+    "sellBps": 10.713999999999999,
+    "roundTripImpact": 11.819467764071316,
+    "totalCost": 81.81946776407132
+  },
+  {
+    "mint": "GtDZKAqvMZMnti46ZewMiXCa4oXF4bZxwQPoKzXPFxZn",
+    "symbol": "nub",
+    "buyBps": 5.459347341217873,
+    "sellBps": 45.41044379734298,
+    "roundTripImpact": 50.86979113856085,
+    "totalCost": 120.86979113856086
+  },
+  {
+    "mint": "Dfh5DzRgSvvCFDoYc2ciTkMrbDfRKybA4SoFbPmApump",
+    "symbol": "pippin",
+    "buyBps": 0,
+    "sellBps": 0,
+    "roundTripImpact": 0,
+    "totalCost": 70
+  },
+  {
+    "mint": "CniPCE4b3s8gSUPhUiyMjXnytrEqUrMfSsnbBjLCpump",
+    "symbol": "pwease",
+    "buyBps": 4.762589412740577,
+    "sellBps": 49.094197912980476,
+    "roundTripImpact": 53.85678732572105,
+    "totalCost": 123.85678732572106
+  },
+  {
+    "mint": "zGh48JtNHVBb5evgoZLXwgPD2Qu4MhkWdJLGDAupump",
+    "symbol": "retire",
+    "buyBps": 20.403285140406382,
+    "sellBps": 44.6179345358979,
+    "roundTripImpact": 65.02121967630428,
+    "totalCost": 135.02121967630427
+  },
+  {
+    "mint": "74SBV4zDXxTRgv1pEMoECskKBkZHc2yGPnc7GYVepump",
+    "symbol": "swarms",
+    "buyBps": 5.813172819471879,
+    "sellBps": 47.73926370773469,
+    "roundTripImpact": 53.552436527206574,
+    "totalCost": 123.55243652720657
+  },
+  {
+    "mint": "4TyZGqRLG3VcHTGMcLBoPUmqYitMVojXinAmkL8xpump",
+    "symbol": "testicle",
+    "buyBps": 1.728266501245608,
+    "sellBps": 40.79178340603306,
+    "roundTripImpact": 42.52004990727867,
+    "totalCost": 112.52004990727866
+  },
+  {
+    "mint": "FeMbDoX7R1Psc4GEcvJdsbNbZA3bfztcyDCatJVJpump",
+    "symbol": "three",
+    "buyBps": 53.58455682461295,
+    "sellBps": 103.37727827741013,
+    "roundTripImpact": 156.9618351020231,
+    "totalCost": 226.9618351020231
+  }
+]

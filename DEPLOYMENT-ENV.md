@@ -41,7 +41,7 @@ Single source of truth for environment variables across all services.
 ## OPTIONAL (safe defaults in code — override only to tune)
 
 Fee / swap:
-- `JUPITER_PLATFORM_FEE_BPS` (default 30 in code; **set to 35** in prod to match fee model).
+- `JUPITER_PLATFORM_FEE_BPS` — per-trade fee is **disabled (0)**. Revenue model is 0.33% performance fee on net session profit at session end (NOT YET BUILT — A1 in TRADING-FIX-PLAN.md).
 
 Rate limits / budgets (fleet-wide, 90% of provider caps):
 - `JUPITER_GENERAL_RPS` (135), `HELIUS_RPC_RPS` (180), `HELIUS_MONTHLY_CREDIT_LIMIT`,

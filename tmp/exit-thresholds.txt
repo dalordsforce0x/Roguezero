@@ -1,0 +1,120 @@
+6291: const computeDynamicExitThresholds = (
+6292:   session: RawSession,
+6293:   positionState: NonNullable<Session['serviceControl']['positionState']>,
+6294:   signalSnapshot: NonNullable<Session['serviceControl']['lastSignal']>,
+6295: ): DynamicExitThresholds => {
+6296:   const costFloorBps = computeExitCostFloorBps(session);
+6297:   const atrBps = positionState.lastComputedAtrBps ?? null;
+6298: 
+6299:   // ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ B4: Regime-based exit scaling ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬
+6300:   // Trending: widen TP (+30%) and trailing (+20%) ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â let winners ride.
+6301:   // Ranging: tighten TP (-20%) and trailing (-20%) ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â take quick profits.
+6302:   const regime = recommendStrategy(sharedMarketTape.solUsdPyth);
+6303:   let regimeTpScale = 1.0;
+6304:   let regimeTrailingScale = 1.0;
+6305:   if (regime.reason === 'expanding_bands_steep_slope') {
+6306:     regimeTpScale = 1.3;
+6307:     regimeTrailingScale = 1.2;
+6308:   } else if (regime.reason === 'narrow_bands_flat_slope') {
+6309:     regimeTpScale = 0.8;
+6310:     regimeTrailingScale = 0.8;
+6311:   }
+6312:   // Token-class exit profile (flag-gated, Noah-scoped). OFF => exact global multipliers as before.
+6313:   const exitProfilesActive = isFeatureActiveForSession(session, WORKER_TOKEN_CLASS_EXIT_PROFILES_ENABLED, 'token_class_exit');
+6314:   const exitProfile: TokenClassExitProfile = exitProfilesActive
+6315:     ? getTokenClassExitProfile(getTokenTradeClass(positionState.positionMint ?? '', positionState.positionSymbol))
+6316:     : {
+6317:         takeProfitMult: positionExitPolicy.atrTakeProfitMultiplier,
+6318:         stopLossMult: positionExitPolicy.atrStopLossMultiplier,
+6319:         trailingStopMult: positionExitPolicy.atrTrailingStopMultiplier,
+6320:       };
+6321: 
+6322:   // Time-decay take-profit ladder: a fresh position must clear its full target,
+6323:   // but as it ages the required take-profit decays linearly toward the cost
+6324:   // floor (breakeven + fees). This frees capital from stale positions that are
+6325:   // green-but-stuck without ever realizing a take-profit below cost. Stop-loss
+6326:   // and trailing thresholds are unaffected.
+6327:   const entryAtMs = positionState.entryAt ? Date.parse(positionState.entryAt) : NaN;
+6328:   const positionAgeMs = Number.isFinite(entryAtMs) ? Math.max(0, Date.now() - entryAtMs) : 0;
+6329:   const decayStartMs = positionExitPolicy.takeProfitTimeDecayStartMs;
+6330:   const decayFullMs = positionExitPolicy.takeProfitTimeDecayFullMs;
+6331:   const applyTakeProfitTimeDecay = (rawTakeProfitBps: number): number => {
+6332:     if (!WORKER_TP_TIME_DECAY_ENABLED || decayFullMs <= decayStartMs || positionAgeMs <= decayStartMs || rawTakeProfitBps <= costFloorBps) {
+6333:       return rawTakeProfitBps;
+6334:     }
+6335:     const progress = Math.min(1, (positionAgeMs - decayStartMs) / (decayFullMs - decayStartMs));
+6336:     const decayed = Math.round(rawTakeProfitBps - (rawTakeProfitBps - costFloorBps) * progress);
+6337:     return Math.max(costFloorBps, decayed);
+6338:   };
+6339: 
+6340:   if (!atrBps || atrBps <= 0) {
+6341:     return {
+6342:       takeProfitBps: applyTakeProfitTimeDecay(Math.max(Math.round(positionExitPolicy.takeProfitBps * regimeTpScale), costFloorBps)),
+6343:       stopLossBps: Math.max(positionExitPolicy.stopLossBps, costFloorBps),
+6344:       trailingStopBps: Math.max(Math.round(positionExitPolicy.trailingStopBps * regimeTrailingScale), positionExitPolicy.trailingStopFloorBps),
+6345:       atrBps: null,
+6346:       costFloorBps,
+6347:       mode: 'fallback',
+6348:     };
+6349:   }
+6350: 
+6351:   const signalStrengthBps = Math.abs(signalSnapshot.momentumBps ?? 0);
+6352:   const signalStrengthBoost = Math.min(0.5, signalStrengthBps / 200);
+6353:   return {
+6354:     takeProfitBps: applyTakeProfitTimeDecay(Math.max(
+6355:       costFloorBps,
+6356:       Math.round(atrBps * exitProfile.takeProfitMult * (1 + signalStrengthBoost) * regimeTpScale),
+6357:     )),
+6358:     stopLossBps: Math.max(
+6359:       costFloorBps,
+6360:       Math.round(atrBps * exitProfile.stopLossMult),
+6361:     ),
+6362:     trailingStopBps: Math.max(
+6363:       positionExitPolicy.trailingStopFloorBps,
+6364:       Math.round(atrBps * exitProfile.trailingStopMult * regimeTrailingScale),
+6365:     ),
+6366:     atrBps,
+6367:     costFloorBps,
+6368:     mode: 'atr',
+6369:   };
+6370: };
+6371: 
+6372: const refreshPositionsMarks = async (
+6373:   session: RawSession,
+6374:   positionsState: SessionPositionsState,
+6375: ) => {
+6376:   const normalized = normalizePositionsState(positionsState);
+6377:   const nextPositions: SessionPositionsState['positions'] = {};
+6378:   let changed = false;
+6379:   let totalUnrealizedPnlUsd = 0;
+6380:   const strategyConfig = getSessionStrategyConfig(session);
+6381: 
+6382:   for (const [mint, positionState] of Object.entries(normalized.positions)) {
+6383:     const markedPriceUsd = mint === SOL_MINT
+6384:       ? (lastPythSolSample?.usdPrice ?? lastJupiterSolSample?.usdPrice ?? null)
+6385:       : (latestJupiterUsdByMint.get(mint) ?? null);
+6386:     const atr = computeAtrFromTape(
+6387:       mint === SOL_MINT
+6388:         ? sharedMarketTape.solUsdPyth
+6389:         : getCandleBackedPriceTape(mint),
+6390:       strategyConfig.supertrend,
+6391:     );
+6392:     const markedAt = new Date().toISOString();
+6393:     const pnlBps = markedPriceUsd
+6394:       ? computeReturnBps(positionState.entryPriceUsd, markedPriceUsd)
+6395:       : null;
+6396:     const nextMaxFavorableBps = pnlBps === null
+6397:       ? positionState.maxFavorableBps ?? null
+6398:       : Math.max(positionState.maxFavorableBps ?? pnlBps, pnlBps);
+6399:     const nextMaxAdverseBps = pnlBps === null
+6400:       ? positionState.maxAdverseBps ?? null
+6401:       : Math.min(positionState.maxAdverseBps ?? pnlBps, pnlBps);
+6402: 
+6403:     const nextPositionState: SessionPositionState = !markedPriceUsd
+6404:       ? clonePositionState(positionState)
+6405:       : {
+6406:           ...positionState,
+6407:           // Backfill cost basis for a re-tracked orphan the first time we have
+6408:           // a price. True entry is unknown, so basis = current mark (unrealized
+6409:           // starts at 0 from discovery)  this lets the position contribute to PnL.
+6410:           entryPriceUsd: isLongPositionStatus(positionState.status) && positionState.entryPriceUsd === null
