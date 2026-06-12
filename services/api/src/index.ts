@@ -965,7 +965,12 @@ const parseJsonResponse = (responseText: string) => {
     return null;
   }
 
-  return JSON.parse(responseText) as unknown;
+  try {
+    return JSON.parse(responseText) as unknown;
+  } catch {
+    // Return the raw text wrapped in an error object so callers can see what came back
+    return { _parseError: true, rawText: responseText.slice(0, 500) } as unknown;
+  }
 };
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -1586,10 +1591,18 @@ type JupiterOrderResponse = {
   slippageBps: number;
   priceImpactPct: string;
   router: string;
-  contextSlot: number;
-  transaction: string; // base64 serialized VersionedTransaction
-  prioritizationType: { computeBudget?: { microLamports: number; estimatedMicroLamports: number } };
+  contextSlot?: number;
+  transaction: string; // base64 serialized VersionedTransaction (empty string on error)
+  prioritizationType?: { computeBudget?: { microLamports: number; estimatedMicroLamports: number } };
   dynamicSlippageReport?: { slippageBps: number; otherAmount: number; simulatedIncurredSlippageBps: number; amplificationRatio: string };
+  // New flat fee fields (replaced totalFees)
+  signatureFeeLamports: number;
+  prioritizationFeeLamports: number;
+  rentFeeLamports: number;
+  // Error fields — present even on 200 responses
+  errorCode?: number;
+  errorMessage?: string;
+  // Legacy (may still appear on some routes)
   totalFees?: { signatureFee: number; ataDeposits: number; totalFeeAndDeposits: number; minimumSOLForTransaction: number };
 };
 
@@ -1604,28 +1617,25 @@ const fetchJupiterOrder = async (params: {
     throw new Error('Jupiter integration is not ready');
   }
 
-  const body: Record<string, unknown> = {
+  const qs = new URLSearchParams({
     inputMint: params.inputMint,
     outputMint: params.outputMint,
-    amount: Number(params.amount),
+    amount: params.amount,
     taker: params.taker,
-  };
+  });
 
   // If slippageBps is provided, use it; otherwise let RTSE decide automatically
   if (params.slippageBps !== undefined) {
-    body.slippageBps = Number(params.slippageBps);
+    qs.set('slippageBps', params.slippageBps);
   }
 
   const result = await fetchJsonWithRetry({
     label: 'jupiter-order',
     budget: { reserve: reserveJupiterRequest },
-    request: () => fetch(`${JUPITER_ULTRA_BASE_URL}/order`, {
-      method: 'POST',
+    request: () => fetch(`${JUPITER_ULTRA_BASE_URL}/order?${qs.toString()}`, {
       headers: {
-        'Content-Type': 'application/json',
         'x-api-key': (jupiterApiKeySelector?.next() ?? jupiterSwapBuildConfig.apiKey),
       },
-      body: JSON.stringify(body),
     }),
   });
 
@@ -3101,9 +3111,33 @@ app.post('/jupiter/swap/prepare', { config: { rateLimit: { max: INTERNAL_SWAP_PR
     }
 
     const order = orderResult.payload;
+
+    // Jupiter Ultra returns errorCode/errorMessage even on 200 responses
+    if (order.errorCode && order.errorMessage) {
+      app.log.warn({ errorCode: order.errorCode, errorMessage: order.errorMessage, taker }, 'Jupiter Ultra /order returned error');
+      return reply.status(422).send({
+        error: 'Jupiter Ultra /order rejected the swap',
+        errorCode: order.errorCode,
+        errorMessage: order.errorMessage,
+        feeTokenSymbol,
+        feeAccount,
+        platformFeeBps: effectivePlatformFeeBps,
+      });
+    }
+
+    if (!order.transaction) {
+      app.log.warn({ order }, 'Jupiter Ultra /order returned no transaction');
+      return reply.status(502).send({
+        error: 'Jupiter Ultra /order returned empty transaction',
+        feeTokenSymbol,
+        feeAccount,
+        platformFeeBps: effectivePlatformFeeBps,
+      });
+    }
+
     const now = new Date().toISOString();
     const executionId = randomUUID();
-    const estimatedNetworkCostLamports = order.totalFees?.signatureFee ?? 5_000;
+    const estimatedNetworkCostLamports = order.signatureFeeLamports ?? order.totalFees?.signatureFee ?? 5_000;
 
     try {
       await createPreparedExecution({
@@ -3179,12 +3213,12 @@ app.post('/jupiter/swap/prepare', { config: { rateLimit: { max: INTERNAL_SWAP_PR
         priceImpactPct: order.priceImpactPct,
       },
       costs: {
-        baseTxFeeLamports: order.totalFees?.signatureFee ?? 5_000,
+        baseTxFeeLamports: order.signatureFeeLamports ?? order.totalFees?.signatureFee ?? 5_000,
         priorityFeeMicroLamports: order.prioritizationType?.computeBudget?.microLamports ?? null,
-        estimatedPriorityFeeLamports: 0,
+        estimatedPriorityFeeLamports: order.prioritizationFeeLamports ?? 0,
         senderTipLamports: 0,
         estimatedNetworkCostLamports,
-        estimatedAtaRentLamports: order.totalFees?.ataDeposits ?? 0,
+        estimatedAtaRentLamports: order.rentFeeLamports ?? order.totalFees?.ataDeposits ?? 0,
       },
       blockhash: '',
       lastValidBlockHeight: null,
